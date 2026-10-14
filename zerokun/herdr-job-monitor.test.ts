@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import type { JobRecord } from './job-runner.ts'
+import { JobStore, type JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   appendHerdrJobMonitorChunk,
@@ -417,6 +417,147 @@ describe('Herdr job monitor', () => {
     expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
     expect(existsSync(join(state, 'job-monitors-detached', record.id, 'manifest.json'))).toBe(true)
   })
+  for (const waiting of [false, true]) {
+    test(`server restart retires dead viewer without touching restored panes (waiting=${waiting})`, async () => {
+      const state = fixtureDirectory()
+      const control = new FakeControl()
+      const record = job({ status: 'queued', monitorState: 'required' })
+      // Create the original view before simulating its armed queue record.
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: { ...record, monitorState: 'none' }, control })
+      appendHerdrJobMonitorStatus(state, record.id, 'saved before restart')
+      const source = join(state, 'job-monitors', record.id)
+      const feed = readFileSync(join(source, 'status.0.feed'), 'utf8')
+      control.generationStatus = 'dead'
+      control.panes[0]!.terminalId = 'term_99999999999999'
+      const calls = [control.createCalls, control.runCalls, control.closeCalls, control.processInfoCalls]
+      let required = true
+      let recoveries = 0
+      const options = {
+        stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control,
+        getJob: () => record,
+        listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+        recoverMissingBindingAfterExecutorsStopped: () => {
+          recoveries += 1
+          required = false
+          if (waiting) return 'unarmed' as const
+          record.status = 'failed'
+          return 'terminalized' as const
+        },
+      }
+      expect((await reconcileHerdrJobMonitors(options)).closed).toBe(1)
+      expect(record.status).toBe(waiting ? 'queued' : 'failed')
+      expect(readFileSync(join(state, 'job-monitors-detached', record.id, 'status.0.feed'), 'utf8')).toBe(feed)
+      await reconcileHerdrJobMonitors(options)
+      expect(recoveries).toBe(1)
+      expect([control.createCalls, control.runCalls, control.closeCalls, control.processInfoCalls]).toEqual(calls)
+    })
+  }
+
+  test('restart after disposition commit retries archive without replaying work', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.generationStatus = 'dead'
+    const archivedRoot = join(state, 'job-monitors-detached')
+    mkdirSync(archivedRoot, { mode: 0o700 })
+    mkdirSync(join(archivedRoot, record.id), { mode: 0o700 })
+    const manifest = JSON.parse(readFileSync(join(state, 'job-monitors', record.id, 'manifest.json'), 'utf8'))
+    const collision = join(archivedRoot, `${record.id}.${manifest.operationId}`)
+    mkdirSync(collision, { mode: 0o700 })
+    let required = true
+    let recoveries = 0
+    const options = {
+      stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control, getJob: () => record,
+      listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+      recoverMissingBindingAfterExecutorsStopped: () => {
+        recoveries += 1
+        required = false
+        record.status = 'failed'
+        return 'terminalized' as const
+      },
+    }
+    await expect(reconcileHerdrJobMonitors(options)).rejects.toThrow('could not archive previous Herdr monitor')
+    expect(record.status).toBe('failed')
+    expect(required).toBe(false)
+    rmSync(collision, { recursive: true })
+    await reconcileHerdrJobMonitors(options)
+    expect(recoveries).toBe(1)
+    expect(existsSync(join(collision, 'manifest.json'))).toBe(true)
+    expect(control.closeCalls).toBe(0)
+  })
+
+  test('same waiting job survives two server restarts and preserves both viewer generations', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    const archives: string[] = []
+    for (const generation of [1, 2]) {
+      control.generationStatus = 'alive'
+      const currentRuntime = { ...runtime(), socketInode: generation }
+      await openHerdrJobMonitor({ stateDir: state, runtime: currentRuntime, job: record, control })
+      appendHerdrJobMonitorStatus(state, record.id, `generation ${generation}`)
+      const source = join(state, 'job-monitors', record.id)
+      const manifest = JSON.parse(readFileSync(join(source, 'manifest.json'), 'utf8'))
+      const feed = readFileSync(join(source, 'status.0.feed'), 'utf8')
+      const archived = join(state, 'job-monitors-detached', generation === 1 ? record.id : `${record.id}.${manifest.operationId}`)
+      archives.push(archived)
+      control.generationStatus = 'dead'
+      let required = true
+      const calls = [control.createCalls, control.runCalls, control.closeCalls]
+      expect((await reconcileHerdrJobMonitors({
+        stateDir: state, runtime: { ...currentRuntime, socketInode: generation + 1 }, control,
+        getJob: () => record,
+        listMonitorObligations: () => required ? [{ id: record.id, status: record.status, state: 'required' as const }] : [],
+        recoverMissingBindingAfterExecutorsStopped: () => { required = false; return 'unarmed' },
+      })).closed).toBe(1)
+      expect(record.status).toBe('queued')
+      expect([control.createCalls, control.runCalls, control.closeCalls]).toEqual(calls)
+      expect(readFileSync(join(archived, 'status.0.feed'), 'utf8')).toBe(feed)
+    }
+    expect(readFileSync(join(archives[0]!, 'status.0.feed'), 'utf8')).toContain('generation 1')
+    expect(readFileSync(join(archives[1]!, 'status.0.feed'), 'utf8')).toContain('generation 2')
+  })
+
+  for (const viewerStatus of ['alive', 'unknown'] as const) {
+    test(`changed control plane preserves ${viewerStatus} viewer and job`, async () => {
+      const state = fixtureDirectory()
+      const control = new FakeControl()
+      const record = job({ status: 'queued' })
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+      control.generationStatus = viewerStatus
+      let recovered = false
+      await expect(reconcileHerdrJobMonitors({
+        stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control,
+        getJob: () => record,
+        recoverMissingBindingAfterExecutorsStopped: () => { recovered = true; return 'unarmed' },
+      })).rejects.toThrow('previous Herdr monitor is not stopped')
+      expect(recovered).toBe(false)
+      expect(existsSync(join(state, 'job-monitors', record.id, 'manifest.json'))).toBe(true)
+      expect(control.closeCalls).toBe(0)
+    })
+  }
+
+  test('changed control plane preserves staged results and requires executor reconciliation', async () => {
+    const state = fixtureDirectory()
+    const control = new FakeControl()
+    const record = job({ status: 'queued' })
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: record, control })
+    control.generationStatus = 'dead'
+    const options = { stateDir: state, runtime: { ...runtime(), socketInode: 99 }, control, getJob: () => record }
+    await expect(reconcileHerdrJobMonitors(options)).rejects.toThrow('previous Herdr monitor is not stopped')
+    let stateValue: 'required' | 'lost-staged' = 'required'
+    await expect(reconcileHerdrJobMonitors({
+      ...options,
+      listMonitorObligations: () => [{ id: record.id, status: record.status, state: stateValue }],
+      recoverMissingBindingAfterExecutorsStopped: () => { stateValue = 'lost-staged'; return 'staged-result' },
+    })).rejects.toThrow('staged execution remains blocked')
+    expect(stateValue).toBe('lost-staged')
+    expect(existsSync(join(state, 'job-monitors', record.id, 'manifest.json'))).toBe(true)
+    expect(record.status).toBe('queued')
+    expect(control.closeCalls).toBe(0)
+  })
+
   test('stop recovery archives dead monitor logs without operating a reused pane', async () => {
     const state = fixtureDirectory()
     const control = new FakeControl()
@@ -822,9 +963,8 @@ describe('Herdr job monitor', () => {
     expect(status.trimEnd().split('\n').every(line => (
       /^\[(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d JST\] /.test(line)
     ))).toBe(true)
-    expect(status).toContain('詳細を安全のため省略しました')
-    expect(status).not.toContain('/Users/example/project')
-    expect(status).not.toContain('abcdefghijklmnop')
+    expect(status).toContain('確認先 /Users/example/project Authorization: Bearer abcdefghijklmnop')
+    expect(status).not.toContain('詳細を安全のため省略しました')
     appendHerdrJobMonitorStatus(
       state,
       record.id,
@@ -834,9 +974,8 @@ describe('Herdr job monitor', () => {
       join(state, 'job-monitors', record.id, 'status.0.feed'),
       'utf8',
     )
-    expect(statusAfterJson).toContain('詳細を安全のため省略しました')
-    expect(statusAfterJson).not.toContain('jsonrpc')
-    expect(statusAfterJson).not.toContain('turnId')
+    expect(statusAfterJson).toContain('失敗として確定します: {"jsonrpc":"2.0","turnId":"internal"}')
+    expect(statusAfterJson).not.toContain('詳細を安全のため省略しました')
 
     await closeHerdrJobMonitor({
       stateDir: state,
@@ -2219,4 +2358,96 @@ describe('Herdr job monitor', () => {
     },
     15_000,
   )
+})
+
+function auditMonitorFixture() {
+  const state = fixtureDirectory()
+  const store = new JobStore(join(state, 'jobs.sqlite'))
+  const record = store.enqueue({chatId:'C1', threadTs:'1.1', messageId:'1.1',
+    userId:'U1', repoPath:state, task:'audit', workflow:'security-audit'}).job
+  store.claimNext('worker')
+  store.beginMonitorPreparation(record.id, 'worker')
+  return {state, store, record, control:new FakeControl()}
+}
+
+for (const reply of [false, true]) test(`audit park closes monitor obligation before same-job resume (reply=${reply})`, async () => {
+  const {state, store, record, control} = auditMonitorFixture()
+  try {
+    await openHerdrJobMonitor({stateDir:state, runtime:runtime(), job:store.get(record.id)!, control,
+      beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'worker')})
+    store.parkAuditSetup(record.id,'question',1)
+    if(reply) store.stageThreadReply(store.liveControlTarget('C1','1.1')!, {
+      chatId:'C1',threadTs:'1.1',messageId:'1.2',userId:'U1',task:'URL: https://example.test/',writeEnabled:true})
+    await closeHerdrJobMonitor({stateDir:state,runtime:runtime(),jobId:record.id,outcome:'waiting',control,
+      onMonitorRetired:id=>store.retireMonitorObligation(id)})
+    expect(store.get(record.id)?.status).toBe('queued')
+    expect(store.get(record.id)?.monitorState).toBe('none')
+    expect(store.monitorObligations()).toEqual([])
+    expect(existsSync(join(state,'job-monitors',record.id))).toBe(false)
+    for(const n of store.pendingStatusNotifications()) store.markStatusNotificationDelivered(n.id)
+    if(reply) {
+      expect(store.claimNext('next')?.id).toBe(record.id)
+      store.beginMonitorPreparation(record.id,'next')
+      await openHerdrJobMonitor({stateDir:state,runtime:runtime(),job:store.get(record.id)!,control:new FakeControl(),
+        beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'next')})
+      expect(store.get(record.id)?.monitorState).toBe('required')
+    }
+  } finally {store.close()}
+})
+
+for (const shape of ['missing-root','missing-directory','active'] as const) {
+  test(`startup preserves parked audit and retires its monitor: ${shape}`, async () => {
+    const {state,store,record,control}=auditMonitorFixture()
+    try {
+      if(shape==='active') await openHerdrJobMonitor({stateDir:state,runtime:runtime(),job:store.get(record.id)!,control,
+        beforeFirstHerdrMutation:()=>store.commitMonitorRequired(record.id,'worker')})
+      else {
+        store.commitMonitorRequired(record.id,'worker')
+        if(shape==='missing-directory') mkdirSync(join(state,'job-monitors'),{mode:0o700})
+      }
+      store.parkAuditSetup(record.id,'question',1)
+      const result=await reconcileHerdrJobMonitors({stateDir:state,runtime:runtime(),control,
+        getJob:id=>store.get(id),listMonitorObligations:()=>store.monitorObligations(),
+        isAuditSetupParked:id=>store.auditSetupIsParked(id),
+        recoverMissingBindingAfterExecutorsStopped:id=>{store.retireMonitorObligation(id);return 'unarmed'},
+        onMonitorRetired:id=>store.retireMonitorObligation(id)})
+      expect(result.retained).toBe(0)
+      expect(store.get(record.id)).toMatchObject({status:'queued',monitorState:'none',inputRevision:1})
+      expect(store.auditSetupIsParked(record.id)).toBe(true)
+      expect(store.pendingStatusNotifications().some(n=>n.payload==='question')).toBe(true)
+      store.enqueue({chatId:'C1',threadTs:'2.1',messageId:'2.1',userId:'U1',repoPath:state,task:'next'})
+      expect(store.claimNext('other')?.id).not.toBe(record.id)
+    } finally {store.close()}
+  })
+}
+
+test('audit missing-monitor recovery refuses a possible surviving binding',async()=>{
+  const {state,store,record,control}=auditMonitorFixture()
+  try {
+    store.commitMonitorRequired(record.id,'worker');store.parkAuditSetup(record.id,'question',1)
+    control.tabs.push({tabId:'foreign:t1',workspaceId:'foreign',label:monitorTabLabel(state,record.seq),paneCount:1})
+    await expect(reconcileHerdrJobMonitors({stateDir:state,runtime:runtime(),control,
+      getJob:id=>store.get(id),listMonitorObligations:()=>store.monitorObligations(),
+      isAuditSetupParked:id=>store.auditSetupIsParked(id),
+      recoverMissingBindingAfterExecutorsStopped:id=>{store.retireMonitorObligation(id);return 'unarmed'},
+    })).rejects.toThrow()
+    expect(store.get(record.id)?.monitorState).toBe('required')
+    expect(control.closeCalls).toBe(0)
+  } finally {store.close()}
+})
+
+test('audit monitor retirement preserves cancellation and rejects ordinary active jobs',()=>{
+  const {store,record}=auditMonitorFixture()
+  try {
+    store.commitMonitorRequired(record.id,'worker')
+    store.retireMonitorObligation(record.id)
+    expect(store.get(record.id)?.monitorState).toBe('required')
+    store.parkAuditSetup(record.id,'question',1)
+    store.stageLiveControl(store.liveControlTarget('C1','1.1')!,{chatId:'C1',threadTs:'1.1',messageId:'1.2',
+      userId:'U1',task:'cancel',writeEnabled:true,kind:'interrupt'})
+    expect(store.auditSetupIsParked(record.id)).toBe(true)
+    store.retireMonitorObligation(record.id)
+    expect(store.get(record.id)?.monitorState).toBe('none')
+    expect(store.claimNext('cancel')?.cancelRequestedAt).not.toBeNull()
+  } finally {store.close()}
 })

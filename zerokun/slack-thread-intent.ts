@@ -17,7 +17,7 @@ import {
   resolveOfficialStandaloneCodex,
   verifyOfficialCodexSnapshot,
 } from './standalone-codex.ts'
-import { type SlackReply } from '../gate.ts'
+import { slackSenderId, type SlackReply } from '../gate.ts'
 import { CodexCleanupPendingError } from './codex-executor.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
@@ -114,7 +114,7 @@ export function buildSlackThreadIntentSnapshot(input: {
   const aliases = new Map<string, string>()
   aliases.set(input.candidate.userId, '@candidate')
   for (const message of selected) {
-    const userId = message.user ?? message.bot_id
+    const userId = slackSenderId(message) ?? message.user
     if (!userId || userId === input.botUserId || aliases.has(userId)) continue
     aliases.set(userId, `@participant-${aliases.size}`)
   }
@@ -124,7 +124,7 @@ export function buildSlackThreadIntentSnapshot(input: {
     // Other Slack apps are participants, not this assistant. Modern Slack bot
     // history includes the bot user ID even when bot_id is also present.
     const assistant = Boolean(input.botUserId && message.user === input.botUserId)
-    const userId = message.user ?? message.bot_id ?? ''
+    const userId = slackSenderId(message) ?? message.user ?? ''
     const speaker = assistant
       ? 'assistant' as const
       : candidate
@@ -230,13 +230,15 @@ function classifierEnvironment(): Record<string, string> {
   return result
 }
 
-function readOwnerOnlyOutput(path: string): string {
+export function readOwnerOnlyOutput(path: string, maxBytes = MAX_CLASSIFIER_OUTPUT_BYTES): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1_000_000)
+    throw new Error('invalid isolated model output limit')
   const before = lstatSync(path, { bigint: true })
   const ownerAllowed = typeof process.getuid !== 'function'
     || before.uid === BigInt(process.getuid())
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n
     || !ownerAllowed || (before.mode & 0o077n) !== 0n
-    || before.size <= 0n || before.size > BigInt(MAX_CLASSIFIER_OUTPUT_BYTES)) {
+    || before.size <= 0n || before.size > BigInt(maxBytes)) {
     throw new Error('thread intent classifier output is unsafe')
   }
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -366,7 +368,8 @@ export async function runSlackThreadIntentClassifier(
 
 /** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
 export async function runIsolatedCodexJson(prompt: string, schema: object,
-  options: { timeoutMs?: number; model?: string; independent?: boolean; signal?: AbortSignal;
+  options: { timeoutMs?: number; model?: string; reasoningEffort?: 'medium'; independent?: boolean; signal?: AbortSignal;
+    purpose?: 'security-audit';
     onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void;
     supervision?: { jobId: string; stateDir: string } } = {}): Promise<string> {
   if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
@@ -420,6 +423,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       '--disable', 'js_repl',
       '--disable', 'view_image',
       ...(configuredModel ? ['--model', configuredModel] : []),
+      ...(options.reasoningEffort ? ['--config', 'model_reasoning_effort="medium"'] : []),
       '-',
     ]
     let command = args
@@ -450,7 +454,11 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     })
     spawned.stdin.write(prompt)
     spawned.stdin.end()
-    const timeoutMs = slackThreadIntentClassifierTimeoutMs(options.timeoutMs)
+    // Source reviews can return many findings; the routing classifier's 4 KiB /
+    // 110 second limits are intentionally unchanged for every other caller.
+    const timeoutMs = options.purpose === 'security-audit'
+      ? 10 * 60_000
+      : slackThreadIntentClassifierTimeoutMs(options.timeoutMs)
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), timeoutMs)
       timer.unref()
@@ -466,7 +474,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     }
     if (timer) clearTimeout(timer)
     if (outcome !== 0) throw new Error(`thread intent classifier exited ${outcome}`)
-    return readOwnerOnlyOutput(outputPath)
+    return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000 : MAX_CLASSIFIER_OUTPUT_BYTES)
   } finally {
     if (timer) clearTimeout(timer)
     if (onAbort) options.signal?.removeEventListener('abort', onAbort)

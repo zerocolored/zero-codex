@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'crypto'
 import type { Database } from 'bun:sqlite'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 
 export type NativeConfirmation = { threadId: string; turnId: string; origin: string }
 export type NativeConfirmationDecision = 'accept' | 'decline' | 'cancel'
@@ -8,6 +7,35 @@ export type NativeConfirmationDecision = 'accept' | 'decline' | 'cancel'
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : null
+}
+
+/** The operator permits app access for authorized primary Computer Use jobs.
+ * Match the official app-access request, not audio recording, file transfer,
+ * site access, arbitrary forms, or an Auto-review decision. Native app policy
+ * is checked before this request is emitted and remains authoritative.
+ */
+export function computerUseAppApproval(params: Record<string, unknown>): {
+  threadId: string; turnId: string; appId: string; persist: 'session' | 'always'
+} | null {
+  const schema = object(params.requestedSchema)
+  const meta = object(params._meta)
+  const toolParams = object(meta?.tool_params)
+  if (params.mode !== 'form' || params.serverName !== 'node_repl'
+    || typeof params.threadId !== 'string' || !params.threadId
+    || typeof params.turnId !== 'string' || !params.turnId
+    || !schema || schema.type !== 'object' || !object(schema.properties)
+    || Object.keys(object(schema.properties)!).length !== 0
+    || Object.keys(schema).some(key => !['type', 'properties', 'required', 'additionalProperties'].includes(key))
+    || (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.length !== 0))
+    || meta?.codex_approval_kind !== 'mcp_tool_call' || meta.connector_id !== 'computer-use'
+    || typeof meta.tool_name !== 'string' || !/^[a-z][a-z0-9_]{0,127}$/.test(meta.tool_name)
+    || !toolParams || Object.keys(toolParams).length !== 1
+    || typeof toolParams.app !== 'string' || toolParams.app.length > 255
+    || !/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(toolParams.app)
+    || !Array.isArray(meta.persist) || meta.persist.length === 0
+    || meta.persist.some(value => value !== 'session' && value !== 'always')) return null
+  return { threadId: params.threadId, turnId: params.turnId, appId: toolParams.app,
+    persist: meta.persist.includes('always') ? 'always' : 'session' }
 }
 
 /** Only the native browser's empty upload confirmation needs no additional form data. */
@@ -28,8 +56,7 @@ export function browserUploadConfirmation(params: Record<string, unknown>): Nati
   try {
     const url = new URL(toolParams.origin)
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password
-      || url.search || url.hash || url.pathname !== '/' || !url.hostname
-      || containsCredentialMaterial(url.origin)) return null
+      || url.search || url.hash || url.pathname !== '/' || !url.hostname) return null
     if (typeof meta.origin === 'string' && new URL(meta.origin).origin !== url.origin) return null
     return { threadId: params.threadId, turnId: params.turnId, origin: url.origin }
   } catch { return null }
@@ -147,8 +174,8 @@ export async function awaitNativeConfirmation(options: {
       `キャンセル ${row.code}`,
       '回答後は同じ処理を続けます。この確認だけへの回答で、常時許可にはしません。',
     ].join('\n'))
-    // Never ask for approval after the public-output guard hid its destination.
-    // Keep the guard intact; this request remains unanswered instead.
+    // An approval must display its exact destination. This is a delivery
+    // integrity check, independent of the destination text or hostname.
     if (!text.includes(row.origin)) return 'cancel'
     if (!options.publish({ sourceKey: row.sourceKey, text })) return 'cancel'
     while (!options.signal.aborted) {

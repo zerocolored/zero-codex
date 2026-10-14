@@ -36,7 +36,6 @@ import {
   SERIAL_WORKER_COUNT,
   createSlackIdentityPauseGuard,
   extractArtifactPaths,
-  encodeSlackGuardNonce,
   enforceHostAdvisorCoverage,
   flushUiApprovalNotifications,
   flushTerminalNotifications,
@@ -2531,6 +2530,7 @@ describe('Codex job store', () => {
     })
     expect(hydrated).toMatchObject({
       text: 'root\n補足\n確認して',
+      modelRequestText: '確認して',
       fileIds: ['FROOT1', 'FMIDDLE1'],
       initialContextState: 'hydrated',
     })
@@ -2542,6 +2542,7 @@ describe('Codex job store', () => {
     expect(store.recoverInboundDeliveries()).toBe(1)
     const recovered = store.claimNextInboundDelivery()!
     expect(recovered.initialContextState).toBe('hydrated')
+    expect(recovered.modelRequestText).toBe('確認して')
     expect(recovered.fileIds).toEqual(['FROOT1', 'FMIDDLE1'])
     store.completeInboundDelivery(recovered.idempotencyKey)
     expect(store.claimNextInboundDelivery()).toBeNull()
@@ -3704,6 +3705,47 @@ describe('Codex job store', () => {
     expect(restarted.getThread('C0123456789', '1800000000.000100')?.repoPath)
       .toBe('/tmp/project-a')
     restarted.close()
+  })
+
+  test('settled GC removes cloud and monitor children while retaining unfinished handoffs', () => {
+    const state = fixtureDir()
+    const dbPath = join(state, 'jobs.sqlite3')
+    const store = new JobStore(dbPath)
+    const database = new Database(dbPath)
+    database.exec('PRAGMA foreign_keys=ON')
+    const records = new Map<string, string>()
+    for (const phase of ['active', 'saving', 'waiting', 'importing', 'transferred', 'unnotified']) {
+      const record = store.enqueue(input({ messageId: `gc-cloud-${phase}` })).job
+      store.claimNext('worker')
+      store.complete(record.id, 'gc-session', 'done')
+      if (phase !== 'unnotified') {
+        const notice = store.pendingTerminalNotifications().find(n => n.jobId === record.id)!
+        store.markTerminalNotificationDelivered(notice.id)
+      }
+      database.run('UPDATE jobs SET finished_at=1 WHERE id=?', [record.id])
+      database.run('INSERT INTO cloud_handoff_jobs(job_id,state,cloud_id,epoch,receipt_json,updated_at) VALUES(?,?,?,?,?,?)',
+        [record.id, phase === 'unnotified' ? 'active' : phase, 'cloud-test', 1, '{}', 1])
+      database.run('INSERT INTO cloud_handoff_context(job_id,source_key,payload,created_at) VALUES(?,?,?,?)',
+        [record.id, 'context', 'synthetic', 1])
+      database.run('INSERT INTO monitor_failures(job_id,reason_digest,created_at) VALUES(?,?,?)',
+        [record.id, 'a'.repeat(64), 1])
+      records.set(phase, record.id)
+    }
+    const options = { stateDir: state, now: 10_000, retentionMs: 1000, tombstoneRetentionMs: 100_000 }
+    expect(store.pruneSettled(options).jobs).toBe(1)
+    expect(store.get(records.get('active')!)).toBeNull()
+    for (const phase of ['saving', 'waiting', 'importing', 'transferred', 'unnotified']) {
+      expect(store.get(records.get(phase)!)).not.toBeNull()
+    }
+    for (const table of ['cloud_handoff_jobs', 'cloud_handoff_context', 'monitor_failures']) {
+      expect(database.query(`SELECT COUNT(*) AS n FROM ${table} WHERE job_id=?`).get(records.get('active')!)).toEqual({ n: 0 })
+      expect(database.query(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({ n: 5 })
+    }
+    expect(store.pruneSettled(options).jobs).toBe(0)
+    expect(database.query('PRAGMA foreign_key_check').all()).toEqual([])
+    expect(store.stageInboundDelivery({ ...input({ messageId: 'gc-cloud-active' }), text: 'redelivery' })).toBe(false)
+    database.close()
+    store.close()
   })
 
   test('settled GCは通知済みjobだけを削除し、tombstoneでSlack再配送を抑止する', () => {
@@ -7030,6 +7072,61 @@ describe('single FIFO worker', () => {
         reason: 'capacity',
       },
     })
+    store.close()
+  })
+
+  test('completed interjection answer retry is durable and bound to the exact receipt', () => {
+    const dir = fixtureDir()
+    const path = join(dir, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    store.enqueue(input({ messageId: 'format-retry', writeEnabled: true }))
+    const job = store.claimNext('format-retry-worker')!
+    const nonce = '7'.repeat(32)
+    const threadId = 'format-retry-thread'
+    expect(store.stageLiveInterjection(store.liveControlTarget(job.chatId, job.threadTs)!, {
+      chatId: job.chatId, threadTs: job.threadTs, messageId: 'format-question',
+      userId: 'UOTHER', task: '途中の質問です',
+    })).toBe('staged')
+    const interjection = store.listJobInterjections(job.id)[0]!
+    store.bindAppServerTurn(job.id, job.workerId!, job.controlEpoch, nonce, threadId, 'parent')
+    store.finishAppServerTurn({ jobId: job.id, epoch: job.controlEpoch,
+      executorNonce: nonce, threadId, turnId: 'parent', retainInput: true })
+    const binding = { interjectionId: interjection.id, jobId: job.id,
+      epoch: job.controlEpoch, logicalNonce: nonce, threadId }
+    for (let generation = 0; generation < 3; generation += 1) {
+      const clientId = `${interjection.id}:answer${generation ? `:repair:${generation}` : ''}`
+      expect(store.prepareInterjectionAnswer(binding)).toBe(clientId)
+      // A prepared-but-unsent request can recover with the same client ID.
+      store.close()
+      store = new JobStore(path)
+      expect(store.reconcileInterjectionsBeforeRecovery().preparedReset).toBe(1)
+      expect(store.prepareInterjectionAnswer(binding)).toBe(clientId)
+      const requestId = generation + 10
+      const turnId = `answer-${generation}`
+      expect(store.beginInterjectionAnswer({ ...binding, requestId })).toBe('dispatching')
+      store.acknowledgeInterjectionAnswer({ ...binding, requestId, turnId, workerId: job.workerId! })
+      for (const mismatch of [{ turnId: 'stale' }, { logicalNonce: '8'.repeat(32) }, { epoch: job.controlEpoch + 1 }, { interjectionId: 'foreign' }]) {
+        expect(() => store.retryInterjectionAnswer({ ...binding, turnId, ...mismatch })).toThrow()
+      }
+      expect(store.retryInterjectionAnswer({ ...binding, turnId }))
+        .toBe(generation + 1)
+      if (generation < 2) {
+        expect(() => store.retryInterjectionAnswer({ ...binding, turnId })).toThrow()
+        expect(() => store.stageInterjectionAnswer({ ...binding, turnId,
+          disposition: 'answer-only', answer: 'stale' })).toThrow()
+      }
+      store.close()
+      store = new JobStore(path)
+      expect(store.get(job.id)).toMatchObject({ status: 'running', inputRevision: 1 })
+      expect(store.listJobInterjections(job.id)[0]).toMatchObject({ answer: null, notificationId: null })
+    }
+    expect(store.prepareInterjectionAnswer(binding)).toBe(`${interjection.id}:answer:repair:3`)
+    store.beginInterjectionAnswer({ ...binding, requestId: 13 })
+    store.acknowledgeInterjectionAnswer({ ...binding, requestId: 13, turnId: 'answer-3', workerId: job.workerId! })
+    const target = store.interruptControlTarget(job.chatId, job.threadTs)!
+    expect(store.stageLiveControl(target, { chatId: job.chatId, threadTs: job.threadTs,
+      messageId: 'format-cancel', userId: 'UOTHER', task: '中止', kind: 'interrupt' })).toBe('staged')
+    expect(store.retryInterjectionAnswer({ ...binding, turnId: 'answer-3' })).toBe('cancelled')
     store.close()
   })
 
@@ -10424,9 +10521,9 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(instructions).not.toContain('Missing required reviewer answers mean the review is incomplete')
     expect(instructions).toContain('legacy separate design phase')
     expect(instructions).toContain('solution_analyst with model=gpt-6-astra,')
-    expect(instructions).toContain('reasoning_effort=high')
+    expect(instructions).toContain('reasoning_effort=medium')
     expect(instructions).toContain('risk_reviewer with')
-    expect(instructions).toContain('model=gpt-6-astra, reasoning_effort=medium')
+    expect(instructions).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=low')
     expect(instructions).toContain('Minor findings, missing advisor responses, or infrastructure failures never')
     expect(instructions).toContain('Never call review round 3')
     expect(instructions).toContain('compares their committed or dirty content')
@@ -10465,8 +10562,8 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     expect(advised).toContain('only if newer input does not change the reviewed scope')
     expect(advised).toContain('legacy design phase')
     expect(advised).toContain('solution_analyst with model=gpt-6-astra,')
-    expect(advised).toContain('reasoning_effort=high')
-    expect(advised).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=medium')
+    expect(advised).toContain('reasoning_effort=medium')
+    expect(advised).toContain('risk_reviewer with model=gpt-6-astra, reasoning_effort=low')
     expect(advised).toContain('fork_turns=none')
     expect(advised).toContain('unavailability, and infrastructure failures do not trigger round 2')
     expect(advised).toContain('Never call round 3')
@@ -10985,7 +11082,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     writeFileSync(unknown, 'unsafe', { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
-    )).toThrow('unsafe attempt entry')
+    )).not.toThrow()
     rmSync(unknown)
 
     const activeLock = join(attemptRoot, 'active-round.lock')
@@ -12204,9 +12301,9 @@ process.exit(0)
     },
   )
 
-  test.skipIf(process.platform === 'win32')(
-    'Codexが即時detachしてstdoutを保持したら公開せずcleanup pendingにする',
-    async () => {
+  test.skipIf(process.platform === 'win32').each([0, 350])(
+    'Codexがdetachしてstdoutを保持する場合は回収証明後だけ完了する (exit delay=%s)',
+    async exitDelayMs => {
       const dir = fixtureDir()
       const repo = join(dir, 'repo')
       const fakeCodex = join(dir, 'fake-codex')
@@ -12221,6 +12318,7 @@ const child = Bun.spawn(['/bin/sleep', '30'], {
 })
 child.unref()
 writeFileSync(process.env.CHILD_PID_FILE!, String(child.pid))
+await Bun.sleep(${exitDelayMs})
 writeFileSync(args[args.indexOf('--output-last-message') + 1], 'ok')
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'instant-detached-thread' }))
 console.log(JSON.stringify({ type: 'turn.started' }))
@@ -12257,16 +12355,24 @@ process.exit(0)
         ).finally(() => { settled = true })
         await waitForTestPath(childPidFile)
         childPid = Number(readFileSync(childPidFile, 'utf8'))
-        // A normal logical completion has no relay deadline. The inherited
-        // descriptor remains open beyond the removed two-second cutoff and
-        // only the explicit runner abort may enter bounded forced cleanup.
+        // Polling may catch even an immediately detached child before its
+        // parent exits. Safe, proven cleanup can then finish normally. If the
+        // descriptor holder escaped that scan, it must outlive the old relay
+        // deadline and only explicit cancellation may force cleanup.
         await Bun.sleep(2_500)
-        expect(settled).toBe(false)
+        const registration = join(dir, 'state/executors', `${job.id}.json`)
+        if (settled) {
+          const outcome = await execution
+          expect(outcome.error).toBeNull()
+          expect(outcome.value?.result).toBe('ok')
+          expect(() => process.kill(childPid, 0)).toThrow()
+          expect(existsSync(registration)).toBe(false)
+          return
+        }
         controller.abort()
         const outcome = await execution
         expect(outcome.value).toBeNull()
         expect(outcome.error).toBeInstanceOf(CodexCleanupPendingError)
-        const registration = join(dir, 'state/executors', `${job.id}.json`)
         expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('active')
         expect(Date.now() - startedAt).toBeLessThan(6_000)
       } finally {
@@ -12529,11 +12635,11 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       expect(overrides).not.toContain('extends=')
       expect(overrides).toContain(`${JSON.stringify(realpathSync(repo))}="write"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(join(repo, '.git')))}="write"`)
-      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(repo), '.zerochan'))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(repo), '.zerochan'))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(attachment))}="read"`)
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(state))}="read"`)
       expect(overrides).not.toContain(JSON.stringify(browserCaptureDirForJob(state, job.id)))
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(codexHome))}="read"`)
       expect(overrides).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
       const primaryPath = (Bun.TOML.parse(overrides) as any).shell_environment_policy.set.PATH
       expect(primaryPath.split(':')).toContain('/usr/bin')
@@ -12558,7 +12664,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         .toEqual(['model="gpt-6-astra"'])
       expect(overrides.split('\n').filter(value => value.startsWith('model_reasoning_effort=')))
         .toEqual(['model_reasoning_effort="medium"'])
-      for (const [role, effort] of [['solution_analyst', 'high'], ['risk_reviewer', 'medium']]) {
+      for (const [role, effort] of [['solution_analyst', 'medium'], ['risk_reviewer', 'low']]) {
         const prefix = `agents.${role}.config_file=`
         const setting = overrides.split('\n').find(value => value.startsWith(prefix))!
         const roleConfig = Bun.TOML.parse(readFileSync(JSON.parse(setting.slice(prefix.length)), 'utf8'))
@@ -12755,7 +12861,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     }
   })
 
-  test('multi-repo workspaceは親をdenyし、pin済みmemberだけをwriteする', () => {
+  test('multi-repo workspaceは親をread-onlyにし、pin済みmemberだけをwriteする', () => {
     const dir = fixtureDir()
     const workspace = join(dir, 'workspace')
     const state = join(dir, 'state')
@@ -12784,14 +12890,14 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         scratchDir: scratch,
         gitRoots: members,
       }).join('\n')
-      expect(overrides).toContain(`${JSON.stringify(realpathSync(workspace))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(realpathSync(workspace))}="read"`)
       expect(overrides).toContain(`${JSON.stringify(realpathSync(instructions))}="read"`)
       for (const member of members) {
         expect(overrides).toContain(`${JSON.stringify(member)}="write"`)
         expect(overrides).toContain(`${JSON.stringify(join(member, '.git'))}="write"`)
-        expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="deny"`)
+        expect(overrides).toContain(`${JSON.stringify(join(member, '.zerochan'))}="read"`)
       }
-      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="deny"`)
+      expect(overrides).toContain(`${JSON.stringify(join(realpathSync(workspace), '.zerochan'))}="read"`)
     } finally {
       store.close()
     }
@@ -12940,10 +13046,10 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         ...overrides.flatMap(value => ['-c', value]),
         '-P', 'zerokun_job', '--', '/bin/zsh', '-c', [
           'set -e',
-          'if /bin/cat "$1" >/dev/null 2>&1; then exit 41; fi',
-          'if /bin/cat "$2" >/dev/null 2>&1; then exit 42; fi',
-          'if /bin/cat "$3" >/dev/null 2>&1; then exit 43; fi',
-          'if /bin/cat "$4" >/dev/null 2>&1; then exit 44; fi',
+          'if (printf blocked > "$1") 2>/dev/null; then exit 41; fi',
+          'if (printf blocked > "$2") 2>/dev/null; then exit 42; fi',
+          'if (printf blocked > "$3") 2>/dev/null; then exit 43; fi',
+          'if (printf blocked > "$4") 2>/dev/null; then exit 44; fi',
           'if /usr/bin/touch parent-write.txt 2>/dev/null; then exit 45; fi',
           "printf 'backend change\\n' > backend/result.txt",
           "printf 'frontend change\\n' > frontend/result.txt",
@@ -13178,7 +13284,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     runSandboxCommit(submodule, join(submoduleBase, 'state'), 'submodule sandbox commit')
   }, 30_000)
 
-  test.skipIf(process.platform !== 'darwin')('実Codex sandboxは完了・GC・再起動後の同一thread添付だけをread許可する', () => {
+  test.skipIf(process.platform !== 'darwin')('実Codex sandboxは保持添付を使えprimary stateはread-only、reviewはdenyを保つ', () => {
     const codex = resolveOfficialStandaloneCodex().physical
     const dir = fixtureDir()
     const state = join(dir, 'state')
@@ -13250,7 +13356,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
         '-P', 'zerokun_job',
         '--',
         '/bin/zsh', '-c',
-        'test ! -r "$1" && test -r "$2" && test "$(/bin/cat "$2")" = "persisted thread attachment" && touch "$3/from-sandbox" && touch .git/from-sandbox',
+        'test -r "$1" && test ! -w "$1" && test -r "$2" && test "$(/bin/cat "$2")" = "persisted thread attachment" && touch "$3/from-sandbox" && touch .git/from-sandbox',
         'zerokun-sandbox', secret, attachment, outbox,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
@@ -13265,7 +13371,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
       const readProfile = Bun.spawnSync([
         codex, 'sandbox', '-C', repo,
         ...readOverrides.flatMap(value => ['-c', value]),
-        '-P', 'zerokun_job', '--', '/usr/bin/true',
+        '-P', 'zerokun_job', '--', '/bin/sh', '-c', 'test ! -r "$1"', 'readonly-probe', secret,
       ], { stdout: 'pipe', stderr: 'pipe' })
       expect(readProfile.exitCode, readProfile.stderr.toString()).toBe(0)
 
@@ -13290,24 +13396,6 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
 })
 
 describe('Slack output guard', () => {
-  test('commit保護nonceは内部名称やID形式と衝突しない', () => {
-    const formerlyColliding = encodeSlackGuardNonce(
-      '09d00000-0000-4000-8000-000000000000',
-    )
-    const second = encodeSlackGuardNonce(
-      '0b840000-0000-4000-8000-000000000000',
-    )
-
-    expect(formerlyColliding).not.toMatch(/gpt|grok/i)
-    expect(second).not.toMatch(/gpt|grok/i)
-    expect(formerlyColliding).not.toMatch(/[0-9a-f]{32,64}/i)
-    expect(formerlyColliding).not.toMatch(/\b[UCBWD][A-Z0-9]{8,}\b/)
-    expect(formerlyColliding).not.toBe(second)
-    expect(() => encodeSlackGuardNonce('not-a-uuid')).toThrow(
-      'Slack guard placeholder entropy is invalid',
-    )
-  })
-
   test('rate-limit通知は表示名を固定せず内部job識別子を含めない', () => {
     const message = slackRateLimitMessage(Date.UTC(2026, 0, 2, 3, 4))
     expect(message).not.toContain('Zeroちゃん')
@@ -13473,7 +13561,7 @@ describe('Slack output guard', () => {
     }
   })
 
-  test('modelがhost controlを反復しても既知ID・pathをSlack結果へ残さない', () => {
+  test('host controlだけを除き本文のID・pathは保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'private-project')
     mkdirSync(repo)
@@ -13515,24 +13603,8 @@ describe('Slack output guard', () => {
       sessionId,
       result: raw,
     }, state)
-    expect(finalized.result).toContain('依頼内容の確認結果です。')
-    expect(finalized.result).not.toContain(job.id)
-    expect(finalized.result).not.toContain(sessionId)
-    expect(finalized.result).not.toContain(repo)
-    expect(finalized.result).not.toContain(outbox)
-    expect(finalized.result).not.toContain(job.chatId)
-    expect(finalized.result).not.toContain(job.userId)
-    expect(finalized.result).not.toContain(job.executorNonce!)
-    expect(finalized.result).toContain('Codex worker job 123 finished through Herdr App Server and Grok.')
-    expect(finalized.result).toContain('クロードコードのアドバイザーとブローカーが確認しました。')
-    expect(finalized.result).not.toContain('\u200b')
-    expect(finalized.result).not.toContain('/opt/homebrew/bin')
-    expect(finalized.result).not.toContain('wabc:pdef')
-    expect(finalized.result).not.toContain('term_deadbeef')
-    expect(finalized.result).not.toContain('~/.codex')
-    expect(finalized.result).not.toContain('.claude/session')
-    expect(finalized.result).not.toContain('file:///opt/homebrew')
-    expect(finalized.result).not.toMatch(/processId|stateChangeSeq|durationMs/i)
+    expect(finalized.result).toBe('依頼内容の確認結果です。\n' + raw.split('--- end Zero host progress check ---\n')[1])
+    expect(finalized.result).not.toContain('Logical attempt nonce:')
     store.close()
   })
 
@@ -13578,9 +13650,9 @@ describe('Slack output guard', () => {
     )
     expect(sanitized).toContain('一次調査では、質問抽出の待ち時間がボトルネック候補です。')
     expect(sanitized).not.toContain('内部構成は公開していません。')
-    expect(sanitized).not.toContain(repo)
+    expect(sanitized).toContain(repo)
     expect(sanitized).toContain('Codex worker')
-    expect(sanitized).not.toMatch(/xoxb|session-private/i)
+    expect(sanitized).toBe(raw)
 
     const posted: string[] = []
     const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
@@ -14018,7 +14090,7 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('内部構成の説明は残し実credentialだけをSlackから落とす', () => {
+  test('認証情報に似た文字列も説明文も原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
@@ -14035,9 +14107,7 @@ describe('Slack output guard', () => {
       task: `Codex と Grok の違いを説明して。token=${token} app=${appToken}`,
     }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'mixed-public-and-internal-answer',
-      result: [
+    const expected = [
         'Codex と Grok は役割が異なります。',
         'Zeroちゃん内部は Codex App Server と Herdr の MCP broker 経由で動作します。',
         `token=${token}`,
@@ -14047,18 +14117,12 @@ describe('Slack output guard', () => {
         bearer,
         jwt,
         invisibleToken,
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'mixed-public-and-internal-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('Codex と Grok は役割が異なります。')
-    expect(finalized.result).toContain('Zeroちゃん内部は Codex App Server と Herdr の MCP broker 経由で動作します。')
-    expect(finalized.result).not.toContain(token)
-    expect(finalized.result).not.toContain(appToken)
-    expect(finalized.result).not.toContain(enterpriseToken)
-    expect(finalized.result).not.toContain(cookieToken)
-    expect(finalized.result).not.toContain('Bearer')
-    expect(finalized.result).not.toContain('eyJhbGci')
-    expect(finalized.result).not.toContain('\u200E')
-    expect(finalized.result).toContain('認証情報を省略')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14246,24 +14310,20 @@ describe('Slack output guard', () => {
       task: 'HTTPのMIME typeとcommit IDを報告してください',
     }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'completion-evidence-answer',
-      result: [
+    const expected = [
         'HTTP: 200, text/html; charset=utf-8',
         'API: application/json',
         `Commit: ${commit}`,
         `コミットID: ${shortCommit}`,
         `Commit: ${unverified}`,
         'not-mime: text/html/../../Users/alice/secret',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'completion-evidence-answer',
+      result: expected,
     }, state)
 
-    expect(finalized.result).toContain('HTTP: 200, text/html; charset=utf-8')
-    expect(finalized.result).toContain('API: application/json')
-    expect(finalized.result).toContain(`Commit: ${commit}`)
-    expect(finalized.result).toContain(`コミットID: ${shortCommit}`)
-    expect(finalized.result).not.toContain(unverified)
-    expect(finalized.result).not.toContain('/Users/alice/secret')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14294,16 +14354,14 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('公開URLは保持しlocal URI・多重encode・Windows pathだけを落とす', () => {
+  test('公開URL・local URI・多重encode・Windows pathを原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, task: '公開リンクと確認結果を教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'public-url-answer',
-      result: [
+    const expected = [
         'docs: https://developer.apple.com/library/archive/documentation',
         'data: https://example.com/docs/data?next=%2Fdocs',
         'safe-query: https://example.com/search?q=/docs/intro',
@@ -14422,87 +14480,36 @@ describe('Slack output guard', () => {
         `encoded-math-forward: ${encodeURIComponent('⟋Users⟋alice⟋secret')}`,
         `encoded-math-reverse: ${encodeURIComponent('⟍⟍server⟍share⟍secret')}`,
         'confusable: ∕Users∕alice∕Projects∕zero∕state.db',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'public-url-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('https://developer.apple.com/library/archive/documentation')
-    expect(finalized.result).toContain('https://example.com/docs/data?next=%2Fdocs')
-    expect(finalized.result).toContain('https://example.com/search?q=/docs/intro')
-    expect(finalized.result).toContain('https://example.com/docs/home/guide')
-    expect(finalized.result).toContain('https://example.com/Users/alice/report')
-    expect(finalized.result).toContain('https://example.com/home/about')
-    expect(finalized.result).toContain('https://example.com/var/data')
-    expect(finalized.result).toContain('https://example.com/tmp/download')
-    expect(finalized.result).toContain('https://[2606:4700:4700::1111]/dns')
-    expect(finalized.result).toContain('//cdn.example.com/x.js')
-    expect(finalized.result).toContain('example.com:443/path')
-    expect(finalized.result).toContain('https://example.com/#/home/dashboard')
-    expect(finalized.result).toContain('https://example.com/#/Users/list')
-    expect(finalized.result).toContain('https://example.com/#/var/charts')
-    expect(finalized.result).toContain('https://example.com/home/account/settings')
-    expect(finalized.result).toContain('https://example.com/Users/list/detail')
-    expect(finalized.result).toContain('https://example.com/users/alice/profile')
-    expect(finalized.result).toContain('https://example.com/var/data/charts')
-    expect(finalized.result).toContain('https://example.com/docs/usr/bin')
-    expect(finalized.result).toContain('https://example.com/#/home/account/settings')
-    expect(finalized.result).toContain('https://example.com/#/Users/list/detail')
-    expect(finalized.result).toContain('https://example.com/#/var/data/charts')
-    expect(finalized.result).toContain('https://example.com/#/Users/alice/secret')
-    expect(finalized.result).toContain('https://example.com/#%2FUsers%2Falice%2Fsecret')
-    expect(finalized.result).toContain('%65%78%61%6d%70%6c%65%2e%63%6f%6d%2fdocs')
-    expect(finalized.result).toContain('exam%70le.com/docs')
-    expect(finalized.result).not.toMatch(/localhost\.?\/|10\.0\.0\.5|buildbox|\[::1\]|\[fc00::1\]|\.ssh\/|file:(?:\/|%)|https:%2F|\$HOME%|%24|%255C|C:(?:\\)?Users|\\\\(?:\?\\UNC\\)?server|∕Users|⧵⧵server|∖∖server|⧹⧹server|╲╲server|╱Users/i)
-    expect(finalized.result).not.toMatch(/example\.com\/\?path=\/Users|example\.com\/search\?q=%2FUsers%2Falice|example\.com\/\?file=/i)
-    expect(finalized.result).not.toMatch(/example\.com\/(?:\?|#)(?:redirect|next|target|location|dest|artifact|where)=/i)
-    expect(finalized.result).not.toMatch(/example\.com\/\?(?:\/Users\/alice\/secret|%2FUsers%2Falice%2Fsecret)/i)
-    expect(finalized.result).not.toMatch(/example\.com\/(?:%2FUsers%2Falice|home\/alice\/\.config|usr\/bin|opt\/homebrew|Applications\/Xcode\.app|System\/Library|tmp\/secret\.txt|Volumes\/Work)/i)
-    expect(finalized.result).not.toContain('https://example.com/#/usr/bin')
-    expect(finalized.result).not.toContain('//example.com/Users/alice/Projects/private.log')
-    expect(finalized.result).not.toContain('www.example.com/home/alice/.config/app')
-    expect(finalized.result).not.toMatch(/Uѕers|hοme|uѕr|Ѕystem|hοmebrew/)
-    expect(finalized.result).not.toContain('%43%3AUsers%2Falice%2Fsecret.txt')
-    expect(finalized.result).not.toContain('C%3AUsers%2Falice%2Fsecret.txt')
-    expect(finalized.result).not.toContain(String.raw`\\%5Cserver%5Cshare%5Csecret`)
-    expect(finalized.result).not.toContain('$%7BHOME%7D%2Fsecret%2Ffile')
-    expect(finalized.result).not.toContain('${HOME%7D%2Fsecret')
-    expect(finalized.result).not.toContain('${HOME%257D%252Fsecret')
-    expect(finalized.result).not.toMatch(/\$\{HO%4DE\}|\$\{H%4FME\}|\\work\\secret/i)
-    expect(finalized.result).not.toContain('$H%4FME%2Fsecret')
-    expect(finalized.result).not.toContain('%2Fworkspace%2Fprivate-project%2Fsecret.txt')
-    expect(finalized.result).not.toContain('%252Fworkspace%252Fprivate-project%252Fsecret.txt')
-    expect(finalized.result).not.toContain('%2Frepo%2Fsecret')
-    expect(finalized.result).not.toContain('C:repo/src/file.ts')
-    expect(finalized.result).not.toMatch(/C:secret\.txt|D:private\.env|C:repo|%43%3Asecret\.txt/i)
-    expect(finalized.result).not.toMatch(/C꞉\\Users|C∶secret\.txt/i)
-    expect(finalized.result).not.toMatch(/localhost:3000|127\.0\.0\.1:8765|10\.0\.0\.5:8080|buildbox:3000|\[::1\]:3000|server\.local:8080/i)
-    expect(finalized.result).not.toMatch(/localhost[∶꞉]3000|10\.0\.0\.5∶8080|localhost∕admin|10\.0\.%30\.5|local%68ost|%6C%6F%63|%31%30%2e%30|%68%74%74%70/i)
-    expect(finalized.result).not.toMatch(/⟋Users|⟍⟍server|%E2%9F%8[BD]/i)
-    expect(finalized.result).toContain('対象箇所')
-    expect(finalized.result).not.toContain('内部パスを省略')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('既知host home prefixをpublic URLへ埋め込んでもrouteとして公開しない', () => {
+  test('host home prefixに似た公開URLも保持する', () => {
     const state = fixtureDir()
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: '/Users/runtime-user/dev/zero', task: '状況を教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'known-host-home-prefix',
-      result: [
+    const expected = [
         'private-path: https://example.com/Users/runtime-user/dev',
         'private-hash: https://example.com/#/Users/runtime-user/dev',
         'confusable-private-path: https://example.com/Users/runtime-uѕer/dev',
         'confusable-private-hash: https://example.com/#/Users/runtime-uѕer/dev',
         'safe-route: https://example.com/Users/list/detail',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'known-host-home-prefix',
+      result: expected,
     }, state)
-    expect(finalized.result).not.toContain('/Users/runtime-user/dev')
-    expect(finalized.result).not.toContain('/Users/runtime-uѕer/dev')
-    expect(finalized.result).toContain('https://example.com/Users/list/detail')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('percent encodingした製品名は残しruntime IDは落とす', () => {
+  test('percent encodingした製品名とIDを保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo-percent-internal-id')
     mkdirSync(repo)
@@ -14510,9 +14517,7 @@ describe('Slack output guard', () => {
     store.enqueue(input({ repoPath: repo, task: '状況を教えて' }))
     const job = store.claimNext('serial-worker')!
     const encodedJobId = job.id.replaceAll('-', '%2D')
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'percent-internal-answer',
-      result: [
+    const expected = [
         '確認が完了しました。',
         'Cod%65xで処理しました。',
         '%43%6F%64%65%78で処理しました。',
@@ -14524,14 +14529,12 @@ describe('Slack output guard', () => {
         'pid%3D12345',
         'five-layer: %2525252565',
         '進捗は50%25です。',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'percent-internal-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認が完了しました。')
-    expect(finalized.result).toContain('進捗は50%25です。')
-    expect(finalized.result).toContain('Cod%65xで処理しました。')
-    expect(finalized.result).toContain('Cl%61ude%20Codeで動いています。')
-    expect(finalized.result).not.toMatch(/pid%3D|%2525252565/i)
-    expect(finalized.result).not.toContain(encodedJobId)
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14563,8 +14566,8 @@ describe('Slack output guard', () => {
     const outbox = artifactDirForJob(state, job.id)
     mkdirSync(outbox, { recursive: true })
     for (const [filename, expected] of [
-      ['report.codex', 'result.codex'],
-      ['report.claude', 'result.claude'],
+      ['report.codex', 'report.codex'],
+      ['report.claude', 'report.claude'],
       ['report.grok', 'report.grok'],
       ['report.o3', 'report.o3'],
       ['unsafe codex report.png', 'unsafe codex report.png'],
@@ -14584,16 +14587,14 @@ describe('Slack output guard', () => {
     store.close()
   })
 
-  test('日本語やJSON escapeへ直結したhost pathもSlackへ残さない', () => {
+  test('日本語やJSON escapeを含むpathも原文で保持する', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
     const store = new JobStore(join(state, 'jobs.sqlite3'))
     store.enqueue(input({ repoPath: repo, task: '内部処理の結果だけ教えて' }))
     const job = store.claimNext('serial-worker')!
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'adjacent-path-answer',
-      result: [
+    const expected = [
         '確認しました。',
         '内部処理は/opt/homebrew/bin/herdrで動作します。',
         'cwd:/Users/example/.codex/config.toml',
@@ -14619,17 +14620,16 @@ describe('Slack output guard', () => {
         'local-triple: zerokun:///etc/passwd',
         'encoded: https://example.invalid/%2FUsers%2Flocal%2F.ssh%2Fid_rsa',
         '[詳細](https://example.invalid/opt/homebrew/bin/herdr)',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'adjacent-path-answer',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認しました。')
-    expect(finalized.result).not.toMatch(/\/opt\/homebrew|\/Users\/example|~\/\.codex|\\\/Users/i)
-    expect(finalized.result).not.toMatch(/My Project|秘密|\.zerokun|example\.invalid|file:\/\/|vscode:\/\//i)
-    expect(finalized.result).not.toMatch(/id_rsa|passwd|credentials|homebrew\/bin|\/srv|\/System|\/\/Users|\/\/\/tmp/i)
-    expect(finalized.result).not.toMatch(/~\/\.ssh|~\/\.aws|\$HOME|zerokun:\/\/|codex:\/\//i)
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
-  test('host生成の添付suffixをユーザー本文とみなさずfollow-up pathと内部名を消す', () => {
+  test('follow-upのpathとIDを回答で書き換えない', () => {
     const state = fixtureDir()
     const repo = join(state, 'repo')
     mkdirSync(repo)
@@ -14655,21 +14655,17 @@ describe('Slack output guard', () => {
       attachments: [attachment],
       kind: 'steer',
     })).toBe('staged')
-    const finalized = finalizeSuccessfulExecution(job, {
-      sessionId: 'attachment-host-suffix-session',
-      result: [
+    const expected = [
         '確認しました。Codex の内部処理結果です。',
         `添付は ${attachment} です。`,
         '相対表示は .codex/zerokun/live-input/example.txt です。',
         '送信元は 1800000001.000200 / UFOLLOWUP123 です。',
-      ].join('\n'),
+      ].join('\n')
+    const finalized = finalizeSuccessfulExecution(job, {
+      sessionId: 'attachment-host-suffix-session',
+      result: expected,
     }, state)
-    expect(finalized.result).toContain('確認しました。')
-    expect(finalized.result).toContain('Codex の内部処理結果です。')
-    expect(finalized.result).not.toMatch(/\.codex|live-input/i)
-    expect(finalized.result).not.toContain(attachment)
-    expect(finalized.result).not.toContain('1800000001.000200')
-    expect(finalized.result).not.toContain('UFOLLOWUP123')
+    expect(finalized.result).toBe(expected)
     store.close()
   })
 
@@ -14695,6 +14691,34 @@ describe('Slack output guard', () => {
       payload: '**受付済み**',
     })
     expect(posted[2]).toBe('*受付済み*')
+    store.close()
+  })
+
+  test('生成URLのpath・query・fragmentを原文のまま永続化してSlackへ届ける', async () => {
+    const store = makeStore()
+    const state = dirname(store.dbPath)
+    const job = store.enqueue(input({ task: 'レポートを生成して', messageId: 'preserve-report-url' })).job
+    const running = store.claimNext('serial-worker')!
+    const url = 'https://reports.example.test/reports/view/rpt_' + 'a'.repeat(64)
+      + '/ZERO_REPORT_123?ref=ZERO_TOKEN_456&token=synthetic_example_123456789#ZERO_REPORT_' + 'b'.repeat(64)
+    const text = 'レポート: ' + url + '\nview bearer vs callback'
+    const finalized = finalizeSuccessfulExecution(running, { sessionId: 'report-session', result: text }, state)
+    expect(finalized.result).toBe(text)
+    store.complete(job.id, 'report-session', finalized.result)
+    const posted: string[] = []
+    const notifier = new SlackNotifier('xoxb-fixture', () => {}, store, {
+      postMessage: async value => { posted.push(value.text) },
+    })
+    await notifier.completed(store.get(job.id)!, finalized.result)
+    // 完了報告は1行目が定型で依頼者宛てになる。URLはその後ろに原文のまま残る。
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toStartWith('✅ 完了 ／ 対応不要')
+    expect(posted[0]).toContain(`<@${job.userId}>`)
+    expect(posted[0]).toEndWith(text)
+    expect(posted[0]).toContain(url)
+    store.enqueue(input({ task: 'さっきのURLを確認して', messageId: 'preserve-report-url-next' }))
+    const next = store.claimNext('serial-worker')!
+    expect(store.threadHistorySnapshot(next.id).transcript).toContain(url)
     store.close()
   })
 
@@ -14755,8 +14779,8 @@ describe('Slack output guard', () => {
       const [internalSealed] = extractArtifactPaths(internalSealedResult).files
       const internalUpload = readUploadableArtifact(job, internalSealed!, state)
       expect(internalUpload.data.toString()).toBe('safe internal-name report')
-      expect(internalUpload.filename).toBe('result.txt')
-      expect(internalUpload.filename).not.toContain(job.id)
+      expect(internalUpload.filename).toBe(`${job.id}.txt`)
+      expect(internalUpload.filename).toContain(job.id)
       const encodedNameResult = sealArtifactResult(
         job,
         `完了\n<zerokun_files>${JSON.stringify([encodedLocalName])}</zerokun_files>`,
@@ -14765,8 +14789,7 @@ describe('Slack output guard', () => {
       const [encodedNameSealed] = extractArtifactPaths(encodedNameResult).files
       const encodedNameUpload = readUploadableArtifact(job, encodedNameSealed!, state)
       expect(encodedNameUpload.data.toString()).toBe('safe encoded-name report')
-      expect(encodedNameUpload.filename).toBe('result.txt')
-      expect(encodedNameUpload.filename).not.toMatch(/Users|\.ssh|id_rsa|%2F/i)
+      expect(encodedNameUpload.filename).toBe('report%2FUsers%2Falice%2F.ssh%2Fid_rsa.txt')
       const implementationNameResult = sealArtifactResult(
         job,
         `完了\n<zerokun_files>${JSON.stringify([implementationName])}</zerokun_files>`,
@@ -14811,7 +14834,7 @@ describe('Slack output guard', () => {
     }
   })
 
-  test('任意のbinaryと実装名を許可し、明白なcredential bytesだけを拒否する', () => {
+  test('任意のbinaryを内容パターンで拒否せず配送する', () => {
     const dir = fixtureDir()
     const state = join(dir, 'state')
     const repo = join(dir, 'repo')
@@ -14839,8 +14862,7 @@ describe('Slack output guard', () => {
       const [sealedBinary, sealedNotes, sealedCredential] = extractArtifactPaths(sealedResult).files
       expect(readUploadableArtifact(job, sealedBinary!, state).data).toEqual(readFileSync(binary))
       expect(readUploadableArtifact(job, sealedNotes!, state).data.toString()).toContain('Codex and Claude')
-      expect(() => readUploadableArtifact(job, sealedCredential!, state))
-        .toThrow(ArtifactPublicationBlockedError)
+      expect(readUploadableArtifact(job, sealedCredential!, state).data).toEqual(readFileSync(credential))
     } finally {
       store.close()
     }
@@ -15044,7 +15066,7 @@ describe('durable terminal notifications', () => {
     }
   }
 
-  test('内部IDを含むartifact名はupload URL取得とcompleteの両方で同じ安全名にする', async () => {
+  test('IDを含むartifact名をuploadとcompleteでそのまま保持する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-internal-title' })).job
@@ -15078,12 +15100,11 @@ describe('durable terminal notifications', () => {
     await notifier.completed(
       store.get(queued.id)!, result, notification.id,
     )
-    expect(observedNames).toEqual(['result.txt', 'result.txt'])
-    expect(observedNames.join(' ')).not.toContain(running.id)
+    expect(observedNames).toEqual([`${running.id}.txt`, `${running.id}.txt`])
     store.close()
   })
 
-  test('不可視文字で分割したcredentialをartifact名からも除去する', async () => {
+  test('credentialに似たartifact名も原文で保持する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-invisible-token-title' })).job
@@ -15115,13 +15136,11 @@ describe('durable terminal notifications', () => {
       },
     })
     await notifier.completed(store.get(queued.id)!, result, notification.id)
-    expect(observedNames).toEqual(['result.txt', 'result.txt'])
-    expect(observedNames.join(' ')).not.toContain('xoxb')
-    expect(observedNames.join(' ')).not.toContain('\u200E')
+    expect(observedNames).toEqual([source.split('/').at(-1)!, source.split('/').at(-1)!])
     store.close()
   })
 
-  test('credential artifactだけをupload前に止め、同じ結果の安全なbinaryは配送する', async () => {
+  test('credentialに似たbytesを含むartifactも同じ結果のbinaryも配送する', async () => {
     const store = makeStore()
     const state = dirname(store.dbPath)
     const queued = store.enqueue(input({ messageId: 'artifact-publication-policy' })).job
@@ -15160,15 +15179,13 @@ describe('durable terminal notifications', () => {
       completeUpload: async () => {},
     })
     await notifier.completed(store.get(queued.id)!, result, notification.id)
-    expect(store.artifactDeliveryState(queued.id, blocked!)).toBe('abandoned')
+    expect(store.artifactDeliveryState(queued.id, blocked!)).toBe('delivered')
     expect(store.artifactDeliveryState(queued.id, safe!)).toBe('delivered')
-    expect(store.publicationBlockedArtifactCount(queued.id)).toBe(1)
+    expect(store.publicationBlockedArtifactCount(queued.id)).toBe(0)
     expect(store.abandonedArtifactCount(queued.id)).toBe(0)
-    expect(uploadTargets).toEqual(['safe.png'])
-    expect(uploaded).toEqual([readFileSync(safeSource)])
-    expect(posted).toHaveLength(1)
-    expect(posted[0]?.text).toBe(slackArtifactPublicationBlockedMessage())
-    expect(posted[0]?.clientMessageId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(uploadTargets).toEqual(['blocked.bin', 'safe.png'])
+    expect(uploaded).toEqual([readFileSync(blockedSource), readFileSync(safeSource)])
+    expect(posted).toHaveLength(0)
     store.close()
   })
 

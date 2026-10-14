@@ -10,6 +10,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { captureClaudeUsage, CodexUsageTracker, createUsageRecorder, ownedClaudeUsageSession, readTaskUsage } from './task-usage.ts'
 import { readProcessIdentity } from './process-generation.ts'
 import { registerTaskUsageTool } from './task-usage-broker.ts'
+import { ClaudePrimaryUsage } from './claude-primary-usage.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }) })
@@ -29,6 +30,19 @@ const counts = (input: number, output = 10, cached = 20) => ({ inputTokens: inpu
 const started = (thread = 'root', turn = 'turn') => ({ method: 'turn/started', params: { threadId: thread, turn: { id: turn } } })
 const ended = (thread = 'root', turn = 'turn') => ({ method: 'turn/completed', params: { threadId: thread, turn: { id: turn } } })
 const usage = (input = 100, thread = 'root', turn = 'turn', last = counts(input)) => ({ method: 'thread/tokenUsage/updated', params: { threadId: thread, turnId: turn, tokenUsage: { total: counts(input), last } } })
+test('Claude primary usage counts new message IDs once and never borrows preceding jobs on session resume', () => {
+  const f = fixture(), old = new ClaudePrimaryUsage(f.state, 'old', 'one'), current = new ClaudePrimaryUsage(f.state, 'current', 'two')
+  const message = (id: string, input: number) => ({ type: 'assistant', message: { id, model: 'claude-opus-5-5',
+    usage: { input_tokens: input, output_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 0 } } })
+  for (const [tracker, id, input] of [[old, 'old-message', 100], [current, 'new-message', 30]] as const) {
+    tracker.begin(); tracker.observe(message(id, input)); tracker.observe(message(id, input))
+    tracker.observe({ type: 'result', subtype: 'success', is_error: false, result: 'done' }); tracker.close()
+  }
+  expect(readTaskUsage(f.state, f.context, { taskNumbers: [1] }).jobs[0]!.claude.tokens?.input).toBe(100)
+  expect(readTaskUsage(f.state, f.context, { taskNumbers: [2] }).jobs[0]!.claude.tokens?.input).toBe(30)
+  current.begin(); current.observe(message('uncertain', 5)); current.close()
+  expect(readTaskUsage(f.state, f.context, { taskNumbers: [2] }).jobs[0]!.claude.status).toBe('partial')
+})
 function log(state: string, id: string, events: unknown[], stage = 'new') {
   writeFileSync(join(state, 'job-logs', `${id}.${stage}.stdout.log`), events.map(e => JSON.stringify(e)).join('\n') + '\n', { mode: 0o600 })
 }

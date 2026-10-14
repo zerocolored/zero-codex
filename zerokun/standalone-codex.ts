@@ -12,7 +12,8 @@ import {
   realpathSync,
 } from 'fs'
 import { homedir } from 'os'
-import { isAbsolute, join, parse, relative, resolve, sep } from 'path'
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'path'
+import { isDeepStrictEqual } from 'util'
 
 interface FileIdentity {
   dev: string
@@ -321,6 +322,24 @@ function supportedVersion(version: string): boolean {
   return true
 }
 
+function readOfficialManifest(releaseDir: string): { packageVersion: string; identity: FileIdentity } {
+  const target = expectedStandaloneTarget()
+  const manifest = readTrustedManifest(join(releaseDir, 'codex-package.json'))
+  const version = manifest.value.version
+  if (JSON.stringify(Object.keys(manifest.value).sort()) !== JSON.stringify(OFFICIAL_MANIFEST_KEYS)
+    || manifest.value.layoutVersion !== 1 || manifest.value.variant !== 'codex'
+    || manifest.value.entrypoint !== 'bin/codex'
+    || manifest.value.resourcesDir !== 'codex-resources'
+    || manifest.value.pathDir !== 'codex-path'
+    || manifest.value.target !== target
+    || typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)
+    || !supportedVersion(version)
+    || basename(releaseDir) !== `${version}-${target}`) {
+    throw new Error('Codex official standalone manifest does not match the release layout')
+  }
+  return { packageVersion: version, identity: manifest.identity }
+}
+
 /**
  * Resolve only the layout installed by bootstrap-macos.sh. No PATH, Homebrew,
  * npm wrapper, or ZEROKUN_CODEX_BIN fallback is part of this production trust
@@ -352,24 +371,11 @@ function resolveOfficialStandaloneCodexAtHome(homeDirectory: string): OfficialCo
     if (links[1].resolvedTarget !== releaseDir) {
       throw new Error('Codex official standalone current link has an unexpected target')
     }
-    const target = expectedStandaloneTarget()
-    const manifest = readTrustedManifest(join(releaseDir, 'codex-package.json'))
-    const version = manifest.value.version
-    if (JSON.stringify(Object.keys(manifest.value).sort()) !== JSON.stringify(OFFICIAL_MANIFEST_KEYS)
-      || manifest.value.layoutVersion !== 1 || manifest.value.variant !== 'codex'
-      || manifest.value.entrypoint !== 'bin/codex'
-      || manifest.value.resourcesDir !== 'codex-resources'
-      || manifest.value.pathDir !== 'codex-path'
-      || manifest.value.target !== target
-      || typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)
-      || !supportedVersion(version)
-      || parts[0] !== `${version}-${target}`) {
-      throw new Error('Codex official standalone manifest does not match the release layout')
-    }
+    const manifest = readOfficialManifest(releaseDir)
     const leafIdentity = verifyExecutableLeaf(walked.physical, true)
     return {
       version: 1,
-      packageVersion: version,
+      packageVersion: manifest.packageVersion,
       logical,
       physical: walked.physical,
       releaseDir,
@@ -397,17 +403,117 @@ export function resolveOfficialStandaloneCodexForTesting(
   return resolveOfficialStandaloneCodexAtHome(homeDirectory)
 }
 
-export function verifyOfficialCodexSnapshot(
-  expected: OfficialCodexSnapshot,
-): OfficialCodexSnapshot {
-  if (!expected || expected.version !== 1 || typeof expected.physical !== 'string') {
+const PATH_IDENTITY_KEYS = ['dev', 'ino', 'mode', 'uid', 'gid'] as const
+const FILE_IDENTITY_KEYS = [...PATH_IDENTITY_KEYS, 'nlink', 'size', 'mtimeNs', 'ctimeNs'] as const
+
+function snapshotIdentity<K extends string>(value: unknown, keys: readonly K[]): Record<K, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Codex official standalone snapshot is invalid')
   }
-  const current = resolveOfficialStandaloneCodex()
-  if (JSON.stringify(current) !== JSON.stringify(expected)) {
+  const record = value as Record<string, unknown>
+  const result = {} as Record<K, string>
+  for (const key of keys) {
+    const field = record[key]
+    const pattern = key === 'mtimeNs' || key === 'ctimeNs' ? /^(0|-?[1-9]\d*)$/ : /^(0|[1-9]\d*)$/
+    if (typeof field !== 'string' || !pattern.test(field)) {
+      throw new Error('Codex official standalone snapshot is invalid')
+    }
+    result[key] = field
+  }
+  if (!isDeepStrictEqual(value, result)) throw new Error('Codex official standalone snapshot is invalid')
+  return result
+}
+
+/** Paths visited by one leg of the official two-link resolution, without the root. */
+function pathComponents(path: string): string[] {
+  let current = parse(path).root
+  return relative(current, path).split(sep).map(component => {
+    current = join(current, component)
+    return current
+  })
+}
+
+function verifyOfficialCodexSnapshotAtHome(
+  expected: OfficialCodexSnapshot,
+  homeDirectory: string,
+): OfficialCodexSnapshot {
+  if (!expected || expected.version !== 1 || typeof expected.packageVersion !== 'string'
+    || !/^\d+\.\d+\.\d+$/.test(expected.packageVersion) || !supportedVersion(expected.packageVersion)
+    || !Array.isArray(expected.nodes)) {
+    throw new Error('Codex official standalone snapshot is invalid')
+  }
+  const home = realpathSync(homeDirectory)
+  const logical = join(home, '.local', 'bin', 'codex')
+  const standalone = join(home, '.codex', 'packages', 'standalone')
+  const current = join(standalone, 'current')
+  const releaseDir = join(standalone, 'releases', `${expected.packageVersion}-${expectedStandaloneTarget()}`)
+  const physical = join(releaseDir, 'bin', 'codex')
+  if (expected.logical !== logical || expected.releaseDir !== releaseDir || expected.physical !== physical) {
     throw new Error('Codex official standalone changed after it was verified')
   }
-  return current
+
+  // Validate the saved resolution history without consulting today's selectors.
+  // Reconstruct every path/kind so missing, duplicate, reordered or forged nodes
+  // cannot omit any part of the pinned physical chain from verification.
+  const paths = [parse(home).root, ...pathComponents(logical), ...pathComponents(current), ...pathComponents(physical)]
+  if (expected.nodes.length !== paths.length) throw new Error('Codex official standalone snapshot is invalid')
+  const resolutionPaths = new Set<string>([logical])
+  const nodes: PathNodeSnapshot[] = paths.map((path, index) => {
+    const saved = expected.nodes[index]
+    if (!saved || typeof saved !== 'object') throw new Error('Codex official standalone snapshot is invalid')
+    if (index > 0) resolutionPaths.add(path)
+    const resolvedTarget = path === logical ? join(current, 'bin', 'codex') : path === current ? releaseDir : undefined
+    const node: PathNodeSnapshot = {
+      path,
+      kind: resolvedTarget ? 'symlink' : path === physical ? 'file' : 'directory',
+      identity: snapshotIdentity(saved.identity, PATH_IDENTITY_KEYS),
+    }
+    if (resolvedTarget) {
+      if (typeof saved.target !== 'string' || !saved.target || saved.target.includes('\0')
+        || resolve(dirname(path), saved.target) !== resolvedTarget) {
+        throw new Error('Codex official standalone snapshot is invalid')
+      }
+      node.target = saved.target
+      node.resolvedTarget = resolvedTarget
+      resolutionPaths.add(resolvedTarget)
+    }
+    return node
+  })
+  const canonical: OfficialCodexSnapshot = {
+    version: 1, packageVersion: expected.packageVersion, logical, physical, releaseDir,
+    resolutionPaths: [...resolutionPaths], nodes,
+    manifestIdentity: snapshotIdentity(expected.manifestIdentity, FILE_IDENTITY_KEYS),
+    leafIdentity: snapshotIdentity(expected.leafIdentity, FILE_IDENTITY_KEYS),
+  }
+  if (!isDeepStrictEqual(expected, canonical)) throw new Error('Codex official standalone snapshot is invalid')
+
+  // Only this physical release is executed by the supervisor and brokers. An
+  // official update may replace/remove either selector while this task runs.
+  const walked = walkExecutable(physical)
+  const physicalNodes = [nodes[0]!, ...nodes.slice(paths.lastIndexOf(current) + 1)]
+  if (walked.physical !== physical || !isDeepStrictEqual(walked.nodes, physicalNodes)) {
+    throw new Error('Codex official standalone changed after it was verified')
+  }
+  const manifest = readOfficialManifest(releaseDir)
+  const leaf = verifyExecutableLeaf(physical, true)
+  if (manifest.packageVersion !== expected.packageVersion
+    || !isDeepStrictEqual(manifest.identity, expected.manifestIdentity)
+    || !isDeepStrictEqual(leaf, expected.leafIdentity)) {
+    throw new Error('Codex official standalone changed after it was verified')
+  }
+  return canonical
+}
+
+export function verifyOfficialCodexSnapshot(expected: OfficialCodexSnapshot): OfficialCodexSnapshot {
+  return verifyOfficialCodexSnapshotAtHome(expected, homedir())
+}
+
+/** Test fixture entrypoint; production callers always validate against the real HOME. */
+export function verifyOfficialCodexSnapshotForTesting(
+  expected: OfficialCodexSnapshot,
+  homeDirectory: string,
+): OfficialCodexSnapshot {
+  return verifyOfficialCodexSnapshotAtHome(expected, homeDirectory)
 }
 
 export function encodeOfficialCodexSnapshot(snapshot: OfficialCodexSnapshot): string {

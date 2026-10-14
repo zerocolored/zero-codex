@@ -123,6 +123,22 @@ export function listRegisteredSlackApps(home = homedir()): RegisteredSlackApp[] 
   return registeredSlackAppIds(home).map(appId => readRegisteredSlackApp(appId, home)!)
 }
 
+/** Resolve one recovery target without depending on other apps' live directories. */
+export function registeredSlackAppForState(stateDir: string, home = homedir()): RegisteredSlackApp | null {
+  const state = requireManagedStateRoot(stateDir)
+  const matches = registeredSlackAppIds(home).flatMap(appId => {
+    let record: RegisteredSlackApp | null
+    try { record = readRegisteredSlackAppMetadata(appId, home) }
+    catch { return [] }
+    return record?.stateDir === state ? [record] : []
+  })
+  if (matches.length > 1) throw new Error('保存先に複数のSlackアプリが登録されています')
+  if (!matches[0]) return null
+  const selected = readRegisteredSlackApp(matches[0].appId, home)
+  if (selected?.stateDir !== state) throw new Error('Slackアプリの登録先が変更されました')
+  return selected
+}
+
 /** Adopt the existing installation in place; never copy its credentials or queue. */
 export function adoptLegacySlackApp(home = homedir(), environment: Record<string, string | undefined> = home === homedir() ? process.env : {}): RegisteredSlackApp | null {
   const selected = resolveZeroStateDir(environment, home)

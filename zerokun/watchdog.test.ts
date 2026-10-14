@@ -10,6 +10,37 @@ const watchdog = join(import.meta.dir, 'watchdog.sh')
 const watchdogSource = readFileSync(watchdog, 'utf8')
 
 describe('Zero-kun watchdog', () => {
+  test.each([false, true])('notification mute runs per-app recovery with separate controller=%s', (separateController) => {
+    const root = mkdtempSync(join(tmpdir(), 'zero-watchdog-recovery-'))
+    try {
+      const state = join(root, 'state')
+      const source = join(root, 'release', 'zerokun')
+      mkdirSync(state, { mode: 0o700 })
+      mkdirSync(source, { recursive: true })
+      mkdirSync(join(root, '.local', 'bin'), { recursive: true })
+      writeFileSync(join(source, 'job-runner.ts'), '')
+      writeFileSync(join(source, 'service-control.ts'), '')
+      writeFileSync(join(source, 'herdr-recovery.ts'), '')
+      symlinkSync(join(source, 'job-runner.ts'), join(state, 'job-runner.ts'))
+      const controllerSource = separateController ? join(root, 'controller', 'zerokun') : source
+      if (separateController) {
+        mkdirSync(controllerSource, { recursive: true })
+        writeFileSync(join(controllerSource, 'service-control.ts'), '')
+        writeFileSync(join(controllerSource, 'herdr-recovery.ts'), '')
+        symlinkSync(join(controllerSource, 'service-control.ts'), join(state, 'service-control.ts'))
+      }
+      writeFileSync(join(state, 'watchdog-off'), '')
+      writeFileSync(join(root, '.local', 'bin', 'bun'),
+        '#!/bin/bash\nprintf "%s\\n" "$@" > "$HOME/recovery-args"\n', { mode: 0o700 })
+      const result = Bun.spawnSync(['/bin/bash', watchdog], {
+        env: { HOME: root, PATH: '/usr/bin:/bin', ZEROKUN_STATE_DIR: state },
+      })
+      expect(result.exitCode).toBe(0)
+      expect(readFileSync(join(root, 'recovery-args'), 'utf8').trim().split('\n'))
+        .toEqual(['--config=/dev/null', '--no-env-file', join(controllerSource, 'service-control.ts'), 'recover', join(root, 'release'), state])
+      expect(result.stdout.toString()).toContain('muted')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
   test('selftestで連続down・再通知抑制・復旧・muteの状態遷移を検証する', () => {
     const result = Bun.spawnSync(['/bin/bash', watchdog, '--selftest'], {
       stdout: 'pipe',

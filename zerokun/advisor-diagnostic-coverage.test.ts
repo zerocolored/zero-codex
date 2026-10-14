@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { assertRequiredAdvisorRounds, collectHostAdvisorCoverage } from './codex-executor.ts'
 import { observeNativeAdvisorCoverage } from './native-advisor-coverage.ts'
 import { nativeAdvisorMarker } from './native-advisor-evidence.ts'
@@ -48,6 +48,10 @@ function fixture() {
     writeFileSync(join(root, name), 'opaque auxiliary data', { mode: 0o600 })
   }
   symlinkSync(join(root, 'does-not-exist'), join(root, 'z-auxiliary-link'))
+  for (const name of ['active-round.lock.stop', 'future-runtime-note', 'ephemeral-delivery.json.tmp']) {
+    writeFileSync(join(dirname(root), name), 'opaque sidecar', { mode: 0o600 })
+  }
+  symlinkSync(join(root, 'missing'), join(dirname(root), 'auxiliary-link'))
   const rounds = () => assertRequiredAdvisorRounds(job, state, digest, nonce, input, digest, digest)
   const marker = nativeAdvisorMarker(nonce, 1, digest, 'investigation', 1, 'solution')
   const child = {

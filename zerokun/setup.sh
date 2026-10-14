@@ -637,6 +637,7 @@ bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/safe-file.ts" validate-e
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$REPO_DIR/zerokun/job-runner.ts" "$CH/job-runner.ts"
 ln -sfn "$REPO_DIR/zerokun/codex-executor.ts" "$CH/codex-executor.ts"
+ln -sfn "$REPO_DIR/zerokun/service-control.ts" "$CH/service-control.ts"
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/update-runtime.ts" \
   install "$REPO_DIR/zerokun" "$CH" >/dev/null
 install -m 0700 "$REPO_DIR/zerokun/watchdog.sh" "$CH/watchdog.sh"
@@ -656,7 +657,7 @@ if [ "${ZEROKUN_SKIP_WATCHDOG_LAUNCHD:-0}" = "1" ]; then
 else
   "$LAUNCHCTL_BIN" bootout "gui/$(id -u)/$WATCHDOG_LABEL" 2>/dev/null || true
   if "$LAUNCHCTL_BIN" bootstrap "gui/$(id -u)" "$WATCHDOG_PLIST"; then
-    echo "   watchdog をlaunchdへ登録しました(60秒間隔・自動再起動なし)"
+    echo "   watchdog をlaunchdへ登録しました(60秒間隔・停止時の自動復旧)"
   else
     echo "⚠️ watchdog のlaunchd登録に失敗しました。CLIとaliasの設置は続行します。" >&2
   fi

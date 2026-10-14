@@ -1,19 +1,9 @@
 import type { AppServerNotification } from './codex-app-server-session'
-import { containsCredentialMaterial, normalizePublicGuardText } from './public-output-guard'
 
 const MAX_MONITOR_TEXT_CHARS = 600
 const MAX_MONITOR_INPUT_CHARS = 8_192
 const MAX_TRACKED_MONITOR_ITEMS = 512
 const MAX_BROWSER_SCREENSHOT_BYTES = 16 * 1024 * 1024
-
-const SECRET_PATTERNS = [
-  /\b(?:Basic|Bearer)\s+[A-Za-z0-9._~+\/-]{8,}={0,2}\b/i,
-  /\b(?:xox[baprs]|xapp)-[A-Za-z0-9-]{8,}\b/i,
-  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/i,
-  /\bgh[pousr]_[A-Za-z0-9]{16,}\b/i,
-  /\bAKIA[A-Z0-9]{16}\b/,
-  /\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|password|secret)\s*[:=]\s*\S+/i,
-] as const
 
 function plainRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -143,32 +133,9 @@ export function sanitizeMonitorText(
   if (typeof value !== 'string' || value.length > MAX_MONITOR_INPUT_CHARS || maxChars < 1) {
     return null
   }
-  let text = normalizePublicGuardText(stripUnsafeTerminalText(value)).trim()
+  let text = stripUnsafeTerminalText(value).trim()
   if (!text) return null
-  if (containsCredentialMaterial(text) || SECRET_PATTERNS.some(pattern => pattern.test(text))) {
-    return null
-  }
-  if (/(?:\{|\[)\s*"(?:[^"\\]|\\.){1,128}"\s*:/.test(text)) return null
-  if (/^(?:\{|\[)/.test(text)) {
-    try {
-      JSON.parse(text)
-      return null
-    } catch {}
-  }
-  text = text
-    .replace(/\b[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/[^\s<>"']+/g, '（URLを省略）')
-    .replace(
-      /(^|[\s=:(,"'`\[])\/(?!\/)[^\s<>"'`)\]}、。！？]*/gm,
-      '$1（内部パスを省略）',
-    )
-    .replace(/(^|[\s=:(,"'`\[])~\/[^\s<>"'`)\]}、。！？]*/gm, '$1（内部パスを省略）')
-    .replace(/\b[A-Za-z]:\\[^\s<>"']+/g, '（内部パスを省略）')
-    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, '（内部IDを省略）')
-    .replace(/\b[0-9a-f]{24,}\b/gi, '（内部IDを省略）')
-    .replace(/\b[CUWDT](?=[A-Z0-9]{8,}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{8,}\b/g, '（内部IDを省略）')
-    .replace(/\b[A-Za-z0-9_-]{48,}\b/g, '（長い識別子を省略）')
-    .replace(/\s+/g, ' ')
-    .trim()
+  text = text.replace(/\s+/g, ' ').trim()
   if (!text) return null
   if (text.length > maxChars) text = `${text.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
   return text

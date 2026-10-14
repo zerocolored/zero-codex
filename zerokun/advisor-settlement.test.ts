@@ -2,7 +2,8 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { requestAdvisorStop, watchAdvisorStopRequest, waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { AdvisorRoundDeadlines, readActiveAdvisorRound, requestAdvisorStop, watchAdvisorStopRequest, waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS, ADVISOR_SETTLEMENT_TIMEOUT_MS } from './advisor-timeouts.ts'
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 function fixture() {
@@ -67,6 +68,30 @@ test('既定待機も期限で終了しlive reviewerやlockを直接変更しな
   } finally { Date.now = originalNow }
 })
 
+test('親の既定待機はGrokの1時間と認証復旧後の1時間を途中で打ち切らない', async () => {
+  const f = fixture()
+  const originalNow = Date.now
+  let finished = false
+  const waiting = waitForAdvisorSettlement({ ...f.options, timeoutMs: undefined })
+    .then(value => { finished = true; return value })
+  try {
+    for (const elapsed of [31 * 60_000, GROK_REVIEW_TIMEOUT_MS,
+      2 * GROK_REVIEW_TIMEOUT_MS + GROK_OAUTH_TIMEOUT_MS]) {
+      Date.now = () => originalNow() + elapsed
+      await Bun.sleep(15)
+      expect(finished).toBe(false)
+    }
+    expect(ADVISOR_SETTLEMENT_TIMEOUT_MS).toBeGreaterThan(
+      2 * GROK_REVIEW_TIMEOUT_MS + GROK_OAUTH_TIMEOUT_MS)
+    rmSync(f.lock)
+    expect(await waiting).toBe('settled')
+  } finally {
+    rmSync(f.lock, { force: true })
+    Date.now = originalNow
+    await waiting
+  }
+})
+
 test.each(['old-generation', 'same-generation'] as const)('新しいactive lockと古いterminal journalが共存しても早期終了しない: %s', async kind => {
   const f = fixture()
   const stale = { ...JSON.parse(await Bun.file(f.journal).text()), status: 'required-reviewer-failed',
@@ -104,4 +129,42 @@ test('前roundの停止要求と差し替わったclaimは新しいreviewerを�
     requestAdvisorStop(f.lock)
     await Bun.sleep(10); expect(watcher.signal.aborted).toBe(true)
   } finally { watcher.close() }
+})
+
+test('goal retention only uses an exact live active round', async () => {
+  const f = fixture()
+  expect(readActiveAdvisorRound(f.options)).toMatchObject({ phase: 'investigation', round: 1, inputRevision: 1 })
+  expect(readActiveAdvisorRound({ ...f.options, processNonce: 'e'.repeat(32) })).toBeNull()
+  const record = JSON.parse(await Bun.file(f.lock).text()); record.brokerProcessId = 2147483647
+  writeFileSync(f.lock, JSON.stringify(record), { mode: 0o600 })
+  expect(readActiveAdvisorRound(f.options)).toBeNull()
+  rmSync(f.lock); expect(readActiveAdvisorRound(f.options)).toBeNull()
+})
+
+test('an expired initial round never consumes a later review round acquisition budget', async () => {
+  const f = fixture(), deadlines = new AdvisorRoundDeadlines(2000)
+  const initial = readActiveAdvisorRound(f.options)!
+  expect(deadlines.forRound(initial.key, 1000)).toBe(3000)
+  expect(deadlines.forRound(initial.key, 4000)).toBe(3000)
+  const lock = JSON.parse(await Bun.file(f.lock).text()); lock.phase = 'review'
+  writeFileSync(f.lock, JSON.stringify(lock), { mode: 0o600 })
+  const review = readActiveAdvisorRound(f.options)!
+  let settled = false
+  const waiting = waitForAdvisorSettlement({ ...f.options,
+    timeoutMs: deadlines.forRound(review.key, 4000) - 4000 }).then(result => { settled = true; return result })
+  await Bun.sleep(20); expect(settled).toBe(false)
+  rmSync(f.lock); expect(await waiting).toBe('settled')
+})
+
+test('a new claim for the same round gets its own budget without renewing an existing claim', async () => {
+  const f = fixture(), deadlines = new AdvisorRoundDeadlines(2000)
+  const first = readActiveAdvisorRound(f.options)!
+  expect(deadlines.forRound(first.key, 1000)).toBe(3000)
+  expect(deadlines.forRound(readActiveAdvisorRound(f.options)!.key, 4000)).toBe(3000)
+  const lock = JSON.parse(await Bun.file(f.lock).text()); lock.claimNonce = 'f'.repeat(32)
+  writeFileSync(f.lock, JSON.stringify(lock), { mode: 0o600 })
+  const retry = readActiveAdvisorRound(f.options)!
+  expect(retry.key).not.toBe(first.key)
+  expect(deadlines.forRound(retry.key, 4000)).toBe(6000)
+  expect(deadlines.forRound(readActiveAdvisorRound(f.options)!.key, 5000)).toBe(6000)
 })

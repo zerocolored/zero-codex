@@ -7,6 +7,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult, type Tool } from '@modelcontextprotocol/sdk/types.js'
 import { GO_CHROME_ENABLED_TOOLS } from './chrome-tools.ts'
+import { GROK_OAUTH_OBSERVATION_SCRIPT, grokOAuthAuthorizeScript } from './grok-oauth-observation.ts'
 import { releaseProcessLock, tryAcquireProcessLock, type ProcessLockLease } from './process-lock.ts'
 
 const failure = (text: string): CallToolResult => ({ isError: true, content: [{ type: 'text', text }] })
@@ -67,9 +68,19 @@ export class ChromeSession {
     this.chain = result.catch(() => {})
     return result
   }
-  private async execute(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+  /** Host-owned OAuth driver only; never exposed by the general MCP server. */
+  oauth(action: 'observe' | 'Authorize' | '許可', tabId: number): Promise<CallToolResult> {
+    if (this.stopping) return Promise.resolve(failure('Chrome session is closing'))
+    const result = this.chain.then(() => this.execute('javascript_exec', { tabId }, action))
+    this.chain = result.catch(() => {})
+    return result
+  }
+  private async execute(name: string, args: Record<string, unknown>, oauth?: 'observe' | 'Authorize' | '許可'): Promise<CallToolResult> {
     try {
-      validateChromeAction(name, args)
+      if (oauth) {
+        validateChromeAction('click', args)
+        args = { tabId: args.tabId, code: oauth === 'observe' ? GROK_OAUTH_OBSERVATION_SCRIPT : grokOAuthAuthorizeScript(oauth) }
+      } else validateChromeAction(name, args)
       if (!this.ready) {
         const deadline = Date.now() + this.readinessMs
         // Only the read-only readiness request is retried. Never replay input,
@@ -100,7 +111,7 @@ export class ChromeSession {
           return { content: [{ type: 'text', text: 'Tab reservation released; tab left open.' }] }
         }
         if (name === 'coordinate_mode' && args.enable === false) return this.detach(id)
-        if (name.startsWith('coordinate_') || name.startsWith('mouse_') || name.startsWith('key_')) {
+        if (oauth || name.startsWith('coordinate_') || name.startsWith('mouse_') || name.startsWith('key_')) {
           // An operation can attach and then fail, so record ownership before
           // dispatch, not only after receiving a successful result.
           this.coordinates.add(id)

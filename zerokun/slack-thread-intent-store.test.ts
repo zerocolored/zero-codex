@@ -193,3 +193,21 @@ describe('durable Slack thread reply intent ledger', () => {
     store.close()
   })
 })
+
+
+test('bot sender and attachment survive duplicate admission and restart', () => {
+  const { root, store } = fixture()
+  const input = { chatId: 'C0THREAD1', threadTs: '1789000000.000001',
+    messageId: '1789000001.000001', userId: 'BREPORT', promptVersion: 1,
+    candidateText: '<@UZERO> ZIPを解析して', fileIds: ['FZIP'] }
+  const first = store.stageSlackThreadReplyCandidate(input)
+  expect(store.stageSlackThreadReplyCandidate(input).idempotencyKey).toBe(first.idempotencyKey)
+  expect(store.listDueSlackThreadReplyIntents(Date.now() + 1000)).toHaveLength(1)
+  store.close()
+  const reopened = new JobStore(join(root, 'jobs.sqlite3'))
+  const restored = reopened.getSlackThreadReplyIntent(first.idempotencyKey)!
+  expect(restored.userId).toBe('BREPORT')
+  expect(restored.fileIds).toEqual(['FZIP'])
+  expect(restored.candidateText).toBe(input.candidateText)
+  reopened.close()
+})

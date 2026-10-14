@@ -5,6 +5,19 @@ import { join } from 'path'
 import { advisorFailureMessage, classifyAdvisorFailure } from './advisor-availability.ts'
 import { enforceHostAdvisorCoverage, JobStore, SlackNotifier, type HostAdvisorCoverage } from './job-runner.ts'
 
+test('自動再認証の中断を手動ログインの必要性として報告しない', () => {
+  const failure = { advisor: 'grok', cause: 'auth-recovery' } as const
+  const message = advisorFailureMessage(failure)
+  expect(message).toContain('自動再認証を完了できませんでした')
+  expect(message).not.toContain('ログインを確認してください')
+  const delivered = enforceHostAdvisorCoverage('評価結果を保存しました。', {
+    version: 1, phases: [{ phase: 'review', round: 1, inputRevision: 1, finishedAt: 1,
+      total: 3, started: 3, responsesObtained: 2, startedNoResponse: 1, startUnconfirmed: 0,
+      unavailableBeforeStart: 0, failures: [failure] }],
+  }, 'result')
+  expect(delivered).toContain(message)
+})
+
 test('Claude送信失敗を認証切れと誤報せず担当と原因を知らせる', () => {
   const failure = classifyAdvisorFailure('claude', 'Claude prompt delivery failed (5): transport failure')
   expect(failure.cause).toBe('startup')

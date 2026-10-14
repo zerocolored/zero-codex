@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 import { CloudHandoffClient, CLOUD_WAIT_MESSAGE, digestBytes, type CloudHandoff } from './cloud-handoff.ts'
 import { JobStore } from './job-runner.ts'
 import { buildCodexWorkerPrompt } from './codex-executor.ts'
+import { readClaudeJobModel } from './claude-model-binding.ts'
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 const h: CloudHandoff = { id: '11111111-1111-4111-8111-111111111111',
@@ -168,4 +169,24 @@ test('import enqueue and owner binding commit atomically and duplicate events do
   expect(store.cloudHandoff(first.job.id)?.epoch).toBe(2)
   expect(store.claimNext('worker')?.resumed).toBe(false)
   store.close()
+})
+
+test('cloud import preserves the source Claude core and pinned model despite a Codex destination admission', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-claude-test-')); roots.push(root)
+  const repo = join(root, 'repo'), workspace = join(root, 'workspace')
+  mkdirSync(repo); mkdirSync(workspace)
+  const store = new JobStore(join(root, 'state', 'jobs.sqlite3'))
+  try {
+    const input = { chatId: 'C1', threadTs: '1.0', messageId: '2.0', userId: 'U1', repoPath: repo, task: 'resume', writeEnabled: false }
+    store.stageInboundDelivery({ ...input, text: 'handoff' })
+    const result = store.enqueueCloudImport({ ...input, core: 'claude-code' }, h.id, 2,
+      JSON.stringify({ ...h, epoch: 2, state: 'active' }), 'claude-opus-5-5', workspace)
+    expect(result.job.runtime).toBe('claude-code')
+    expect(readClaudeJobModel(join(root, 'state'), result.job.id, workspace)).toBe('claude-opus-5-5')
+    expect(store.taskModels().latest(result.job.id)).toBeNull()
+    const duplicate = store.enqueueCloudImport({ ...input, core: 'claude-code' }, h.id, 2,
+      JSON.stringify({ ...h, epoch: 2, state: 'active' }), 'claude-opus-5-5', workspace)
+    expect(duplicate.job.id).toBe(result.job.id)
+    expect(() => store.enqueueCloudImport({ ...input, core: 'codex' }, h.id, 2, '{}')).toThrow('core differs')
+  } finally { store.close() }
 })

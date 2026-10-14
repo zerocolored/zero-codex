@@ -9,6 +9,7 @@ import { CloudHandoffClient, CloudHandoffError, digestBytes, type CloudHandoff }
 import { writeCheckpoint } from './handoff-coordinator.ts'
 import { resolveProjectLayout } from './project-layout.ts'
 import { buildCodexDeveloperInstructions } from './codex-executor.ts'
+import { prepareClaudeJobContext } from './claude-job-context.ts'
 const roots: string[] = []
 test('configuration failures reach Slack without exposing arbitrary Git diagnostics', () => {
   for (const message of Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES)) {
@@ -266,7 +267,7 @@ class MemberClient extends CloudHandoffClient {
   }
 }
 
-test('follow-up branch in the same managed repository preserves prior work through handoff A -> B -> A', async () => {
+for (const core of ['codex', 'claude-code'] as const) test(`${core}: follow-up branch in the same managed repository preserves prior work through handoff A -> B -> A`, async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-runtime-test-')); roots.push(root)
   const source = join(root, 'source'); mkdirSync(source)
   git(source, 'init', '--quiet')
@@ -283,7 +284,7 @@ test('follow-up branch in the same managed repository preserves prior work throu
     const runtimeA = new CloudRuntime(storeA, stateA, new MemberClient(cloud, ownerA, 'UA'), join(root, 'imports-A'))
     const runtimeB = new CloudRuntime(storeB, stateB, new MemberClient(cloud, ownerB, 'UB'), join(root, 'imports-B'))
     const attachment = join(stateA, 'input.txt'); writeFileSync(attachment, 'original attachment')
-    storeA.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'USER', repoPath: source,
+    storeA.enqueue({ core, chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'USER', repoPath: source,
       task: 'Finish the existing task', writeEnabled: true, attachments: [attachment] })
     const jobA = storeA.claimNext('worker-A')!
     storeA.bindCloudHandoff(jobA.id, cloud.h.id, 1, JSON.stringify(cloud.h))
@@ -295,6 +296,10 @@ test('follow-up branch in the same managed repository preserves prior work throu
     writeFileSync(join(projectA,'AGENTS.md'),oldInstructions)
     await runtimeA.prepare(jobA)
     const execution = runtimeA.executionJob(jobA)
+    if (core === 'claude-code') {
+      const context = prepareClaudeJobContext(execution, stateA)
+      try { context.pinModel('claude-opus-5-5') } finally { context.retire() }
+    }
     expect(execution.task).toContain('Branches are not permanently pinned')
     expect(buildCodexDeveloperInstructions(execution,join(stateA,'artifacts')))
       .toContain('This replaces the old generated Managed continuation workspace instruction')
@@ -348,6 +353,11 @@ test('follow-up branch in the same managed repository preserves prior work throu
     expect(storeA.list()).toHaveLength(1)
     const jobB = storeB.claimNext('worker-B')!
     const executionB = runtimeB.executionJob(jobB)
+    expect(executionB.runtime).toBe(core)
+    if (core === 'claude-code') {
+      const context = prepareClaudeJobContext(executionB, stateB)
+      try { expect(context.pinnedModel).toBe('claude-opus-5-5') } finally { context.retire() }
+    }
     const workB = executionB.repoPath
     expect(resolveProjectLayout(executionB.repoPath).gitRoots).toEqual([realpathSync(workB)])
     expect(() => buildCodexDeveloperInstructions(executionB, join(stateB, 'artifacts'))).not.toThrow()
@@ -367,6 +377,11 @@ test('follow-up branch in the same managed repository preserves prior work throu
     await runtimeA.receive({ ...request, bot: 'UA', message: '3.0' })
     const resumedA = storeA.claimNext('worker-A')!
     const executionA = runtimeA.executionJob(resumedA)
+    expect(executionA.runtime).toBe(core)
+    if (core === 'claude-code') {
+      const context = prepareClaudeJobContext(executionA, stateA)
+      try { expect(context.pinnedModel).toBe('claude-opus-5-5') } finally { context.retire() }
+    }
     expect(executionA.repoPath).not.toBe(projectA)
     expect(readFileSync(join(executionA.repoPath, 'file.txt'), 'utf8')).toBe('continued-B\n')
     expect(readFileSync(join(workA, 'file.txt'), 'utf8')).toBe('unstaged-A\n')

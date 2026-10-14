@@ -14,13 +14,13 @@ function fixture() {
   const repo = join(root, 'repo'); mkdirSync(repo)
   const id = 'job', scratchDir = ensureManagedDirectory(stateDir, join(stateDir, 'tmp', id)), artifactDir = ensureManagedDirectory(stateDir, join(stateDir, 'outbox', id)), liveInputDir = ensureManagedDirectory(stateDir, join(stateDir, 'live-input', id))
   const context = { version: 1, stateDir, scratchDir, artifactDir, liveInputDir, fingerprintAllowPath: '', job: { id, repoPath: repo, writeEnabled: true, attachments: [] } } as ReproductionContext
-  const request = join(scratchDir, 'prompt.txt'); writeFileSync(request, 'Exact original request.\n', { mode: 0o600 })
+  const request = join(scratchDir, 'prompt.txt'); writeFileSync(request, 'Exact original request: view bearer vs callback; Authorization: Bearer synthetic-example.\n', { mode: 0o600 })
   return { context, request, workspace: scratchDir }
 }
 test('独立execへ原文bytesを渡し、完了記録を再利用して二重実行しない', async () => {
   const f = fixture(); let count = 0, final = ''
   const runs = new CodexReproductions(f.context, async (_ctx, _cwd, path) => { final = path; return { argv: ['fake-codex'], environment: {} } }, async (_argv, options) => {
-    count++; expect(Buffer.from(options.stdin!).toString()).toBe('Exact original request.\n')
+    count++; expect(Buffer.from(options.stdin!).toString()).toBe('Exact original request: view bearer vs callback; Authorization: Bearer synthetic-example.\n')
     writeFileSync(final, 'Finished', { mode: 0o600 })
     return { exitCode: 0, stdout: '{"type":"thread.started"}\n', stderr: '', timedOut: false, forcedCleanup: false, outputTruncated: false }
   })

@@ -1,6 +1,16 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
-import { executeSecurityAudit, copyAuditReportForFollowup } from './security-audit.ts'
-import { createSecurityAuditProgress } from './security-audit-progress.ts'
+import { isPrimaryCore, type PrimaryCore, type JobRuntime } from './primary-core.ts'
+import { migratePrimaryCoreRuntime } from './primary-core-migration.ts'
+import { projectPrimaryCore } from './project-channel-config.ts'
+import { reconcileClaudeHerdrTransports } from './claude-herdr-transport.ts'
+import { executeClaudeJob } from './claude-executor.ts'
+import { createPrimaryLiveControlHooks } from './primary-live-controls.ts'
+import { pinClaudeJobModel } from './claude-model-binding.ts'
+import { initializeAudit, AuditSetupRequiredError, AUDIT_ANSWER_VERSION, type AuditSetupReply } from './security-audit-setup.ts'
+import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
+import { assertSlackProjectAdmission } from './slack-project-admission.ts'
+import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
+import { createSecurityAuditProgress, deliverAuditMilestone } from './security-audit-progress.ts'
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
@@ -63,12 +73,6 @@ import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
-import {
-  containsCredentialMaterial,
-  normalizeImplementationGuardText,
-  normalizePublicGuardText,
-  redactCredentialMaterial,
-} from './public-output-guard.ts'
 import {
   applyStateEnvironment,
   parseStateSlackTokens,
@@ -237,7 +241,7 @@ import {
 } from './seatbelt-fingerprint.ts'
 
 export const SERIAL_WORKER_COUNT = 1 as const
-export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v1' as const
+export const JOB_RUNNER_HANDSHAKE = 'zerokun-codex-runner-v2' as const
 export const DEFAULT_MAX_JOBS_PER_SESSION = 20 as const
 // v3 removes the former localhost-only browser instruction and introduces
 // explicit Slack-milestone commentary. Never resume a physical Codex thread
@@ -292,7 +296,7 @@ function rateLimitWaitNotificationKey(
 }
 export const DEFAULT_MAX_REPOSITORY_DRIFT_RETRIES = 3 as const
 const CLAIMABLE_CODEX_JOB_PREDICATE = `
-  jobs.runtime = 'codex'
+  jobs.runtime IN ('codex', 'claude-code')
   AND jobs.status = 'queued'
   AND NOT EXISTS (
     SELECT 1 FROM cloud_handoff_controls pending_cloud
@@ -305,6 +309,11 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
     SELECT 1 FROM cloud_handoff_jobs cloud_wait
     WHERE cloud_wait.job_id = jobs.id AND cloud_wait.state <> 'active'
   )
+  AND NOT EXISTS (
+    SELECT 1 FROM audit_setup_waits aw WHERE aw.job_id=jobs.id AND jobs.cancel_requested_at IS NULL
+      AND (aw.waiting=1 OR EXISTS (SELECT 1 FROM status_notifications sn
+        WHERE sn.idempotency_key=aw.notification_key AND sn.delivered_at IS NULL AND sn.superseded_at IS NULL))
+  )
   AND jobs.ui_approval_request_id IS NULL
   AND NOT EXISTS (
     SELECT 1 FROM inbound_deliveries AS inbound
@@ -312,7 +321,7 @@ const CLAIMABLE_CODEX_JOB_PREDICATE = `
   )
   AND NOT EXISTS (
     SELECT 1 FROM jobs AS approval_wait
-    WHERE approval_wait.runtime = 'codex'
+    WHERE approval_wait.runtime IN ('codex', 'claude-code')
       AND approval_wait.chat_id = jobs.chat_id
       AND approval_wait.thread_ts = jobs.thread_ts
       AND approval_wait.status = 'queued'
@@ -326,7 +335,7 @@ const READY_CODEX_JOB_PREDICATE = `
   AND (jobs.cancel_requested_at IS NOT NULL OR jobs.not_before IS NULL OR jobs.not_before <= ?)
   AND NOT EXISTS (
     SELECT 1 FROM jobs earlier
-    WHERE earlier.runtime = 'codex' AND earlier.status IN ('queued', 'running')
+    WHERE earlier.runtime IN ('codex', 'claude-code') AND earlier.status IN ('queued', 'running')
       AND earlier.chat_id = jobs.chat_id AND earlier.thread_ts = jobs.thread_ts
       AND earlier.seq < jobs.seq
       AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs transferred
@@ -334,7 +343,7 @@ const READY_CODEX_JOB_PREDICATE = `
   )
 `
 const PRIOR_EXECUTABLE_CODEX_JOB_PREDICATE = `
-  (jobs.runtime = 'codex' AND jobs.status = 'running')
+  (jobs.runtime IN ('codex', 'claude-code') AND jobs.status = 'running')
   OR (${READY_CODEX_JOB_PREDICATE})
 `
 const SLACK_DM_HISTORY_RETRY_BASE_MS = 24 * 60 * 60 * 1_000
@@ -470,6 +479,9 @@ export interface JobInterjectionRecord {
 export type JobLiveInputRecord = JobControlRecord | JobInterjectionRecord
 
 export interface EnqueueInput {
+  /** Host-resolved core for imports/fixtures; ordinary admission snapshots the project setting. */
+  core?: PrimaryCore
+  modelRequestText?: string
   workflow?: 'work' | 'security-audit'
   chatId: string
   threadTs: string
@@ -526,6 +538,7 @@ export interface LiveControlInput {
 }
 
 export interface InboundDeliveryRecord extends InboundDeliveryInput {
+  modelRequestText?: string
   seq: number
   idempotencyKey: string
   fileIds: string[]
@@ -575,6 +588,7 @@ type InboundDeliveryRow = {
   expected_control_epoch: number | null
   downloaded_files_json: string
   initial_context_state: InboundInitialContextState
+  model_request_text: string | null
 }
 
 export interface JobRecord {
@@ -599,7 +613,7 @@ export interface JobRecord {
   attachments: string[]
   /** Immutable, thread-scoped Slack files available to every continuation. */
   threadAttachments?: ThreadAttachmentRecord[]
-  runtime: 'claude' | 'codex'
+  runtime: JobRuntime
   writeEnabled: boolean
   status: JobStatus
   sessionId: string | null
@@ -693,7 +707,7 @@ type JobRow = {
   input_revision: number
   attachments_json: string
   thread_attachments_json: string
-  runtime: 'claude' | 'codex'
+  runtime: JobRuntime
   write_enabled: number
   status: JobStatus
   session_id: string | null
@@ -801,7 +815,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   attachments_json TEXT NOT NULL DEFAULT '[]',
   thread_attachments_json TEXT NOT NULL DEFAULT '[]',
   runtime TEXT NOT NULL DEFAULT 'codex'
-    CHECK (runtime IN ('claude', 'codex')),
+    CHECK (runtime IN ('claude', 'codex', 'claude-code')),
   write_enabled INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'queued'
     CHECK (status IN ('queued', 'running', 'completed', 'failed')),
@@ -838,6 +852,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_thread_seq ON jobs(chat_id, thread_ts, seq);
 CREATE TABLE IF NOT EXISTS codex_session_protocols (
   session_id TEXT PRIMARY KEY,
   protocol_version INTEGER NOT NULL,
+  core TEXT NOT NULL DEFAULT 'codex' CHECK(core IN ('codex','claude-code')),
   recorded_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS codex_session_workspaces (
@@ -997,6 +1012,13 @@ CREATE TABLE IF NOT EXISTS commentary_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_commentary_notifications_pending
   ON commentary_notifications(delivered_at, not_before, seq);
+CREATE TABLE IF NOT EXISTS audit_setup_waits (
+ job_id TEXT PRIMARY KEY, input_revision INTEGER NOT NULL, waiting INTEGER NOT NULL DEFAULT 1,
+ notification_key TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS audit_setup_history_checks (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS fleet_queries (
  idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
  repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
@@ -1378,6 +1400,7 @@ CREATE TABLE IF NOT EXISTS job_interjections (
   answer_turn_id TEXT,
   disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answer-only', 'task-update')),
   answer_payload TEXT,
+  answer_retry_count INTEGER NOT NULL DEFAULT 0,
   notification_id TEXT UNIQUE,
   attempts INTEGER NOT NULL DEFAULT 0,
   not_before INTEGER,
@@ -1739,7 +1762,7 @@ function materializeSettledThreadHistoryJob(
 ): ThreadHistoryArchive | null {
   const job = db.query<JobRow, [string]>(
     `SELECT * FROM jobs
-     WHERE id = ? AND runtime = 'codex' AND status IN ('completed', 'failed')
+     WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status IN ('completed', 'failed')
        AND finished_at IS NOT NULL`,
   ).get(jobId)
   if (!job) throw new Error(`settled thread history source is unavailable: ${jobId}`)
@@ -1892,7 +1915,7 @@ function persistThreadHistorySnapshot(
   }
   const priorJobs = db.query<{ id: string }, [string, string, string, number]>(
     `SELECT id FROM jobs
-     WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ? AND repo_path = ?
+     WHERE runtime IN ('codex', 'claude-code') AND chat_id = ? AND thread_ts = ? AND repo_path = ?
        AND seq < ? AND status IN ('completed', 'failed') AND finished_at IS NOT NULL
        AND NOT EXISTS (
          SELECT 1 FROM slack_thread_job_history AS history WHERE history.job_id = jobs.id
@@ -1947,6 +1970,12 @@ function persistThreadHistorySnapshot(
 }
 
 function ensureJobSchemaMigrations(db: Database): void {
+  db.exec(TASK_MODEL_SCHEMA)
+  db.transaction(() => {
+    if (!db.query<{ name: string }, []>('PRAGMA table_info(codex_session_protocols)').all().some(column => column.name === 'core')) {
+      db.exec("ALTER TABLE codex_session_protocols ADD COLUMN core TEXT NOT NULL DEFAULT 'codex' CHECK(core IN ('codex','claude-code'))")
+    }
+  }).immediate()
   db.transaction(() => {
     const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
     if (!schema.includes("'security-audit'")) {
@@ -2110,7 +2139,7 @@ function ensureJobSchemaMigrations(db: Database): void {
          ON receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
        JOIN codex_session_protocols AS protocols
          ON protocols.session_id = jobs.session_id AND protocols.protocol_version = ?
-       WHERE jobs.runtime = 'codex' AND jobs.status = 'running'
+       WHERE jobs.runtime IN ('codex', 'claude-code') AND jobs.status = 'running'
          AND jobs.write_enabled = 1 AND jobs.not_before IS NOT NULL
          AND jobs.session_id IS NOT NULL AND jobs.active_thread_id = jobs.session_id
          AND jobs.active_turn_id IS NULL AND jobs.executor_pid IS NULL
@@ -2245,7 +2274,7 @@ function ensureJobSchemaMigrations(db: Database): void {
       `SELECT sets.job_id FROM github_publication_sets AS sets
        JOIN jobs ON jobs.id = sets.job_id
        WHERE sets.status = 'completed' AND sets.plan_count > 0
-         AND jobs.runtime = 'codex' AND jobs.status = 'completed'
+         AND jobs.runtime IN ('codex', 'claude-code') AND jobs.status = 'completed'
        ORDER BY jobs.seq ASC`,
     ).all()
     for (const row of completed) {
@@ -2274,6 +2303,15 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   })
   migratePublicationContinuationArchives.immediate()
+  const interjectionColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+  if (!interjectionColumns.some(column => column.name === 'answer_retry_count')) {
+    try {
+      db.exec('ALTER TABLE job_interjections ADD COLUMN answer_retry_count INTEGER NOT NULL DEFAULT 0')
+    } catch (error) {
+      const columns = db.query<{ name: string }, []>('PRAGMA table_info(job_interjections)').all()
+      if (!columns.some(column => column.name === 'answer_retry_count')) throw error
+    }
+  }
   const controlColumns = db.query<{ name: string }, []>('PRAGMA table_info(job_controls)').all()
   for (const [name, definition] of [
     ['input_revision', 'INTEGER NOT NULL DEFAULT 1'],
@@ -2330,7 +2368,7 @@ function ensureJobSchemaMigrations(db: Database): void {
        SELECT jobs.session_id, jobs.id, COALESCE(jobs.started_at, jobs.created_at)
        FROM jobs
        JOIN codex_session_protocols protocols ON protocols.session_id = jobs.session_id
-       WHERE jobs.runtime = 'codex' AND jobs.session_id IS NOT NULL`,
+       WHERE jobs.runtime IN ('codex', 'claude-code') AND jobs.session_id IS NOT NULL`,
     )
     db.run(
       `INSERT INTO migration_ledger (name, completed_at)
@@ -2369,6 +2407,8 @@ function ensureJobSchemaMigrations(db: Database): void {
     }
   }
   for (const [name, definition] of [
+    ['primary_core', "TEXT NOT NULL DEFAULT 'codex' CHECK(primary_core IN ('codex','claude-code'))"],
+    ['model_request_text', 'TEXT'],
     ['expected_control_job_id', 'TEXT'],
     ['expected_control_epoch', 'INTEGER'],
     ['downloaded_files_json', "TEXT NOT NULL DEFAULT '[]'"],
@@ -2665,7 +2705,7 @@ function ensureJobSchemaMigrations(db: Database): void {
       `UPDATE jobs
        SET control_epoch = CASE WHEN control_epoch < 1 THEN 1 ELSE control_epoch END,
            accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END
-       WHERE runtime = 'codex' AND status = 'queued'`,
+       WHERE runtime IN ('codex', 'claude-code') AND status = 'queued'`,
     )
     db.run(
       `INSERT INTO migration_ledger (name, completed_at)
@@ -2731,7 +2771,7 @@ function ensureJobSchemaMigrations(db: Database): void {
     ).get()) return
     const jobs = db.query<{ id: string }, []>(
       `SELECT id FROM jobs
-       WHERE runtime = 'codex' AND status IN ('completed', 'failed')
+       WHERE runtime IN ('codex', 'claude-code') AND status IN ('completed', 'failed')
          AND finished_at IS NOT NULL
        ORDER BY seq`,
     ).all()
@@ -2744,7 +2784,7 @@ function ensureJobSchemaMigrations(db: Database): void {
   })
   migrateSlackThreadHistory.immediate()
   const runningCodex = db.query<{ count: number }, []>(
-    "SELECT COUNT(*) AS count FROM jobs WHERE runtime = 'codex' AND status = 'running'",
+    "SELECT COUNT(*) AS count FROM jobs WHERE runtime IN ('codex', 'claude-code') AND status = 'running'",
   ).get()?.count ?? 0
   if (runningCodex > 1) {
     throw new Error(
@@ -2752,8 +2792,8 @@ function ensureJobSchemaMigrations(db: Database): void {
     )
   }
   db.exec(
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_single_running_codex "
-      + "ON jobs((1)) WHERE runtime = 'codex' AND status = 'running'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_single_running_modern "
+      + "ON jobs((1)) WHERE runtime IN ('codex', 'claude-code') AND status = 'running'",
   )
 }
 
@@ -2871,6 +2911,7 @@ function mapInboundDeliveryRow(row: InboundDeliveryRow): InboundDeliveryRecord {
     expectedControlEpoch: row.expected_control_epoch,
     downloadedFiles: parseInboundDownloadedFiles(row.downloaded_files_json),
     initialContextState: row.initial_context_state,
+    ...(row.model_request_text !== null ? { modelRequestText: row.model_request_text } : {}),
   }
 }
 
@@ -3133,6 +3174,7 @@ type JobInterjectionRow = {
   answer_thread_id: string | null
   answer_turn_id: string | null
   disposition: JobInterjectionDisposition | null
+  answer_retry_count: number
   answer_payload: string | null
   notification_id: string | null
   attempts: number
@@ -4405,6 +4447,7 @@ export class JobStore {
           db.exec('PRAGMA journal_mode=WAL')
           db.exec('PRAGMA synchronous=FULL')
           db.exec(JOB_SCHEMA)
+          migratePrimaryCoreRuntime(db)
           db.exec(`CREATE TABLE IF NOT EXISTS cloud_handoff_jobs (
             job_id TEXT PRIMARY KEY REFERENCES jobs(id),
             state TEXT NOT NULL CHECK (state IN ('active','saving','waiting','transferred','importing')),
@@ -4443,6 +4486,7 @@ export class JobStore {
     } catch {}
     this.nativeConfirmations = new NativeConfirmationStore(this.db)
     this.migrateLegacyThreadAttachments(dirname(dbPath))
+    this.resumeLegacyAuditSetupHistory()
   }
 
   private migrateLegacyThreadAttachments(stateDir: string): void {
@@ -4808,27 +4852,29 @@ export class JobStore {
   }
 
   private recordCodexSessionUse(sessionId: string, jobId: string, recordedAt: number): void {
-    const existing = this.db.query<{ protocol_version: number }, [string]>(
-      'SELECT protocol_version FROM codex_session_protocols WHERE session_id = ?',
+    const core = this.db.query<{ runtime: JobRuntime }, [string]>('SELECT runtime FROM jobs WHERE id = ?').get(jobId)?.runtime
+    if (!isPrimaryCore(core)) throw new Error('session requires a modern primary job')
+    const existing = this.db.query<{ protocol_version: number; core: PrimaryCore }, [string]>(
+      'SELECT protocol_version, core FROM codex_session_protocols WHERE session_id = ?',
     ).get(sessionId)
-    if (existing && existing.protocol_version !== CODEX_SESSION_PROTOCOL_VERSION) {
-      throw new Error(`Codex session protocol changed for job ${jobId}`)
+    if (existing && (existing.protocol_version !== CODEX_SESSION_PROTOCOL_VERSION || existing.core !== core)) {
+      throw new Error(`primary session core or protocol changed for job ${jobId}`)
     }
     const retired = this.db.query<{ present: number }, [string]>(
       'SELECT 1 AS present FROM codex_session_retirements WHERE session_id = ?',
     ).get(sessionId)
     const sameJobContinuation = this.db.query<{ present: number }, [string, string]>(
       `SELECT 1 AS present FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND session_id = ? AND attempts > 0`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND session_id = ? AND attempts > 0`,
     ).get(jobId, sessionId)
     if (retired && !sameJobContinuation) {
       throw new Error(`retired Codex session cannot bind a new job: ${jobId}`)
     }
     this.db.run(
-      `INSERT INTO codex_session_protocols (session_id, protocol_version, recorded_at)
-       VALUES (?, ?, ?)
+      `INSERT INTO codex_session_protocols (session_id, protocol_version, recorded_at, core)
+       VALUES (?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET recorded_at = excluded.recorded_at`,
-      [sessionId, CODEX_SESSION_PROTOCOL_VERSION, recordedAt],
+      [sessionId, CODEX_SESSION_PROTOCOL_VERSION, recordedAt, core],
     )
     this.db.run(
       `INSERT OR IGNORE INTO codex_session_job_uses (session_id, job_id, recorded_at)
@@ -5201,7 +5247,7 @@ export class JobStore {
       || Number(messageId) <= Number(threadTs)) {
       throw new Error('thread intent timestamps are invalid')
     }
-    if (!/^[UW][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
+    if (!/^[UWB][A-Z0-9]+$/.test(userId)) throw new Error('thread intent user is invalid')
     if (!Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1) {
       throw new Error('thread intent prompt version is invalid')
     }
@@ -5611,6 +5657,8 @@ export class JobStore {
         return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
       }
 
+      if (!this.hasDurableEvent(idempotencyKey)) assertSlackProjectAdmission(repoPath, messageId)
+
       const pendingBootstrap = !existingThread
         ? this.db.query<{ present: number }, [string, string]>(
             `SELECT 1 AS present FROM inbound_deliveries
@@ -5628,8 +5676,8 @@ export class JobStore {
         `INSERT OR IGNORE INTO inbound_deliveries (
            idempotency_key, chat_id, thread_ts, message_id, user_id,
            repo_path, text, file_ids_json, write_enabled, is_interrupt, created_at,
-           initial_context_state
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           initial_context_state, primary_core
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           idempotencyKey,
           chatId,
@@ -5643,6 +5691,7 @@ export class JobStore {
           input.isInterrupt ? 1 : 0,
           Date.now(),
           initialContextRequired ? 'pending' : 'none',
+          existsSync(repoPath) ? projectPrimaryCore(repoPath).active : 'codex',
         ],
       ).changes
       if (inserted !== 1) {
@@ -5709,7 +5758,7 @@ export class JobStore {
       if (expectedJobId !== null && expectedEpoch !== null) {
         const target = this.db.query<{ present: number }, [string, number, string, string, number]>(
           `SELECT 1 AS present FROM jobs
-           WHERE id = ? AND control_epoch = ? AND runtime = 'codex'
+           WHERE id = ? AND control_epoch = ? AND runtime IN ('codex', 'claude-code')
              AND chat_id = ? AND thread_ts = ?
              AND status IN ('running', 'queued')
              AND cancel_requested_at IS NULL
@@ -5737,12 +5786,18 @@ export class JobStore {
         }
       }
 
+      if (!this.hasDurableEvent(idempotencyKey)) {
+        assertSlackProjectAdmission(input.repoPath, messageId, {
+          allowDisconnectedStop: Boolean(input.isInterrupt && boundJobId !== null),
+        })
+      }
+
       const inserted = this.db.run(
         `INSERT OR IGNORE INTO inbound_deliveries (
            idempotency_key, chat_id, thread_ts, message_id, user_id,
            repo_path, text, file_ids_json, write_enabled, is_interrupt, created_at,
-           expected_control_job_id, expected_control_epoch
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           expected_control_job_id, expected_control_epoch, primary_core
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           idempotencyKey,
           chatId,
@@ -5757,6 +5812,8 @@ export class JobStore {
           Date.now(),
           boundJobId,
           boundEpoch,
+          boundJobId !== null ? this.get(boundJobId)!.runtime
+            : existsSync(input.repoPath) ? projectPrimaryCore(input.repoPath).active : 'codex',
         ],
       ).changes
       if (inserted !== 1) return 'duplicate' as const
@@ -6185,7 +6242,7 @@ export class JobStore {
            AND (inbound.not_before IS NULL OR inbound.not_before <= ?)
            AND EXISTS (
              SELECT 1 FROM jobs
-             WHERE jobs.runtime = 'codex'
+             WHERE jobs.runtime IN ('codex', 'claude-code')
                AND jobs.chat_id = inbound.chat_id
                AND jobs.thread_ts = inbound.thread_ts
                AND jobs.status IN ('running', 'queued')
@@ -6407,7 +6464,7 @@ export class JobStore {
          SET idempotency_key = ?, message_id = ?, user_id = ?, text = ?,
              file_ids_json = ?, write_enabled = ?, is_interrupt = ?,
              downloaded_files_json = '[]', not_before = NULL, last_error = NULL,
-             initial_context_state = ?
+             initial_context_state = ?, model_request_text = ?
          WHERE idempotency_key = ? AND status = 'processing'
            AND initial_context_state = 'pending'`,
         [
@@ -6419,6 +6476,7 @@ export class JobStore {
           canonical.writeEnabled ? 1 : 0,
           canonical.isInterrupt ? 1 : 0,
           input.mode === 'context' ? 'hydrated' : 'none',
+          canonical.text,
           key,
         ],
       )
@@ -6636,10 +6694,114 @@ export class JobStore {
     return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
   }
 
-  previousSecurityAudit(job:JobRecord):string|null {
+  auditSetupWaiting(jobId: string): boolean {
+    return !!this.db.query<{yes:number},[string]>(
+      "SELECT 1 AS yes FROM audit_setup_waits w JOIN jobs j ON j.id=w.job_id WHERE w.job_id=? AND j.status IN ('queued','running') AND j.cancel_requested_at IS NULL",
+    ).get(jobId)
+  }
+
+  /** The monitor may be retired after parking, including a reply or cancellation
+   * arriving before the close finishes. This is not a live-control permission. */
+  auditSetupIsParked(jobId: string): boolean {
+    return !!this.db.query<{ yes: number }, [string]>(
+      `SELECT 1 AS yes FROM jobs j JOIN audit_setup_waits w ON w.job_id=j.id
+       WHERE j.id=? AND j.workflow='security-audit' AND j.status='queued'`,
+    ).get(jobId)
+  }
+
+  parkAuditSetup(jobId: string, prompt: string, inputRevision: number): void {
+    retrySqlite(() => this.db.transaction(() => {
+      const job=this.get(jobId)
+      if(!job || job.workflow!=='security-audit' || job.status!=='running') throw Error('audit setup job changed')
+      if(job.cancelRequestedAt!==null) { this.cancel(jobId); return }
+      const key=`audit-setup:${jobId}:${inputRevision}:v${AUDIT_ANSWER_VERSION}`
+      this.stageStatusNotificationRow({idempotencyKey:key,jobId,chatId:job.chatId,threadTs:job.threadTs,
+        kind:'execution-started',payload:prompt,createdAt:Date.now()})
+      this.db.run(`INSERT INTO audit_setup_waits(job_id,input_revision,waiting,notification_key) VALUES(?,?,?,?)
+        ON CONFLICT(job_id) DO UPDATE SET input_revision=excluded.input_revision,waiting=excluded.waiting,notification_key=excluded.notification_key`,
+        [jobId,inputRevision,job.inputRevision===inputRevision?1:0,key])
+      this.db.run(`UPDATE jobs SET status='queued',worker_id=NULL,started_at=NULL,executor_pid=NULL,
+        accepts_control=1,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL,
+        pending_session_id=NULL,pending_result=NULL,not_before=NULL,finished_at=NULL,last_error=NULL WHERE id=?`,[jobId])
+      this.supersedeLifecycleNotifications(jobId,Date.now())
+    }).immediate())
+  }
+
+  /** Authorized user answers since the last finished audit/cancellation, never
+   * assistant output, attachment text, or permission-unknown original requests. */
+  auditSetupHistory(jobId: string): AuditSetupReply[] {
+    return this.db.query<{
+      task: string; input_revision: number; job_id: string; id: string; workflow: string
+    }, [string]>(`
+      SELECT c.task,c.input_revision,c.job_id,c.id,previous.workflow
+      FROM jobs current JOIN jobs previous
+        ON previous.chat_id=current.chat_id AND previous.thread_ts=current.thread_ts
+        AND previous.repo_path=current.repo_path AND previous.seq<current.seq
+      JOIN job_controls c ON c.job_id=previous.id
+      WHERE current.id=? AND current.workflow='security-audit'
+        AND previous.status IN ('failed','completed') AND previous.cancel_requested_at IS NULL
+        AND c.chat_id=current.chat_id AND c.thread_ts=current.thread_ts
+        AND c.kind='steer' AND c.write_enabled=1 AND c.status<>'superseded'
+        AND c.input_revision<=previous.input_revision
+        AND previous.seq>COALESCE((SELECT MAX(boundary.seq) FROM jobs boundary
+          WHERE boundary.chat_id=current.chat_id AND boundary.thread_ts=current.thread_ts
+            AND boundary.repo_path=current.repo_path AND boundary.seq<current.seq
+            AND ((boundary.workflow='security-audit' AND boundary.status='completed')
+              OR boundary.cancel_requested_at IS NOT NULL OR boundary.terminal_outcome='cancelled')),0)
+      ORDER BY previous.seq,c.input_revision,c.seq
+    `).all(jobId).map(row => ({text:row.task,writeEnabled:true,revision:row.input_revision,
+      sourceJobId:row.job_id,sourceControlId:row.id,...(row.workflow!=='security-audit'?{restrictionsOnly:true}:{})}))
+  }
+
+  private resumeLegacyAuditSetupHistory(): void {
+    retrySqlite(() => this.db.transaction(() => {
+      const waiting=this.db.query<{id:string},[]>(`SELECT j.id FROM jobs j
+        JOIN audit_setup_waits w ON w.job_id=j.id
+        WHERE j.workflow='security-audit' AND j.status='queued' AND j.cancel_requested_at IS NULL
+          AND w.waiting=1 AND NOT EXISTS (SELECT 1 FROM audit_setup_history_checks h WHERE h.job_id=j.id)`).all()
+      for (const row of waiting) {
+        if (!this.auditSetupHistory(row.id).some(answer => !answer.restrictionsOnly)) continue
+        // Re-evaluate an existing parked request once after upgrading. Never
+        // enqueue another job, resurrect a failed job, or alter its old controls.
+        this.db.run('INSERT OR IGNORE INTO audit_setup_history_checks VALUES (?)',[row.id])
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=?',[row.id])
+      }
+    }).immediate())
+  }
+
+  takeAuditSetupAnswers(job: Pick<JobRecord, 'id' | 'attempts' | 'controlEpoch' | 'inputRevision'>): AuditSetupReply[] {
+    return retrySqlite(() => this.db.transaction(() => {
+      const current = this.get(job.id)
+      if (current?.cancelRequestedAt != null) throw new CodexUserCancelledError()
+      if (!current || current.workflow !== 'security-audit' || current.status !== 'running'
+        || current.attempts !== job.attempts || current.controlEpoch !== job.controlEpoch
+        || current.inputRevision !== job.inputRevision) {
+        throw new CodexInterruptedError('audit setup input changed before host acceptance')
+      }
+      const answers = [...this.auditSetupHistory(job.id), ...this.listJobControls(job.id)
+        .filter(c => c.kind === 'steer' && c.status !== 'superseded' && c.inputRevision <= job.inputRevision)
+        .map(c => ({text:c.task, writeEnabled:c.writeEnabled, revision:c.inputRevision}))]
+      this.db.run('INSERT OR IGNORE INTO audit_setup_history_checks VALUES (?)',[job.id])
+      // These inputs are consumed by the host initializer, never dispatched to
+      // App Server. Record host observation so they cannot block its start notice.
+      this.db.run(`UPDATE job_controls SET status='observed', observed_at=?
+        WHERE job_id=? AND control_epoch=? AND kind='steer' AND status='ready'
+          AND input_revision<=?`, [Date.now(),job.id,job.controlEpoch,job.inputRevision])
+      return answers
+    }).immediate())
+  }
+
+  finishAuditSetup(jobId: string, revision: number): void {
+    const job = this.get(jobId)
+    if (job?.cancelRequestedAt != null) throw new CodexUserCancelledError()
+    if (!job || job.inputRevision !== revision) throw new CodexInterruptedError('audit setup input changed before scanning')
+    this.db.run('DELETE FROM audit_setup_waits WHERE job_id=?', [jobId])
+  }
+
+  previousSecurityAudit(job:JobRecord, include: (id: string) => boolean = () => true):string|null {
     return this.db.query<{id:string},[string,string,string,number]>(
-      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC LIMIT 1",
-    ).get(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq)?.id??null
+      "SELECT id FROM jobs WHERE workflow='security-audit' AND status='completed' AND chat_id=? AND thread_ts=? AND repo_path=? AND seq<? ORDER BY seq DESC",
+    ).all(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq).find(row => include(row.id))?.id??null
   }
 
   stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit', projectKey: string | null): void {
@@ -6727,7 +6889,7 @@ export class JobStore {
       ui_approval_request_id: string | null
     }, [string, string]>(
       `SELECT id, control_epoch, repo_path, write_enabled, ui_approval_request_id FROM jobs
-       WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ?
+       WHERE runtime IN ('codex', 'claude-code') AND chat_id = ? AND thread_ts = ?
          AND accepts_control = 1 AND control_epoch > 0
          AND status IN ('running', 'queued')
        ORDER BY CASE
@@ -6764,7 +6926,7 @@ export class JobStore {
       ui_approval_request_id: string | null
     }, [string, string]>(
       `SELECT id, control_epoch, repo_path, write_enabled, ui_approval_request_id FROM jobs
-       WHERE runtime = 'codex' AND chat_id = ? AND thread_ts = ?
+       WHERE runtime IN ('codex', 'claude-code') AND chat_id = ? AND thread_ts = ?
          AND control_epoch > 0 AND cancel_requested_at IS NULL
          AND status IN ('running', 'queued')
        ORDER BY CASE
@@ -6824,8 +6986,10 @@ export class JobStore {
         `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts, status, started_at,
                 monitor_state, repo_path, write_enabled, cancel_requested_at,
                 ui_approval_request_id
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
+      if (input.kind === 'steer' && this.auditSetupWaiting(jobId)
+        && (!input.writeEnabled || expected.repoPath !== target?.repo_path)) return 'closed'
       if (!target || target.control_epoch !== epoch
         || target.chat_id !== chatId || target.thread_ts !== threadTs
         || !(target.status === 'running' || target.status === 'queued')
@@ -6876,6 +7040,7 @@ export class JobStore {
             [chatId, threadTs, interruptInbound.seq, jobId, epoch],
           )
         }
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=?', [jobId])
         this.db.run(
           `UPDATE job_controls SET status = 'superseded',
              last_error = 'superseded by a later Slack interrupt'
@@ -6971,6 +7136,7 @@ export class JobStore {
              AND status IN ('ready', 'paused', 'answer-prepared')`,
           [snapshot.revision, snapshot.digest, jobId, epoch],
         )
+        this.db.run('UPDATE audit_setup_waits SET waiting=0 WHERE job_id=? AND input_revision<?', [jobId, inputRevision])
         if (target.ui_approval_request_id) {
           const prompt = this.db.query<{
             prompt_message_id: string | null
@@ -7084,7 +7250,7 @@ export class JobStore {
         `SELECT accepts_control, control_epoch, input_revision, chat_id, thread_ts,
                 status, cancel_requested_at, id, message_id, user_id, write_enabled,
                 task, attachments_json, repo_path, ui_approval_request_id
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
       if (!target || target.control_epoch !== epoch
         || target.chat_id !== chatId || target.thread_ts !== threadTs
@@ -7154,7 +7320,7 @@ export class JobStore {
   ): 'staged' | 'duplicate' | 'closed' {
     let target: LiveControlTarget | null = expected
     for (let attempt = 0; attempt < 2 && target; attempt += 1) {
-      const disposition = target.awaitingUiApproval
+      const disposition = target.awaitingUiApproval || this.auditSetupWaiting(target.jobId)
         ? this.stageLiveControl(target, { ...input, kind: 'steer' })
         : this.stageLiveInterjection(target, input)
       if (disposition !== 'closed') return disposition
@@ -7300,7 +7466,7 @@ export class JobStore {
   ): void {
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_nonce = ?, active_thread_id = ?, active_turn_id = ?
-       WHERE id = ? AND runtime = 'codex' AND status = 'running' AND worker_id = ?
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND worker_id = ?
          AND control_epoch = ?
          AND (executor_nonce IS NULL OR executor_nonce = ?)
          AND (active_thread_id IS NULL OR active_thread_id = ?)`,
@@ -7335,7 +7501,7 @@ export class JobStore {
       const job = this.db.query<JobRow, [string]>(
         'SELECT * FROM jobs WHERE id = ?',
       ).get(jobId)
-      if (!job || job.runtime !== 'codex' || job.status !== 'running'
+      if (!job || !isPrimaryCore(job.runtime) || job.status !== 'running'
         || job.worker_id !== workerId || job.control_epoch !== epoch
         || job.executor_nonce !== executorNonce || job.active_thread_id !== threadId
         || (job.active_turn_id !== null && job.active_turn_id !== parentTurnId)
@@ -7390,7 +7556,7 @@ export class JobStore {
         cancel_requested_at: number | null
       }, [string, number, number]>(
         `SELECT input_revision, cancel_requested_at FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND attempts = ? AND control_epoch = ?`,
       ).get(
         requireText(options.jobId, 'jobId'),
@@ -7494,7 +7660,7 @@ export class JobStore {
       )
       const binding = this.db.run(
         `UPDATE jobs SET executor_nonce = ?, active_thread_id = ?, active_turn_id = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running' AND worker_id = ?
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND worker_id = ?
            AND attempts = ? AND control_epoch = ?
            AND executor_nonce IS NULL AND active_thread_id IS NULL AND active_turn_id IS NULL`,
         [
@@ -7661,7 +7827,7 @@ export class JobStore {
       }, [string, number, number]>(
         `SELECT executor_nonce, active_thread_id, active_turn_id, cancel_requested_at,
                 input_revision
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND attempts = ? AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.attempt), Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -7731,7 +7897,7 @@ export class JobStore {
         `SELECT id, message_id, user_id, write_enabled, task, attachments_json, input_revision,
                 cancel_requested_at, chat_id, thread_ts, executor_nonce,
                 active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND attempts = ? AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.attempt), Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -7838,7 +8004,7 @@ export class JobStore {
       )
       const binding = this.db.run(
         `UPDATE jobs SET active_turn_id = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running' AND worker_id = ?
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND worker_id = ?
            AND attempts = ? AND control_epoch = ? AND executor_nonce = ?
            AND active_thread_id = ? AND active_turn_id IS NULL`,
         [
@@ -7920,7 +8086,7 @@ export class JobStore {
         active_turn_id: string | null
       }, [string, number]>(
         `SELECT executor_nonce, active_thread_id, active_turn_id FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running' AND control_epoch = ?`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!binding || binding.executor_nonce !== options.executorNonce
         || binding.active_thread_id !== options.threadId
@@ -8020,7 +8186,7 @@ export class JobStore {
         cancel_requested_at: number | null
       }, [string, number]>(
         `SELECT executor_nonce, active_thread_id, active_turn_id, cancel_requested_at
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!binding || binding.cancel_requested_at !== null
@@ -8135,6 +8301,43 @@ export class JobStore {
     }
   }
 
+  retryInterjectionAnswer(options: {
+    interjectionId: string
+    jobId: string
+    epoch: number
+    logicalNonce: string
+    threadId: string
+    turnId: string
+  }): number | 'cancelled' {
+    const retry = this.db.transaction(() => {
+      const job = this.db.query<{ cancel_requested_at: number | null }, [string, number, string, string, string]>(
+        `SELECT cancel_requested_at FROM jobs WHERE id = ? AND control_epoch = ?
+         AND status = 'running' AND runtime IN ('codex', 'claude-code') AND executor_nonce = ?
+         AND active_thread_id = ? AND active_turn_id = ?`,
+      ).get(options.jobId, options.epoch, options.logicalNonce, options.threadId, options.turnId)
+      if (!job) throw new Error('interjection answer retry job binding changed')
+      if (job.cancel_requested_at !== null) return 'cancelled' as const
+      const row = this.db.query<JobInterjectionRow, [string, string, number, string, string, string]>(
+        `SELECT * FROM job_interjections WHERE id = ? AND job_id = ? AND control_epoch = ?
+         AND status = 'answering' AND answer_logical_nonce = ? AND answer_thread_id = ?
+         AND answer_turn_id = ? AND answer_payload IS NULL AND notification_id IS NULL`,
+      ).get(options.interjectionId, options.jobId, options.epoch, options.logicalNonce,
+        options.threadId, options.turnId)
+      if (!row) throw new Error('interjection answer retry receipt changed')
+      this.db.run(
+        `UPDATE job_interjections SET status = CASE WHEN paused_at IS NULL THEN 'ready' ELSE 'paused' END,
+         answer_retry_count = answer_retry_count + 1,
+         last_error = 'completed answer format was invalid; retry only the read-only answer'
+         WHERE id = ?`, [options.interjectionId],
+      )
+      // Keep the previous answer receipt as evidence until preparation of the
+      // next generation. Release only the exact, observed terminal binding.
+      this.db.run(`UPDATE jobs SET active_turn_id = NULL WHERE id = ?`, [options.jobId])
+      return row.answer_retry_count + 1
+    })
+    return retrySqlite(() => retry.immediate())
+  }
+
   prepareInterjectionAnswer(options: {
     interjectionId: string
     jobId: string
@@ -8142,7 +8345,7 @@ export class JobStore {
     logicalNonce: string
     threadId: string
   }): string | 'cancelled' | 'input-changed' {
-    const clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
+    let clientUserMessageId = `${requireText(options.interjectionId, 'interjectionId')}:answer`
     const prepare = this.db.transaction(() => {
       const job = this.db.query<{
         input_revision: number
@@ -8153,7 +8356,7 @@ export class JobStore {
       }, [string, number]>(
         `SELECT input_revision, cancel_requested_at, executor_nonce,
                 active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -8176,6 +8379,8 @@ export class JobStore {
         throw new Error(`interjection is not ready for an answer: ${options.interjectionId}`)
       }
       if (row.input_revision !== job.input_revision) return 'input-changed' as const
+      clientUserMessageId = `${options.interjectionId}:answer`
+        + (row.answer_retry_count > 0 ? `:repair:${row.answer_retry_count}` : '')
       const updated = this.db.run(
         `UPDATE job_interjections SET status = 'answer-prepared',
            answer_logical_nonce = ?, answer_thread_id = ?, answer_prepared_at = ?,
@@ -8210,7 +8415,7 @@ export class JobStore {
       }, [string, number]>(
         `SELECT input_revision, cancel_requested_at, executor_nonce,
                 active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -8265,7 +8470,7 @@ export class JobStore {
       }
       const binding = this.db.run(
         `UPDATE jobs SET active_turn_id = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running' AND worker_id = ?
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND worker_id = ?
            AND control_epoch = ? AND executor_nonce = ? AND active_thread_id = ?
            AND active_turn_id IS NULL`,
         [
@@ -8300,7 +8505,7 @@ export class JobStore {
         active_turn_id: string | null
       }, [string, number]>(
         `SELECT cancel_requested_at, executor_nonce, active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -8385,7 +8590,7 @@ export class JobStore {
       }, [string, number]>(
         `SELECT executor_nonce, active_thread_id, active_turn_id, cancel_requested_at, attempts,
                 chat_id, thread_ts
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.executorNonce
@@ -8607,7 +8812,7 @@ export class JobStore {
         `SELECT id, message_id, user_id, write_enabled, task, attachments_json, input_revision,
                 cancel_requested_at, chat_id, thread_ts, executor_nonce,
                 active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.logicalNonce
@@ -8657,7 +8862,7 @@ export class JobStore {
       }
       const updated = this.db.run(
         `UPDATE jobs SET accepts_control = 0
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ? AND executor_nonce = ? AND active_thread_id = ?
            AND active_turn_id IS NULL AND cancel_requested_at IS NULL`,
         [options.jobId, Math.floor(options.epoch), options.logicalNonce, options.threadId],
@@ -8687,7 +8892,7 @@ export class JobStore {
         active_turn_id: string | null
       }, [string, number]>(
         `SELECT executor_nonce, active_thread_id, active_turn_id
-         FROM jobs WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
       ).get(options.jobId, Math.floor(options.epoch))
       if (!job || job.executor_nonce !== options.executorNonce
@@ -8701,7 +8906,7 @@ export class JobStore {
       const updated = this.db.run(
         `UPDATE jobs SET not_before = ?, session_id = ?,
            accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND control_epoch = ?`,
         [options.resumeAt, options.threadId, options.jobId, Math.floor(options.epoch)],
       )
@@ -8785,6 +8990,16 @@ export class JobStore {
         'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (retained) throw new Error(`event already completed and retained: ${idempotencyKey}`)
+      const prior = this.db.query<{ runtime: JobRuntime }, [string]>(
+        'SELECT runtime FROM jobs WHERE idempotency_key = ?',
+      ).get(idempotencyKey)
+      const admitted = this.db.query<{ primary_core: PrimaryCore }, [string, string]>(
+        'SELECT primary_core FROM inbound_deliveries WHERE idempotency_key = ? AND repo_path = ?',
+      ).get(idempotencyKey, repoPath)
+      const core = prior ? (isPrimaryCore(prior.runtime) ? prior.runtime : 'codex')
+        : input.workflow === 'security-audit' ? 'codex'
+        : admitted?.primary_core ?? input.core ?? (existsSync(repoPath) ? projectPrimaryCore(repoPath).active : 'codex')
+      if (!isPrimaryCore(core)) throw new Error('unsupported primary core')
       const threadAttachments = this.catalogProcessingInboundAttachments(idempotencyKey, {
         chatId,
         threadTs,
@@ -8796,7 +9011,7 @@ export class JobStore {
            repo_path, task, attachments_json, thread_attachments_json,
            runtime, write_enabled, status, workflow,
            control_epoch, accepts_control, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, 'queued', ?, 1, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 1, 1, ?)`,
         [
           id,
           idempotencyKey,
@@ -8808,6 +9023,7 @@ export class JobStore {
           task,
           JSON.stringify(attachments),
           JSON.stringify(threadAttachments),
+          core,
           input.workflow === 'security-audit' ? 0 : input.writeEnabled ? 1 : 0,
           input.workflow ?? 'work',
           Date.now(),
@@ -8827,6 +9043,7 @@ export class JobStore {
         'SELECT * FROM jobs WHERE idempotency_key = ?',
       ).get(idempotencyKey)
       if (!row) throw new Error('failed to read enqueued job')
+      this.db.run('INSERT OR IGNORE INTO task_model_sources VALUES (?,?)', [row.id,input.modelRequestText ?? task])
 
       const position = this.db.query<{ position: number }, [number]>(
         `SELECT COUNT(*) AS position
@@ -8852,7 +9069,7 @@ export class JobStore {
           idempotencyKey: `security-audit-accepted:${idempotencyKey}`,
           jobId: row.id, chatId, threadTs,
           kind: 'execution-started', createdAt: Date.now(),
-          payload: 'セキュリティ検査として受け付けました。コードを修正せず13工程を順に検査し、検査不能・失敗も含めたレポートをこのスレッドへ添付します。'
+          payload: 'セキュリティ検査として受け付けました。最初に12工程すべての利用可能状態を確認し、不備があれば本検査を開始せずお知らせします。全件確認できた後に、コードを修正せず検査し、レポートをこのスレッドへ添付します。'
             + (waitsBehindPriorJob ? ' 現在の作業が終わり次第、開始します。' : ''),
         })
       } else if (result.changes === 1 && input.notifyAccepted && waitsBehindPriorJob) {
@@ -8913,6 +9130,8 @@ export class JobStore {
     return row ? mapRow(row) : null
   }
 
+  taskModels(): TaskModelSelections { return new TaskModelSelections(this.db) }
+
   previousSlackDelivery(id: string): JobRecord['previousSlackDelivery'] {
     const prior = this.db.query<{ id: string; seq: number }, [string]>(
       `SELECT prior.id, prior.seq FROM jobs current JOIN jobs prior
@@ -8948,13 +9167,13 @@ export class JobStore {
     const messages = this.db.query<{ payload: string }, [string]>(
       'SELECT payload FROM cloud_handoff_context WHERE job_id=? ORDER BY created_at,rowid',
     ).all(id).map(row => row.payload).join('\n\n')
-    return redactCredentialMaterial(`${prior}\n\nCurrent task events:\n${events.map(event => `[${event.kind}] ${event.text}`).join('\n\n')}\n\nVisible Codex output (including messages not posted to Slack):\n${messages}`, '[credential removed]')
+    return `${prior}\n\nCurrent task events:\n${events.map(event => `[${event.kind}] ${event.text}`).join('\n\n')}\n\nVisible Codex output (including messages not posted to Slack):\n${messages}`
   }
 
   recordCloudContext(id: string, sourceKey: string, text: string): void {
     if (!this.cloudHandoff(id)) return
     this.db.run('INSERT OR IGNORE INTO cloud_handoff_context(job_id,source_key,payload,created_at) VALUES(?,?,?,?)',
-      [id, sourceKey, redactCredentialMaterial(text, '[credential removed]'), Date.now()])
+      [id, sourceKey, text, Date.now()])
   }
 
   pendingCloudSaves(): JobRecord[] {
@@ -9024,6 +9243,7 @@ export class JobStore {
   }
 
   stageCloudControl(input: CloudControl): void {
+    if (!this.hasDurableEvent(`${input.channel}:${input.message}`)) assertSlackProjectAdmission(input.project, input.message)
     this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
       [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()])
   }
@@ -9065,9 +9285,17 @@ export class JobStore {
       chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: CLOUD_SAVE_FAILED_MESSAGE, createdAt: Date.now() })
   }
 
-  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string): ReturnType<JobStore['enqueue']> {
+  enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string, primaryModel?: string, executionRepo?: string): ReturnType<JobStore['enqueue']> {
     const commit = this.db.transaction(() => {
+      // A handoff continues an already-admitted source job. Its core takes
+      // precedence over the destination's setting for otherwise new work.
+      if (input.core) this.db.run(`UPDATE inbound_deliveries SET primary_core=?
+        WHERE idempotency_key=? AND repo_path=?`, [input.core, `${input.chatId}:${input.messageId}`, input.repoPath])
       const result = this.enqueue(input)
+      if (input.core && result.job.runtime !== input.core) throw new Error('cloud import core differs from its existing job')
+      if (primaryModel && result.job.runtime === 'claude-code') {
+        pinClaudeJobModel(dirname(this.dbPath), result.job.id, executionRepo ?? input.repoPath, primaryModel)
+      } else if (primaryModel) this.taskModels().seedHandoff(result.job.id, input.task, primaryModel)
       this.bindCloudHandoff(result.job.id, cloudId, epoch, receipt)
       this.db.run(`UPDATE cloud_handoff_jobs SET state='transferred',updated_at=?
         WHERE cloud_id=? AND job_id<>? AND state IN ('saving','waiting')`, [Date.now(), cloudId, result.job.id])
@@ -9120,7 +9348,7 @@ export class JobStore {
   ): DurableThreadHistorySnapshot {
     const jobId = requireText(jobIdInput, 'jobId')
     const job = this.db.query<JobRow, [string]>(
-      "SELECT * FROM jobs WHERE id = ? AND runtime = 'codex'",
+      "SELECT * FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')",
     ).get(jobId)
     if (!job) throw new Error(`thread history job is unavailable: ${jobId}`)
     const attempt = attemptInput ?? job.attempts
@@ -9163,7 +9391,7 @@ export class JobStore {
   countActive(): number {
     return this.db.query<{ count: number }, []>(
       `SELECT COUNT(*) AS count FROM jobs
-       WHERE runtime = 'codex' AND status IN ('queued', 'running')
+       WHERE runtime IN ('codex', 'claude-code') AND status IN ('queued', 'running')
          AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs c WHERE c.job_id=jobs.id AND c.state<>'active')`,
     ).get()?.count ?? 0
   }
@@ -9171,7 +9399,7 @@ export class JobStore {
   activeCounts(): { queued: number; running: number } {
     const rows = this.db.query<{ status: 'queued' | 'running'; count: number }, []>(
       `SELECT status, COUNT(*) AS count FROM jobs
-       WHERE runtime = 'codex' AND status IN ('queued', 'running')
+       WHERE runtime IN ('codex', 'claude-code') AND status IN ('queued', 'running')
          AND NOT EXISTS (SELECT 1 FROM cloud_handoff_jobs c WHERE c.job_id=jobs.id AND c.state<>'active')
        GROUP BY status`,
     ).all()
@@ -9184,7 +9412,7 @@ export class JobStore {
   /** Current folder and details come from the same live job; otherwise use the startup folder. */
   fleetFolderFacts(now: number, startup: string): FleetLocalFacts {
     const current=this.db.query<{repo_path:string},[]>(
-      `SELECT repo_path FROM jobs WHERE runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+      `SELECT repo_path FROM jobs WHERE runtime IN ('codex', 'claude-code') AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
     ).get()
     const currentProject=current?fleetProject(current.repo_path)?.key??null:null
@@ -9198,11 +9426,11 @@ export class JobStore {
     const counts = this.activeCounts()
     const allQueued = counts.queued
     const allRunning = counts.running
-    if(project) counts.running=this.db.query<{n:number},[string]>("SELECT count(*) AS n FROM jobs WHERE runtime='codex' AND status='running' AND repo_path=?").get(project)!.n
+    if(project) counts.running=this.db.query<{n:number},[string]>("SELECT count(*) AS n FROM jobs WHERE runtime IN ('codex', 'claude-code') AND status='running' AND repo_path=?").get(project)!.n
     counts.queued = this.db.query<{ n: number }, any[]>(`SELECT count(*) AS n FROM jobs WHERE ${CLAIMABLE_CODEX_JOB_PREDICATE} AND (? IS NULL OR repo_path=?)`).get(project ?? null, project ?? null)!.n
     const current = this.db.query<{ id: string; attempts: number; not_before: number | null; rate_limit_terminal_json: string | null }, any[]>(
       `SELECT id, attempts, not_before, rate_limit_terminal_json FROM jobs
-       WHERE (? IS NULL OR repo_path=?) AND runtime='codex' AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
+       WHERE (? IS NULL OR repo_path=?) AND runtime IN ('codex', 'claude-code') AND (status='running' OR (${CLAIMABLE_CODEX_JOB_PREDICATE}))
        ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, seq LIMIT 1`,
     ).get(project ?? null, project ?? null)
     const summary = current ? this.db.query<{ payload: string; created_at: number }, [string, number]>(
@@ -9210,7 +9438,7 @@ export class JobStore {
        AND delivered_at IS NOT NULL AND suppressed_at IS NULL ORDER BY seq DESC LIMIT 1`,
     ).get(current.id, current.attempts) : null
     const last = this.db.query<{ at: number | null }, any[]>(
-      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime='codex' AND (? IS NULL OR repo_path=?)
+      `SELECT MAX(at) AS at FROM (SELECT MAX(created_at) AS at FROM jobs WHERE runtime IN ('codex', 'claude-code') AND (? IS NULL OR repo_path=?)
        UNION ALL SELECT MAX(c.created_at) FROM job_controls c JOIN jobs j ON j.id=c.job_id WHERE c.kind='steer' AND (? IS NULL OR j.repo_path=?))`,
     ).get(project ?? null, project ?? null, project ?? null, project ?? null)?.at ?? null
     const limited = !counts.running && (Boolean(current?.rate_limit_terminal_json) || Boolean(this.db.query<{ yes: number }, any[]>(
@@ -9221,7 +9449,7 @@ export class JobStore {
     ).get(project ?? null, project ?? null))
     // Public Slack milestones only. Credentials and local paths are not a fleet summary.
     const text = summary?.payload.replace(/^💬\s*/, '').trim() ?? null
-    const safe = text && !containsCredentialMaterial(text) ? fleetSummaryWithoutPaths(text) : null
+    const safe = text ? fleetSummaryWithoutPaths(text) : null
     return { ...counts, limited, approval, occupiedElsewhere: allRunning > counts.running || allQueued > counts.queued, deferred: Boolean(current?.not_before && current.not_before > now),
       lastAcceptedAt: last, summary: limited ? null : safe, summaryAt: !limited && safe ? summary!.created_at : null }
   }
@@ -9252,7 +9480,7 @@ export class JobStore {
     )
     const claim = this.db.transaction((claimingWorkerId: string, claimAt: number): JobRecord | null => {
       const active = this.db.query<{ present: number }, []>(
-        "SELECT 1 AS present FROM jobs WHERE runtime = 'codex' AND status = 'running' LIMIT 1",
+        "SELECT 1 AS present FROM jobs WHERE runtime IN ('codex', 'claude-code') AND status = 'running' LIMIT 1",
       ).get()
       if (active) return null
       const row = this.db.query<JobRow, [number]>(
@@ -9266,10 +9494,10 @@ export class JobStore {
         && row.not_before !== null && row.not_before > claimAt) return null
 
       const sessionUsesCurrentProtocol = (sessionId: string): boolean => (
-        this.db.query<{ present: number }, [string, number]>(
+        this.db.query<{ present: number }, [string, number, JobRuntime]>(
           `SELECT 1 AS present FROM codex_session_protocols
-           WHERE session_id = ? AND protocol_version = ?`,
-        ).get(sessionId, CODEX_SESSION_PROTOCOL_VERSION) !== null
+           WHERE session_id = ? AND protocol_version = ? AND core = ?`,
+        ).get(sessionId, CODEX_SESSION_PROTOCOL_VERSION, row.runtime) !== null
       )
       const isRetry = row.attempts > 0 && row.session_id !== null
         && sessionUsesCurrentProtocol(row.session_id)
@@ -9284,12 +9512,12 @@ export class JobStore {
         // would incorrectly skip a newer ordinary failure and resurrect an
         // older, no-longer-adjacent session.
         const preceding = this.db.query<
-          { session_id: string | null; status: JobStatus; workflow: string },
+          { session_id: string | null; status: JobStatus; workflow: string; runtime: JobRuntime },
           [string, string, string, number, number]
         >(
-          `SELECT jobs.session_id, jobs.status, jobs.workflow
+          `SELECT jobs.session_id, jobs.status, jobs.workflow, jobs.runtime
            FROM jobs
-           WHERE jobs.runtime = 'codex'
+           WHERE jobs.runtime IN ('codex', 'claude-code')
              AND jobs.chat_id = ?
              AND jobs.thread_ts = ?
              AND jobs.repo_path = ?
@@ -9309,6 +9537,7 @@ export class JobStore {
         // retires that session explicitly; every other same-thread failure is
         // valuable continuation context for the user's next "resume" request.
         const prior = row.workflow !== 'security-audit' && preceding?.workflow !== 'security-audit' && preceding?.session_id
+          && preceding.runtime === row.runtime
           && (preceding.status === 'completed' || preceding.status === 'failed')
           && sessionUsesCurrentProtocol(preceding.session_id)
           && this.db.query<{ present: number }, [string]>(
@@ -9412,7 +9641,7 @@ export class JobStore {
              ui_approval_request_id = NULL,
              terminal_outcome = 'completed',
              finished_at = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND cancel_requested_at IS NULL
            AND (executor_nonce IS NULL OR (accepts_control = 0 AND active_turn_id IS NULL))
            ${ignoreMonitorBarriersForForcedServiceStop ? '' : `AND monitor_state != 3
@@ -9471,7 +9700,7 @@ export class JobStore {
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs
        SET pending_session_id = ?, pending_result = ?, executor_pid = NULL
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
          AND pending_session_id IS NULL AND pending_result IS NULL`,
       [requireText(sessionId, 'sessionId'), result, id],
     ))
@@ -9495,7 +9724,7 @@ export class JobStore {
       }, [string]>(
         `SELECT status, attempts, input_revision, write_enabled,
                 pending_session_id, pending_result FROM jobs
-         WHERE id = ? AND runtime = 'codex'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(id)
       if (!row || row.status !== 'running') {
         throw new Error(`job is no longer running: ${id}`)
@@ -9621,7 +9850,7 @@ export class JobStore {
       }
       const updated = this.db.run(
         `UPDATE jobs SET pending_session_id = ?, pending_result = ?, executor_pid = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND pending_session_id IS NULL AND pending_result IS NULL`,
         [persistedSession, expectedPersistedResult, id],
       )
@@ -9652,7 +9881,7 @@ export class JobStore {
       pending_result: string | null
     }, [string]>(
       `SELECT pending_session_id, pending_result FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
     ).get(id)
     let expected = result
     if (publication) {
@@ -9674,7 +9903,7 @@ export class JobStore {
     return this.db.query<{ job_id: string }, []>(
       `SELECT sets.job_id FROM github_publication_sets AS sets
        JOIN jobs ON jobs.id = sets.job_id
-       WHERE sets.status = 'pending' AND jobs.runtime = 'codex'
+       WHERE sets.status = 'pending' AND jobs.runtime IN ('codex', 'claude-code')
          AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL
          AND jobs.cancel_requested_at IS NULL
        ORDER BY jobs.seq`,
@@ -9685,7 +9914,7 @@ export class JobStore {
     return Boolean(this.db.query<{ job_id: string }, [string]>(
       `SELECT sets.job_id FROM github_publication_sets AS sets
        JOIN jobs ON jobs.id = sets.job_id
-       WHERE sets.job_id = ? AND jobs.runtime = 'codex'
+       WHERE sets.job_id = ? AND jobs.runtime IN ('codex', 'claude-code')
          AND jobs.status = 'running' AND jobs.pending_result IS NOT NULL`,
     ).get(jobId))
   }
@@ -9783,7 +10012,7 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const row = this.db.query<JobRow, [string]>(
       `SELECT * FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
     ).get(jobId)
     if (!row) return null
     const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
@@ -9826,7 +10055,7 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const row = this.db.query<JobRow, [string]>(
       `SELECT * FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
     ).get(jobId)
     if (!row) return null
     const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
@@ -9978,7 +10207,7 @@ export class JobStore {
       }, [string]>(
         `SELECT status, write_enabled, attempts, session_id, pending_session_id,
                 pending_result, cancel_requested_at
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
       if (!job) throw new Error(`GitHub publication recovery job disappeared: ${jobId}`)
       if (job.status === 'queued') {
@@ -10065,7 +10294,7 @@ export class JobStore {
              active_thread_id = NULL, active_turn_id = NULL,
              terminal_outcome = NULL, ui_approval_request_id = NULL,
              monitor_state = CASE WHEN monitor_state = 3 THEN 0 ELSE monitor_state END
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND attempts = ? AND cancel_requested_at IS NULL
            AND pending_session_id = ? AND pending_result = ?`,
         [
@@ -10106,7 +10335,7 @@ export class JobStore {
                 active_turn_id, pending_session_id, pending_result,
                 ui_approval_request_id
          FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND write_enabled = 1`,
       ).get(jobId)
       if (!job || job.cancel_requested_at !== null || job.executor_pid !== null
@@ -10151,7 +10380,7 @@ export class JobStore {
              accepts_control = 1, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
              terminal_outcome = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND write_enabled = 1 AND attempts = ? AND session_id = ?
            AND cancel_requested_at IS NULL AND executor_pid IS NULL
            AND active_turn_id IS NULL AND pending_session_id IS NULL
@@ -10334,7 +10563,7 @@ export class JobStore {
       }
       const job = this.db.query<{ pending_result: string | null }, [string]>(
         `SELECT pending_result FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
       ).get(jobId)
       if (!job || job.pending_result === null) {
         throw new Error(`GitHub publication has no staged result for job ${jobId}`)
@@ -10381,7 +10610,7 @@ export class JobStore {
       pending_result: string | null
     }, [string]>(
       `SELECT write_enabled, pending_session_id, pending_result FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
     ).get(id)
     if (!row?.pending_session_id || row.pending_result === null) {
       throw new Error(`job has no staged execution result: ${id}`)
@@ -10410,7 +10639,7 @@ export class JobStore {
     // terminalize the cancellation and discard the pending result afterward.
     const rows = this.db.query<{ id: string }, []>(
       `SELECT id FROM jobs
-       WHERE runtime = 'codex' AND status = 'running'
+       WHERE runtime IN ('codex', 'claude-code') AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL
          AND NOT EXISTS (
            SELECT 1 FROM github_publication_sets AS publication
@@ -10435,7 +10664,7 @@ export class JobStore {
   stagedExecutionJobIds(): string[] {
     return this.db.query<{ id: string }, []>(
       `SELECT id FROM jobs
-       WHERE runtime = 'codex' AND status = 'running'
+       WHERE runtime IN ('codex', 'claude-code') AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL
        ORDER BY seq ASC`,
     ).all().map(row => row.id)
@@ -10444,7 +10673,7 @@ export class JobStore {
   hasStagedExecution(id: string): boolean {
     return this.db.query<{ present: number }, [string]>(
       `SELECT 1 AS present FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL`,
     ).get(id) !== null
   }
@@ -10452,7 +10681,7 @@ export class JobStore {
   beginMonitorPreparation(id: string, workerId: string): void {
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 1
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
          AND worker_id = ? AND executor_pid IS NULL
          AND pending_session_id IS NULL AND pending_result IS NULL
          AND monitor_state = 0`,
@@ -10470,7 +10699,7 @@ export class JobStore {
   commitMonitorRequired(id: string, workerId: string): void {
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 2
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
          AND worker_id = ? AND executor_pid IS NULL
          AND pending_session_id IS NULL AND pending_result IS NULL
          AND monitor_state = 1`,
@@ -10488,7 +10717,7 @@ export class JobStore {
   releaseUnarmedMonitorPreparation(id: string): boolean {
     return retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 0
-       WHERE id = ? AND runtime = 'codex' AND status IN ('queued', 'running')
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status IN ('queued', 'running')
          AND monitor_state = 1 AND executor_pid IS NULL
          AND pending_session_id IS NULL AND pending_result IS NULL`,
       [id],
@@ -10498,9 +10727,12 @@ export class JobStore {
   retireMonitorObligation(id: string): void {
     retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 0
-       WHERE id = ? AND runtime = 'codex'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code')
          AND (status IN ('completed', 'failed')
-           OR (status = 'queued' AND ui_approval_request_id IS NOT NULL))`,
+           OR (status = 'queued' AND (ui_approval_request_id IS NOT NULL
+             OR (workflow = 'security-audit' AND EXISTS (
+               SELECT 1 FROM audit_setup_waits WHERE job_id = jobs.id
+             )))))`,
       [id],
     ))
   }
@@ -10510,7 +10742,7 @@ export class JobStore {
     const inserted = retrySqlite(() => this.db.run(
       `INSERT INTO monitor_failures (job_id, reason_digest, created_at)
        SELECT id, ?, ? FROM jobs
-       WHERE id = ? AND runtime = 'codex' AND monitor_state = 2
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND monitor_state = 2
        ON CONFLICT(job_id) DO NOTHING`,
       [digest, Date.now(), id],
     ))
@@ -10535,7 +10767,7 @@ export class JobStore {
   markMonitorLostAfterStagedResult(id: string): boolean {
     return retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 3
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
          AND monitor_state = 2
          AND pending_session_id IS NOT NULL AND pending_result IS NOT NULL`,
       [id],
@@ -10575,7 +10807,7 @@ export class JobStore {
       pending_result: string | null
     }, []>(
       `SELECT id, status, monitor_state, executor_pid, pending_session_id, pending_result FROM jobs
-       WHERE runtime = 'codex' AND monitor_state IN (1, 2, 3)
+       WHERE runtime IN ('codex', 'claude-code') AND monitor_state IN (1, 2, 3)
        ORDER BY seq ASC`,
     ).all().map(row => {
       const validLostStaged = row.monitor_state !== 3
@@ -10621,7 +10853,7 @@ export class JobStore {
       }
       const updated = this.db.run(
         `UPDATE jobs SET session_id = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
         [persistedSessionId, id],
       )
       if (updated.changes !== 1) throw new Error(`job is no longer running: ${id}`)
@@ -10635,7 +10867,7 @@ export class JobStore {
     }
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_pid = ?
-       WHERE id = ? AND runtime = 'codex' AND status = 'running' AND monitor_state = 2`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND monitor_state = 2`,
       [executorPid, id],
     ))
     if (updated.changes !== 1) {
@@ -10646,7 +10878,7 @@ export class JobStore {
   clearExecutorPid(id: string, executorPid: number): void {
     retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_pid = NULL
-       WHERE id = ? AND runtime = 'codex' AND status = 'running' AND executor_pid = ?`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND executor_pid = ?`,
       [id, executorPid],
     ))
   }
@@ -10654,7 +10886,7 @@ export class JobStore {
   clearExecutorPidAfterExit(id: string, executorPid: number): void {
     const updated = retrySqlite(() => this.db.run(
       `UPDATE jobs SET executor_pid = NULL
-       WHERE id = ? AND runtime = 'codex' AND status = 'running' AND executor_pid = ?`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running' AND executor_pid = ?`,
       [id, executorPid],
     ))
     if (updated.changes !== 1) {
@@ -10665,7 +10897,7 @@ export class JobStore {
   clearSession(id: string): void {
     this.db.run(
       `UPDATE jobs SET session_id = NULL, resumed = 0
-       WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
       [id],
     )
   }
@@ -10884,7 +11116,7 @@ export class JobStore {
              ui_approval_request_id = NULL,
              terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
         [error, finishedAt, id],
       )
       if (updated.changes !== 1) throw new Error('job is no longer running: ' + id)
@@ -10927,7 +11159,7 @@ export class JobStore {
              ui_approval_request_id = NULL,
              terminal_outcome = 'cancelled',
              last_error = ?, finished_at = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND cancel_requested_at IS NOT NULL`,
         [message, finishedAt, id],
       )
@@ -11006,7 +11238,7 @@ export class JobStore {
              ui_approval_request_id = NULL,
              terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
-         WHERE id = ? AND runtime = 'codex' AND status IN ('queued', 'running')`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status IN ('queued', 'running')`,
         [error, finishedAt, id],
       )
       if (updated.changes === 0) return false
@@ -11407,12 +11639,11 @@ export class JobStore {
     const attempt = Math.floor(attemptInput)
     const inputRevision = Math.floor(inputRevisionInput)
     const kind = kindInput
-    const payload = normalizePublicGuardText(payloadInput).trim()
+    const payload = payloadInput.trim()
     if (!Number.isSafeInteger(attempt) || attempt < 1
       || !Number.isSafeInteger(inputRevision) || inputRevision < 1
       || !['PLAN', 'VERIFY', 'BLOCKED'].includes(kind)
       || !payload.startsWith('💬 ') || payload.length > 700
-      || containsCredentialMaterial(payload)
       || !Number.isSafeInteger(now) || now <= 0) {
       throw new Error('milestone commentary notification is invalid')
     }
@@ -11459,11 +11690,10 @@ export class JobStore {
     const jobId = requireText(jobIdInput, 'jobId')
     const attempt = Math.floor(attemptInput)
     const sourceKey = requireText(sourceKeyInput, 'commentary source key')
-    const payload = normalizePublicGuardText(payloadInput).trim()
+    const payload = payloadInput.trim()
     if (!Number.isSafeInteger(attempt) || attempt < 1
       || !/^[0-9a-f]{64}$/.test(sourceKey)
       || !payload.startsWith('💬 ') || payload.length > 700
-      || containsCredentialMaterial(payload)
       || !Number.isSafeInteger(now) || now <= 0) {
       throw new Error('commentary notification is invalid')
     }
@@ -11515,6 +11745,15 @@ export class JobStore {
       return 'staged'
     })
     return retrySqlite(() => stage.immediate())
+  }
+
+  commentarySourceDelivered(jobId: string, sourceKey: string): boolean {
+    return !!this.db.query<{ delivered: number }, [string, string]>(
+      `SELECT 1 AS delivered FROM commentary_notifications c WHERE c.job_id = ? AND c.source_key = ?
+       AND (c.delivered_at IS NOT NULL OR (c.suppressed_at IS NOT NULL AND EXISTS (
+         SELECT 1 FROM commentary_notifications prior WHERE prior.job_id=c.job_id AND prior.attempt=c.attempt
+         AND prior.seq<c.seq AND prior.payload=c.payload AND prior.delivered_at IS NOT NULL)))`,
+    ).get(jobId, sourceKey)
   }
 
   pendingCommentaryNotifications(
@@ -11803,7 +12042,7 @@ export class JobStore {
       }, [string]>(
         `SELECT id, message_id, user_id, write_enabled, task, attachments_json,
                 input_revision, control_epoch, cancel_requested_at, status
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(row.job_id)
       if (!job || job.status !== 'running' || job.cancel_requested_at !== null
         || job.control_epoch !== row.control_epoch) {
@@ -11943,7 +12182,13 @@ export class JobStore {
       ).get(id)
       if (!row) return false
       let deliverable = true
-      if (row.kind === 'accepted') {
+      if (row.idempotency_key.startsWith('audit-setup:')) {
+        deliverable = row.job_id !== null && row.cancel_requested_at === null
+          && (row.job_status === 'queued' || row.job_status === 'running')
+          && !!this.db.query<{yes:number},[string,string]>(
+            'SELECT 1 AS yes FROM audit_setup_waits WHERE job_id=? AND notification_key=?',
+          ).get(row.job_id,row.idempotency_key)
+      } else if (row.kind === 'accepted') {
         deliverable = row.job_id !== null
           && row.job_status === 'queued'
           && row.job_seq !== null
@@ -12338,6 +12583,10 @@ export class JobStore {
          FROM jobs AS j
          WHERE status IN ('completed', 'failed') AND finished_at IS NOT NULL AND finished_at < ?
            AND NOT EXISTS (
+             SELECT 1 FROM cloud_handoff_jobs AS c
+             WHERE c.job_id = j.id AND c.state <> 'active'
+           )
+           AND NOT EXISTS (
              SELECT 1 FROM terminal_notifications AS n
              WHERE n.job_id = j.id AND n.delivered_at IS NULL
            )
@@ -12473,6 +12722,9 @@ export class JobStore {
         this.db.run('DELETE FROM job_native_turns WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_phase_dispatches WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM job_initial_dispatches WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM monitor_failures WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM cloud_handoff_context WHERE job_id = ?', [row.id])
+        this.db.run('DELETE FROM cloud_handoff_jobs WHERE job_id = ?', [row.id])
         this.db.run('DELETE FROM jobs WHERE id = ?', [row.id])
         prunedCandidates.push(row)
       }
@@ -12668,7 +12920,7 @@ export class JobStore {
       }, [string]>(
         `SELECT input_revision, session_id, ui_approval_request_id, chat_id, thread_ts,
                 status, cancel_requested_at
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
       if (!job) {
         throw new Error('job disappeared before its UI/UX proposal could be parked')
@@ -12734,7 +12986,7 @@ export class JobStore {
              accepts_control = 1, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
              ui_approval_request_id = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND input_revision = ? AND session_id = ? AND cancel_requested_at IS NULL`,
         [requestId, jobId, input.inputRevision, sessionId],
       )
@@ -12902,7 +13154,7 @@ export class JobStore {
              active_thread_id = NULL, active_turn_id = NULL,
              ui_approval_request_id = NULL, terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'queued'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'queued'
            AND ui_approval_request_id = ?`,
         [error, finishedAt, request.job_id, id],
       )
@@ -12947,7 +13199,7 @@ export class JobStore {
   runningJobs(): JobRecord[] {
     return this.db.query<JobRow, []>(
       `SELECT * FROM jobs
-       WHERE runtime = 'codex' AND status = 'running'
+       WHERE runtime IN ('codex', 'claude-code') AND status = 'running'
        ORDER BY seq ASC`,
     ).all().map(mapRow)
   }
@@ -12965,7 +13217,7 @@ export class JobStore {
              accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
              executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND EXISTS (
              SELECT 1 FROM job_initial_dispatches receipts
              WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
@@ -13016,7 +13268,7 @@ export class JobStore {
                 executor_pid, active_turn_id, pending_session_id, pending_result,
                 ui_approval_request_id
          FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
       ).get(id)
       if (!job) return 'unsafe' as const
       if (job.cancel_requested_at !== null) return 'cancelled' as const
@@ -13053,7 +13305,7 @@ export class JobStore {
         `UPDATE jobs
          SET repository_drift_intent_attempt = attempts,
              repository_drift_intent_reason = ?
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND cancel_requested_at IS NULL
            AND repository_drift_retries < ?
            AND executor_pid IS NULL AND active_turn_id IS NULL
@@ -13110,7 +13362,7 @@ export class JobStore {
                 cancel_requested_at, executor_pid, active_turn_id,
                 pending_session_id, pending_result, ui_approval_request_id
          FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
       ).get(id)
       if (!job) return 'unsafe' as const
       if (job.cancel_requested_at !== null) return 'cancelled' as const
@@ -13151,7 +13403,7 @@ export class JobStore {
              accepts_control = 1, executor_nonce = NULL,
              active_thread_id = NULL, active_turn_id = NULL,
              terminal_outcome = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND cancel_requested_at IS NULL
            AND repository_drift_retries < ?
            AND repository_drift_intent_attempt = attempts
@@ -13191,7 +13443,7 @@ export class JobStore {
     const release = this.db.transaction(() => {
       const job = this.db.query<{ attempts: number }, [string, string]>(
         `SELECT attempts FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND worker_id = ? AND executor_pid IS NULL`,
       ).get(id, workerId)
       if (!job || job.attempts < 1) return false
@@ -13218,7 +13470,7 @@ export class JobStore {
              attempts = attempts - 1,
              session_id = CASE WHEN attempts = 1 THEN NULL ELSE session_id END,
              resumed = CASE WHEN attempts = 1 THEN 0 ELSE resumed END
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND worker_id = ? AND executor_pid IS NULL AND attempts = ?`,
         [reason, id, workerId, job.attempts],
       )
@@ -13263,7 +13515,7 @@ export class JobStore {
         not_before: number | null
       }, [string]>(
         `SELECT attempts, write_enabled, not_before FROM jobs
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
       ).get(id)
       const initialReceipt = current
         ? this.db.query<{ status: string }, [string, number]>(
@@ -13307,7 +13559,7 @@ export class JobStore {
              finished_at = NULL, last_error = ?,
              accepts_control = CASE WHEN cancel_requested_at IS NULL THEN 1 ELSE 0 END,
              executor_nonce = NULL, active_thread_id = NULL, active_turn_id = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'running'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'
            AND EXISTS (
              SELECT 1 FROM job_initial_dispatches receipts
              WHERE receipts.job_id = jobs.id AND receipts.attempt = jobs.attempts
@@ -13492,7 +13744,7 @@ export class JobStore {
       }
       retrySqlite(() => this.db.run(
         `UPDATE jobs SET worker_id = NULL
-         WHERE id = ? AND runtime = 'codex' AND status = 'failed'`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'failed'`,
         [job.id],
       ))
       failed.push(job.id)
@@ -13505,13 +13757,13 @@ export class JobStore {
     const retire = this.db.transaction(() => {
       const updated = this.db.run(
         `UPDATE jobs SET monitor_state = 0
-         WHERE id = ? AND runtime = 'codex'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code')
            AND status IN ('queued', 'completed', 'failed')`,
         [id],
       )
       const terminal = this.db.query<{ present: number }, [string]>(
         `SELECT 1 AS present FROM jobs
-         WHERE id = ? AND runtime = 'codex'
+         WHERE id = ? AND runtime IN ('codex', 'claude-code')
            AND status IN ('queued', 'completed', 'failed') AND monitor_state = 0`,
       ).get(id)
       if (terminal) this.db.run('DELETE FROM monitor_failures WHERE job_id = ?', [id])
@@ -13860,6 +14112,9 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  for (const [reason, message] of Object.entries(MODEL_SELECTION_MESSAGES)) {
+    if (error.includes(`ZERO_MODEL_SELECTION:${reason}`)) return message
+  }
   if ((Object.values(CLOUD_PREPARATION_FAILURE_MESSAGES) as string[]).includes(error)) return error
   if (error === FORCED_SERVICE_STOP_FAILURE_MESSAGE) {
     return FORCED_SERVICE_STOP_FAILURE_MESSAGE
@@ -14965,6 +15220,14 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         )
         continue
       }
+      if (error instanceof AuditSetupRequiredError) {
+        await updateMonitor(job, 'セキュリティ検査の初期設定の回答を待っています')
+        await quiesceMonitorBeforeTerminal()
+        options.store.parkAuditSetup(job.id, error.prompt, error.inputRevision)
+        closeRequeuedUiApprovalMonitor = true
+        scheduleNotificationFlush()
+        continue
+      }
       if (error instanceof CodexUiApprovalRequiredError) {
         try {
           const current = options.store.get(job.id)
@@ -15401,8 +15664,6 @@ export function splitSlackChunks(text: string): string[] {
 
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
 const ARTIFACT_READ_CHUNK_BYTES = 64 * 1024
-const ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES = 256 * 1024
-const ARTIFACT_CREDENTIAL_SCAN_OVERLAP_BYTES = 16 * 1024
 
 function safeJobId(jobId: string): string {
   return jobId.replace(/[^A-Za-z0-9._-]/g, '_')
@@ -15592,31 +15853,6 @@ export function extractArtifactPaths(result: string): { text: string; files: str
 // Kept only to suppress legacy queued refusal messages; never classify new answers.
 const SELF_IMPLEMENTATION_NON_DISCLOSURE = '内部構成は公開していません。'
 
-/**
- * Path redaction is a safety boundary, but its implementation marker is not
- * useful conversation text. Keep the redaction while presenting it as a
- * semantic placeholder, including for legacy monitor text that used ASCII
- * parentheses and can re-enter a resumed thread.
- */
-export function naturalizeSlackRedactions(value: string): string {
-  const pathMarker = /[（(]\s*内部パスを省略\s*[）)]/g
-  return value
-    .replace(pathMarker, '対象箇所')
-    .replace(/対象箇所(?:\s*[、,・／/]\s*対象箇所)+/g, '対象箇所')
-}
-
-export function encodeSlackGuardNonce(uuid: string): string {
-  const entropy = uuid.replaceAll('-', '').toLowerCase()
-  if (!/^[0-9a-f]{32}$/.test(entropy)) {
-    throw new Error('Slack guard placeholder entropy is invalid')
-  }
-  // Keep all 128 random bits while separating every hex nibble with a
-  // non-hex character.  This prevents the nonce itself from looking like a
-  // runtime ID or accidentally spelling a protected implementation name
-  // (for example the old alphabet could produce "gpt").
-  return [...entropy].map(character => `z${character}`).join('')
-}
-
 export function sanitizeExecutionTextForSlack(
   job: JobRecord,
   sessionId: string,
@@ -15625,16 +15861,6 @@ export function sanitizeExecutionTextForSlack(
   additionalSensitiveValues: readonly string[] = [],
   purpose: 'result' | 'progress' = 'result',
 ): string {
-  const normalizeGuardText = normalizePublicGuardText
-  const slackAuthoredTask = (task: string, attachments: readonly string[]): string => {
-    if (attachments.length === 0) return task
-    // Compatibility for rows created before task/attachment authority was
-    // separated. Strip exactly the suffix generated by the host, once; an
-    // identical block genuinely typed by the user remains before this copy.
-    const legacySuffix = `\n添付ファイル（ローカル絶対パス）:\n${attachments
-      .map(path => `- ${path}`).join('\n')}`
-    return task.endsWith(legacySuffix) ? task.slice(0, -legacySuffix.length) : task
-  }
   const visible: string[] = []
   let insideHostBlock = false
   for (const line of text.split(/\r?\n/)) {
@@ -15654,496 +15880,10 @@ export function sanitizeExecutionTextForSlack(
     visible.push(line)
   }
 
-  let sanitized = normalizeGuardText(visible.join('\n'))
-  let inputEntries = [{
-    task: job.task,
-    attachments: job.attachments,
-    messageId: job.messageId,
-    userId: job.userId,
-  }]
-  try {
-    inputEntries = readAdvisorInputSnapshot(dir, job.id).entries.map(entry => ({
-      task: entry.task,
-      attachments: entry.attachments,
-      messageId: entry.messageId,
-      userId: entry.userId,
-    }))
-  } catch {}
-  const userText = normalizeGuardText(inputEntries
-    .map(entry => slackAuthoredTask(entry.task, entry.attachments))
-    .join('\n'))
-  const sensitiveValues = [
-    artifactDirForJob(dir, job.id),
-    sealedArtifactDirForJob(dir, job.id),
-    ...job.attachments,
-    ...(job.threadAttachments ?? []).map(attachment => attachment.path),
-    ...(job.threadAttachments ?? []).map(attachment => attachment.sourceMessageId),
-    ...(job.threadAttachments ?? []).map(attachment => attachment.fileId),
-    ...inputEntries.flatMap(entry => entry.attachments),
-    ...inputEntries.map(entry => entry.messageId),
-    ...inputEntries.map(entry => entry.userId),
-    job.repoPath,
-    dir,
-    sessionId,
-    job.id,
-    `${job.chatId} / ${job.threadTs}`,
-    job.messageId,
-    job.threadTs,
-    job.chatId,
-    job.userId,
-    job.executorNonce,
-    ...additionalSensitiveValues,
-  ].filter((value): value is string => typeof value === 'string' && value.length >= 4)
-    .map(normalizeGuardText)
-    .sort((left, right) => right.length - left.length)
-  for (const value of new Set(sensitiveValues)) {
-    sanitized = sanitized.split(value).join('（内部情報を省略）')
-  }
-
-  // A commit SHA is useful completion evidence, but a bare hex token is also
-  // indistinguishable from Zero's runtime IDs. Preserve it only when the
-  // answer labels it as a commit and Git confirms that it names a commit in
-  // the repository handled by this job.
-  const gitBinary = '/usr/bin/git'
-  let commitVerificationRoots: string[] = []
-  try {
-    const layout = resolveAdvisorProjectLayout(job.repoPath)
-    commitVerificationRoots = layout.gitRoots.length > 0
-      ? layout.gitRoots
-      : [job.repoPath]
-  } catch {}
-  const verifiedGitCommits = new Map<string, boolean>()
-  const isVerifiedGitCommit = (value: string): boolean => {
-    const normalized = value.toLowerCase()
-    const cached = verifiedGitCommits.get(normalized)
-    if (cached != null) return cached
-    let verified = false
-    if (/^[0-9a-f]{7,64}$/i.test(value)) {
-      let matches = 0
-      for (const root of commitVerificationRoots) try {
-        const result = Bun.spawnSync([
-          gitBinary, '-C', root, 'cat-file', '-e', `${value}^{commit}`,
-        ], {
-          env: {
-            PATH: '/usr/bin:/bin',
-            HOME: '/',
-            GIT_CONFIG_GLOBAL: '/dev/null',
-            GIT_CONFIG_NOSYSTEM: '1',
-            GIT_TERMINAL_PROMPT: '0',
-            GIT_ASKPASS: '/usr/bin/false',
-            GIT_OPTIONAL_LOCKS: '0',
-            LC_ALL: 'C',
-            LANG: 'C',
-          },
-          stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
-        })
-        if (result.exitCode === 0) matches += 1
-      } catch {}
-      // A short SHA that names commits in multiple independent repositories
-      // is ambiguous in a project-wide Slack answer. Full object IDs remain
-      // useful even when identical content happens to exist in two members.
-      verified = matches === 1 || (matches > 0 && value.length >= 40)
-    }
-    verifiedGitCommits.set(normalized, verified)
-    return verified
-  }
-  const protectedGitCommits: string[] = []
-  const gitCommitPlaceholderNonce = encodeSlackGuardNonce(randomUUID())
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_])((?:commit(?:[ \t]*(?:id|sha|hash))?|コミット(?:[ \t]*(?:ID|SHA|ハッシュ))?)[ \t]*[:：#]?[ \t]*`?)([0-9a-f]{7,64})(`?)(?![0-9a-f])/gi,
-    (match, prefix: string, value: string, suffix: string) => {
-      if (!isVerifiedGitCommit(value)) return match
-      const index = protectedGitCommits.push(value) - 1
-      return `${prefix}\uE004${gitCommitPlaceholderNonce}_${index}\uE005${suffix}`
-    },
-  )
-
-  // Protect path and runtime-identity shapes independently of product names.
-  const redactPathUnlessUserAuthored = (value: string): string => (
-    userText.includes(normalizeGuardText(value)) ? value : '（内部パスを省略）'
-  )
-  const pathCredential = /(?:^|[\\/])(?:\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.netrc|\.git-credentials|id_(?:rsa|dsa|ecdsa|ed25519)|credentials)(?:[\\/]|$)/i
-  const conventionalLocalRoot = /(?:^|[\\/])(?:Users|home|private|tmp|var|etc|opt|usr|srv|System|Library|Applications|Volumes)(?:[\\/]|$)/i
-  const homePathPrefix = /^(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i
-  const absolutePlatformPath = /^(?:\\\\|[A-Za-z]:[\\/])/i
-  const driveRelativePlatformPath = /^[A-Za-z]:[^\s`'"<>。、！？!?;,\)\]}]+/i
-  const inspectPathSpelling = (value: string): { decoded: string; stable: boolean } => {
-    const mapConfusableSeparators = (input: string): string => input
-      .replace(/[\u2044\u2215\u2571\u27CB\u29F8]/g, '/')
-      .replace(/[\u2216\u2572\u27CD\u29F5\u29F9]/g, '\\')
-      .replace(/[\u2236\uA789]/g, ':')
-    const decodeOnce = (input: string): string => input.replace(
-      /(?:%[0-9a-f]{2})+/gi,
-      run => {
-        try {
-          return decodeURIComponent(run)
-        } catch {
-          return run.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) => (
-            String.fromCharCode(Number.parseInt(hex, 16))
-          ))
-        }
-      },
-    )
-    let decoded = mapConfusableSeparators(normalizeGuardText(value))
-    for (let round = 0; round < 4; round += 1) {
-      const next = mapConfusableSeparators(decodeOnce(decoded))
-      if (next === decoded) return { decoded, stable: true }
-      decoded = next
-    }
-    return { decoded, stable: decodeOnce(decoded) === decoded }
-  }
-  const containsDecodedInternalIdentity = (value: string): boolean => {
-    const decoded = normalizeGuardText(value)
-    return sensitiveValues.some(sensitive => decoded.includes(sensitive))
-      || /\bw[A-Za-z0-9_-]+:[pt][A-Za-z0-9_-]+\b|\bterm_[A-Za-z0-9_-]+\b/.test(decoded)
-      || /(?<![A-Za-z0-9_])"?(?:pid|process[ _-]?id|state[ _-]?change[ _-]?seq|duration[ _-]?ms)"?(?:\s*[:=]\s*|\s+(?:is\s+)?)"?\d+"?(?![A-Za-z0-9_])/i.test(decoded)
-      || /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/i.test(decoded)
-      || /\b[0-9a-f]{32,64}\b/i.test(decoded)
-      || /\b[UCBWD][A-Z0-9]{8,}\b/.test(decoded)
-  }
-  const normalizedUrlPath = (value: string): string => {
-    const inspection = inspectPathSpelling(value)
-    return inspection.stable ? inspection.decoded.replace(/^\/+/, '/') : ''
-  }
-  const hostPathSegments = [
-    'Users', 'home', 'private', 'tmp', 'var', 'etc', 'opt', 'usr', 'srv',
-    'System', 'Library', 'Applications', 'Volumes', 'bin', 'sbin', 'lib',
-    'libexec', 'local', 'share', 'homebrew', 'Application Support', 'Caches',
-    'Preferences', 'Logs', 'LaunchAgents', 'LaunchDaemons', 'Desktop',
-    'Documents', 'Downloads', 'Projects',
-  ] as const
-  const hostPathSegmentSkeletons = new Map(hostPathSegments.map(segment => [
-    normalizeImplementationGuardText(segment),
-    segment,
-  ]))
-  const canonicalHostPath = (value: string): string => normalizedUrlPath(value)
-    .split('/')
-    .map(segment => hostPathSegmentSkeletons.get(
-      normalizeImplementationGuardText(segment),
-    ) ?? segment)
-    .join('/')
-  const sensitiveHostHomePrefixes = new Set(sensitiveValues.flatMap(value => {
-    const match = canonicalHostPath(value).match(/^\/(?:Users|home)\/[^/]+/)
-    return match ? [match[0]] : []
-  }))
-  const sensitiveHostHomePrefixSkeletons = new Set(
-    [...sensitiveHostHomePrefixes].map(normalizeImplementationGuardText),
-  )
-  const startsWithConventionalHostRoot = (value: string): boolean => (
-    /^\/(?:Users|home|private|tmp|var|etc|opt|usr|srv|System|Library|Applications|Volumes)(?:\/|$)/.test(
-      canonicalHostPath(value),
-    )
-  )
-  const resemblesConventionalHostPath = (value: string): boolean => {
-    if (value.length === 0) return false
-    const inspection = inspectPathSpelling(value)
-    if (!inspection.stable) return true
-    const path = canonicalHostPath(value)
-    const candidateHomePrefix = path.match(/^\/(?:Users|home)\/[^/]+/)?.[0]
-    const fileLikeLeaf = /\.[A-Za-z0-9][A-Za-z0-9._-]{0,15}$/.test(path)
-    return [...sensitiveHostHomePrefixes].some(prefix => (
-      path === prefix || path.startsWith(`${prefix}/`)
-    ))
-      || (candidateHomePrefix != null
-        && sensitiveHostHomePrefixSkeletons.has(
-          normalizeImplementationGuardText(candidateHomePrefix),
-        ))
-      || /^\/private\/(?:tmp|var)(?:\/|$)/.test(path)
-      || /^\/System\/(?:Volumes|Library)(?:\/|$)/.test(path)
-      || /^\/etc(?:\/|$)/.test(path)
-      || /^\/usr\/(?:bin|sbin|lib|libexec|local|share)(?:\/|$)/.test(path)
-      || /^\/opt\/homebrew(?:\/|$)/.test(path)
-      || /^\/Applications\/[^/]+\.app(?:\/|$)/.test(path)
-      || /^\/Library\/(?:Application Support|Caches|Preferences|Logs|LaunchAgents|LaunchDaemons)(?:\/|$)/.test(path)
-      || /^\/Volumes\/[^/]+(?:\/|$)/.test(path)
-      || /^\/(?:Users|home)\/[^/]+\/(?:Desktop|Documents|Downloads|Library|Applications|Projects|\.config|\.ssh|\.aws|\.gnupg|\.kube|\.docker)(?:\/|$)/.test(path)
-      || (/^\/(?:Users|home|tmp|var|srv)(?:\/|$)/.test(path) && fileLikeLeaf)
-  }
-  const redactPath = (value: string, always = false): string => {
-    const normalized = normalizeGuardText(value)
-    return always || pathCredential.test(normalized)
-      ? '（内部パスを省略）'
-      : redactPathUnlessUserAuthored(value)
-  }
-  // Home-relative credential/config paths are unsafe even when the sender
-  // pasted them. Match through the enclosing clause so a path with spaces or
-  // Unicode cannot leave a revealing suffix behind.
-  sanitized = sanitized.replace(
-    /\$\{(?:[A-Za-z0-9_]|%[0-9a-f]{2}){1,64}(?:\}|(?:%[0-9a-f]{2})+)[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || homePathPrefix.test(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  sanitized = sanitized.replace(
-    /(?:~|\$HOME|\$\{HOME\})(?:[\\/\u2044\u2215\u2216\u2571\u2572\u27CB\u27CD\u29F5\u29F8\u29F9]|%[0-9a-f]{2})+[^\r\n`'"<>。、！？!?;,\)\]}]*/gim,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?:~[\\/])?\.(?:codex|claude|zerokun|ssh|aws|gnupg|kube|docker)(?:[\\/][^\r\n`'"<>。、！？!?;,\)\]}]*)?/gim,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  // Inspect every URL-like scheme as one unit. Decode separators only in the
-  // detector, never in the visible text. Internal/local schemes and URLs that
-  // embed a local root or credential path are removed as a whole, closing
-  // host, triple-slash and percent-encoded variants without leaking suffixes.
-  const protectedMimeTypes: string[] = []
-  const mimePlaceholderNonce = randomUUID().replaceAll('-', '')
-  sanitized = sanitized.replace(
-    /\b(?:application|audio|font|image|message|model|multipart|text|video)\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,127}(?![A-Za-z0-9!#$&^_.+\\/%-])/gi,
-    value => {
-      const index = protectedMimeTypes.push(value) - 1
-      return `\uE006${mimePlaceholderNonce}_${index}\uE007`
-    },
-  )
-  const protectedPublicUrls: string[] = []
-  const urlPlaceholderNonce = randomUUID().replaceAll('-', '')
-  const isLocalHostname = (input: string): boolean => {
-    const hostname = input.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase()
-    return hostname === 'localhost' || hostname.endsWith('.localhost')
-      || hostname === '0.0.0.0' || hostname === '::1' || /^127(?:\.|$)/.test(hostname)
-      || hostname.endsWith('.local') || hostname.endsWith('.invalid')
-      || hostname.endsWith('.test') || hostname.endsWith('.internal')
-      || hostname.endsWith('.lan') || hostname.endsWith('.home')
-      || hostname.endsWith('.home.arpa')
-      || (!hostname.includes('.') && !hostname.includes(':'))
-      || /^10\./.test(hostname) || /^192\.168\./.test(hostname)
-      || /^172\.(?:1[6-9]|2\d|3[01])\./.test(hostname)
-      || /^169\.254\./.test(hostname)
-      || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname)
-      || /^198\.(?:18|19)\./.test(hostname)
-      || /^(?:fc|fd|fe[89ab])[0-9a-f]*:/i.test(hostname)
-      || hostname === '::' || hostname.startsWith('::ffff:')
-  }
-  const isLocalEndpointSpelling = (input: string): boolean => {
-    const inspection = inspectPathSpelling(input)
-    if (!inspection.stable) return true
-    const decoded = inspection.decoded
-    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(decoded)
-    const hasEndpoint = /^(?:\[[0-9a-f:.%]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::\d{1,5})?(?:[/?#])[^\s]*$/i.test(decoded)
-    if (!hasScheme && !hasEndpoint) return false
-    try {
-      const parsed = new URL(hasScheme ? decoded : `http://${decoded}`)
-      return isLocalHostname(parsed.hostname)
-    } catch {
-      return false
-    }
-  }
-  const protectPublicUrl = (value: string, _encoded = false): string => {
-    const inspection = inspectPathSpelling(value)
-    let parsed: URL
-    try {
-      parsed = new URL(inspection.decoded.startsWith('//')
-        ? `https:${inspection.decoded}`
-        : inspection.decoded)
-    } catch {
-      return redactPath(value, true)
-    }
-    const protocol = parsed.protocol.toLowerCase()
-    const publicProtocol = protocol === 'https:' || protocol === 'http:'
-    const localHost = isLocalHostname(parsed.hostname)
-    const payloadInspection = inspectPathSpelling(
-      `${parsed.pathname}${parsed.search}${parsed.hash}`,
-    )
-    const queryInspection = inspectPathSpelling(`${parsed.search}${parsed.hash}`)
-    const userAuthoredPublicUrl = userText.includes(normalizeGuardText(value))
-    const unsafeHostPathParameter = (parameter: string): boolean => {
-      const parameterInspection = inspectPathSpelling(parameter)
-      return !parameterInspection.stable
-        || startsWithConventionalHostRoot(parameterInspection.decoded)
-        || /^(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i.test(parameterInspection.decoded)
-        || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(parameterInspection.decoded)
-        || pathCredential.test(parameterInspection.decoded)
-    }
-    const rawHash = parsed.hash.replace(/^#/, '')
-    const hashUsesParameters = rawHash.includes('=') || rawHash.includes('&')
-    const searchParts = [...parsed.searchParams.entries()].flat()
-    const hashParts = hashUsesParameters
-      ? [...new URLSearchParams(rawHash).entries()].flat()
-      : []
-    const modelOnlyHostPathParameter = !userAuthoredPublicUrl
-      && (searchParts.some(unsafeHostPathParameter)
-        || hashParts.some(unsafeHostPathParameter)
-        || (!hashUsesParameters && resemblesConventionalHostPath(rawHash)))
-    const modelOnlyHostPathname = !userAuthoredPublicUrl
-      && resemblesConventionalHostPath(parsed.pathname)
-    const localPathInPayload = pathCredential.test(payloadInspection.decoded)
-      || /(?:^|[?&#=])(?:~|\$HOME|\$\{HOME\})(?:[\\/]|$)/i.test(payloadInspection.decoded)
-      || /(?:^|[?&#=])(?:[A-Za-z]:[\\/]|\\\\)/.test(payloadInspection.decoded)
-      || modelOnlyHostPathParameter || modelOnlyHostPathname
-    const modelOnlyEncodedInternalIdentity = !userAuthoredPublicUrl
-      && /%[0-9a-f]{2}/i.test(value)
-      && containsDecodedInternalIdentity(inspection.decoded)
-    const unsafe = !inspection.stable || !publicProtocol || localHost
-      || parsed.username.length > 0 || parsed.password.length > 0
-      || pathCredential.test(inspection.decoded)
-      || containsCredentialMaterial(inspection.decoded)
-      || !payloadInspection.stable || !queryInspection.stable || localPathInPayload
-      || modelOnlyEncodedInternalIdentity
-    if (unsafe) return redactPath(value, true)
-    const index = protectedPublicUrls.push(value) - 1
-    return `\uE000${urlPlaceholderNonce}_${index}\uE001`
-  }
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:\/\/\[[0-9a-f:.%]+\](?::\d{1,5})?(?:[\/?#][^\s`'"<>。、！？!;,\)\]}]*)?/gim,
-    value => protectPublicUrl(value),
-  )
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:\/\/[^\s`'"<>。、！？!;,\)\]}]*/gim,
-    value => protectPublicUrl(value),
-  )
-  sanitized = sanitized.replace(
-    /[a-z][a-z0-9+.-]*:%[^\s`'"<>。、！？!;,\)\]}]*/gim,
-    value => protectPublicUrl(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(^|[\s(\[])(\/\/(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{1,5})?(?:\/[^\s`'"<>。、！？!;,\)\]}]*)?)/gim,
-    (_value, prefix: string, url: string) => `${prefix}${protectPublicUrl(url)}`,
-  )
-  // Public URLs are placeholders at this point, so inspect every remaining
-  // percent-mixed token as a single unit. This closes obfuscated product names
-  // and runtime IDs without decoding or rewriting harmless public prose.
-  sanitized = sanitized.replace(
-    /[^\s`'"<>。、！？!?;,\(\)\[\]\{\}]*%[0-9a-f]{2}[^\s`'"<>。、！？!?;,\(\)\[\]\{\}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      if (!inspection.stable) return '（内部情報を省略）'
-      if (userText.includes(normalizeGuardText(value))) return value
-      return containsDecodedInternalIdentity(inspection.decoded)
-        ? '（内部情報を省略）'
-        : value
-    },
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_.-])(?:\[[0-9a-f:.%]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?:(?:[:\u2236\uA789]\d{1,5})(?:[\/\u2044\u2215\u2571\u27CB\u29F8][^\s`'"<>。、！？!?;,\)\]}]*)?|[\/\u2044\u2215\u2571\u27CB\u29F8][^\s`'"<>。、！？!?;,\)\]}]+)(?![A-Za-z0-9_.-])/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      let parsed: URL
-      try {
-        parsed = new URL(`http://${inspection.decoded}`)
-      } catch {
-        return value
-      }
-      const userAuthoredPublicUrl = userText.includes(normalizeGuardText(value))
-      return !inspection.stable || isLocalHostname(parsed.hostname)
-        || (!userAuthoredPublicUrl && resemblesConventionalHostPath(parsed.pathname))
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Mixed literal/percent-encoded HOME spellings must be decoded as one unit;
-  // starting at the first percent sequence would otherwise omit the `$H` prefix.
-  sanitized = sanitized.replace(
-    /\$(?:[A-Za-z]*%[0-9a-f]{2}|%[0-9a-f]{2})[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || homePathPrefix.test(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Inspect a percent-mixed URL/endpoint as one token, including the literal
-  // host prefix. Starting at the first percent byte would miss private hosts
-  // such as `10.0.%30.5` and leave a misleading prefix visible.
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_.-])[A-Za-z0-9[\].:%-]*%[0-9a-f]{2}[A-Za-z0-9[\].:%/?#-]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || isLocalEndpointSpelling(inspection.decoded)
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Encoded absolute/home paths without a scheme must be classified as one
-  // token. Inspect a bounded number of decoding layers and redact the original
-  // spelling so no decoded suffix is exposed.
-  sanitized = sanitized.replace(
-    /(?:[A-Za-z]|\\{1,2})?%[0-9a-f]{2}[^\s`'"<>。、！？!?;,\)\]}]*/gim,
-    value => {
-      const inspection = inspectPathSpelling(value)
-      return !inspection.stable || conventionalLocalRoot.test(inspection.decoded)
-        || pathCredential.test(inspection.decoded)
-        || homePathPrefix.test(inspection.decoded)
-        || absolutePlatformPath.test(inspection.decoded)
-        || driveRelativePlatformPath.test(inspection.decoded)
-        || isLocalEndpointSpelling(inspection.decoded)
-        || inspection.decoded.startsWith('/')
-        ? redactPath(value, true)
-        : value
-    },
-  )
-  // Absolute and network-style paths use a deliberately fail-closed tail.
-  // Spaces and non-ASCII components are indistinguishable from prose without
-  // filesystem access, so redact to the next sentence delimiter instead of
-  // exposing a partially matched suffix.
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])\/{1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])(?:\\\\\?\\UNC\\|\\\\\?\\)[^\r\n`'"<>。、！？!;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])(?:[A-Za-z][\u2236\uA789:](?=[^\r\n`'"<>。、！？!?;,\)\]}]+)|\\\\|[\u2216\u2572\u27CD\u29F5\u29F9]{2})[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9])[\u2044\u2215\u2571\u27CB\u29F8]{1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, true),
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9\\])(?:\\\/){1,}[^\r\n`'"<>。、！？!?;,\)\]}]+/gm,
-    value => redactPath(value, pathCredential.test(value)),
-  )
-  sanitized = sanitized.replace(
-    /\bw[A-Za-z0-9_-]+:[pt][A-Za-z0-9_-]+\b|\bterm_[A-Za-z0-9_-]+\b/g,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /(?<![A-Za-z0-9_])"?(?:pid|process[ _-]?id|state[ _-]?change[ _-]?seq|duration[ _-]?ms)"?(?:\s*[:=]\s*|\s+(?:is\s+)?)"?\d+"?(?![A-Za-z0-9_])/gi,
-    value => userText.includes(value) ? value : '（内部情報を省略）',
-  )
-  protectedPublicUrls.forEach((url, index) => {
-    sanitized = sanitized.replaceAll(`\uE000${urlPlaceholderNonce}_${index}\uE001`, url)
-  })
-  protectedMimeTypes.forEach((mimeType, index) => {
-    sanitized = sanitized.replaceAll(`\uE006${mimePlaceholderNonce}_${index}\uE007`, mimeType)
-  })
-
-  // Credentials are never safe to echo into a shared Slack thread, even when
-  // the sender pasted the same value in the request. User input must not
-  // turn into a credential allowlist.
-  sanitized = redactCredentialMaterial(sanitized, '（認証情報を省略）')
-
-  const zeroMarker = /\[ZERO_/i.exec(sanitized)
-  if (zeroMarker) sanitized = sanitized.slice(0, zeroMarker.index).trimEnd()
-  sanitized = sanitized.replace(
-    /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /\b[0-9a-f]{32,64}\b/gi,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  sanitized = sanitized.replace(
-    /\b[UCBWD][A-Z0-9]{8,}\b/g,
-    value => userText.includes(value) ? value : '（内部IDを省略）',
-  )
-  protectedGitCommits.forEach((commit, index) => {
-    sanitized = sanitized.replaceAll(
-      `\uE004${gitCommitPlaceholderNonce}_${index}\uE005`, commit,
-    )
-  })
-  if (purpose === 'progress') {
-    sanitized = sanitized.split(/\r?\n/)
-      .filter(line => line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE)
-      .join('\n')
-  }
-  sanitized = naturalizeSlackRedactions(sanitized).trim()
-  return sanitized
+  // Host protocol records are transport metadata; ordinary answer text, URLs,
+  // identifiers and credential-shaped examples pass through unchanged.
+  return visible.filter(line => purpose !== 'progress'
+    || line.trim().replace(/^💬\s*/, '') !== SELF_IMPLEMENTATION_NON_DISCLOSURE).join('\n').trim()
 }
 
 /**
@@ -16734,43 +16474,9 @@ function readBoundedArtifact(descriptor: number, file: string): Buffer {
   return Buffer.concat(chunks, total)
 }
 
-/**
- * Lightweight internal-use guard: inspect the exact bytes that would be sent
- * for obvious credential spellings, while deliberately preserving arbitrary
- * binary formats. It does not unpack archives, decrypt content, or perform OCR.
- */
-function artifactContainsObviousCredential(data: Buffer): boolean {
-  for (let offset = 0; offset < data.byteLength; offset += ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES) {
-    const start = Math.max(0, offset - ARTIFACT_CREDENTIAL_SCAN_OVERLAP_BYTES)
-    const end = Math.min(data.byteLength, offset + ARTIFACT_CREDENTIAL_SCAN_CHUNK_BYTES)
-    const window = data.subarray(start, end)
-    if (containsCredentialMaterial(window.toString('latin1'))
-      || containsCredentialMaterial(window.toString('utf8'))) return true
-  }
-  return false
-}
-
 function slackVisibleArtifactFilename(job: JobRecord, filename: string, dir: string): string {
-  const normalized = normalizePublicGuardText(filename)
-  const internalValues = [
-    job.id,
-    job.sessionId,
-    job.executorNonce,
-    job.chatId,
-    job.threadTs,
-    job.messageId,
-    job.userId,
-  ].filter((value): value is string => typeof value === 'string' && value.length >= 4)
-  const sanitized = sanitizeExecutionTextForSlack(
-    job,
-    job.sessionId ?? '',
-    normalized,
-    dir,
-  )
-  const unsafe = sanitized !== normalized
-    || internalValues.some(value => normalized.includes(value.normalize('NFKC')))
-    || /[\0\r\n/\\]/.test(normalized)
-    || Buffer.byteLength(normalized) > 180
+  const normalized = filename
+  const unsafe = /[\0\r\n/\\]/.test(normalized) || Buffer.byteLength(normalized) > 180
   if (!unsafe) return filename
   const extension = extname(normalized)
   const safeExtension = /^\.[A-Za-z0-9]{1,10}$/.test(extension)
@@ -16806,9 +16512,6 @@ export function readUploadableArtifact(
     const separator = encodedName.lastIndexOf('--')
     const filename = separator >= 0 ? encodedName.slice(separator + 2) : encodedName
     const data = readBoundedArtifact(descriptor, file)
-    if (artifactContainsObviousCredential(data)) {
-      throw new ArtifactPublicationBlockedError()
-    }
     return {
       path: candidate,
       filename: slackVisibleArtifactFilename(job, filename, dir),
@@ -18324,6 +18027,7 @@ export async function recoverForcedServiceStop(input: {
   }
   try {
     await terminateTrackedExecutors(store, log, 15_000, dir)
+    await reconcileClaudeHerdrTransports({ stateDir: dir, runtime: input.runtime })
     const interjections = store.reconcileInterjectionsBeforeRecovery()
     if (interjections.preparedReset > 0 || interjections.promoted > 0
       || interjections.blocked > 0) {
@@ -18497,6 +18201,7 @@ async function runCli(): Promise<void> {
       const runtime = readPinnedHerdrRuntime(dir)
       await verifyHerdrRuntimeIdentityAsync(runtime)
       await terminateTrackedExecutors(store, log, 15_000, dir)
+      await reconcileClaudeHerdrTransports({ stateDir: dir, runtime })
       const interjections = store.reconcileInterjectionsBeforeRecovery()
       if (interjections.preparedReset > 0 || interjections.promoted > 0
         || interjections.blocked > 0) {
@@ -18525,10 +18230,15 @@ async function runCli(): Promise<void> {
           log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
           return 'staged-result'
         }
+        if (status === 'queued' && store.auditSetupIsParked(jobId)) {
+          store.retireMonitorObligation(jobId)
+          log(`retired ${jobId} monitor after entering audit setup wait`)
+          return 'unarmed'
+        }
         if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
           store.retireMonitorObligation(jobId)
           log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-          return 'terminalized'
+          return 'unarmed'
         }
         if ((status === 'queued' || status === 'running')
           && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
@@ -18548,6 +18258,7 @@ async function runCli(): Promise<void> {
             runtime,
             getJob: jobId => store.get(jobId),
             listMonitorObligations: () => store.monitorObligations(),
+            isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
             recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
             onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
             publicFailureReason: jobId => publicJobFailureSummary(
@@ -18582,6 +18293,7 @@ async function runCli(): Promise<void> {
         runtime,
         getJob: jobId => store.get(jobId),
         listMonitorObligations: () => store.monitorObligations(),
+        isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
         recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
         onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         publicFailureReason: jobId => publicJobFailureSummary(
@@ -18684,6 +18396,7 @@ async function runCli(): Promise<void> {
   let startupRetainedMonitorJobIds: string[] = []
   if (!updateTransactionPending(updateJournal)) {
     await terminateTrackedExecutors(store, log, 15_000, dir)
+    await reconcileClaudeHerdrTransports({ stateDir: dir, runtime: pinnedHerdrRuntime })
     const interjections = store.reconcileInterjectionsBeforeRecovery()
     if (interjections.preparedReset > 0 || interjections.promoted > 0
       || interjections.blocked > 0) {
@@ -18712,10 +18425,15 @@ async function runCli(): Promise<void> {
         log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
         return 'staged-result'
       }
+      if (status === 'queued' && store.auditSetupIsParked(jobId)) {
+        store.retireMonitorObligation(jobId)
+        log(`retired ${jobId} monitor after entering audit setup wait`)
+        return 'unarmed'
+      }
       if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
         store.retireMonitorObligation(jobId)
         log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-        return 'terminalized'
+        return 'unarmed'
       }
       if ((status === 'queued' || status === 'running')
         && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
@@ -18735,6 +18453,7 @@ async function runCli(): Promise<void> {
           runtime: pinnedHerdrRuntime,
           getJob: jobId => store.get(jobId),
           listMonitorObligations: () => store.monitorObligations(),
+          isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
           recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
           publicFailureReason: jobId => publicJobFailureSummary(
@@ -18778,6 +18497,7 @@ async function runCli(): Promise<void> {
       runtime: pinnedHerdrRuntime,
       getJob: jobId => store.get(jobId),
       listMonitorObligations: () => store.monitorObligations(),
+      isAuditSetupParked: jobId => store.auditSetupIsParked(jobId),
       recoverMissingBindingAfterExecutorsStopped: recoverMissingMonitor,
       onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
       publicFailureReason: jobId => publicJobFailureSummary(
@@ -18825,8 +18545,8 @@ async function runCli(): Promise<void> {
   let serviceControlPauseWarning = ''
   let fleetPaused = true
   const shouldPause = (): boolean => {
-    if (slackIdentityChanged() || herdrIdentityInvalid) { fleetPaused = true; return true }
-    const paused = updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
+    const paused = slackIdentityChanged() || herdrIdentityInvalid
+      || updateTransactionPending(updateJournal) || updateIsRunning(join(dir, 'update.lock'))
     fleetPaused = paused
     if (paused) {
       try {
@@ -18992,7 +18712,7 @@ async function runCli(): Promise<void> {
             ? 'cancelled'
             : job.status === 'failed'
               ? 'failed'
-              : job.uiApprovalRequestId !== null
+              : job.uiApprovalRequestId !== null || store.auditSetupWaiting(job.id)
                 || (job.taskGoalStatus && job.taskGoalStatus !== 'complete') ? 'waiting' : 'completed',
           onMonitorRetired: jobId => store.retireMonitorObligation(jobId),
         })
@@ -19034,20 +18754,34 @@ async function runCli(): Promise<void> {
         try {
           const executorPidLifecycle = createExecutorPidLifecycle(store, job.id)
           if (job.workflow === 'security-audit') {
+            const answers = store.takeAuditSetupAnswers(job)
+            const milestone = async (phase: 'initializing' | 'checking' | 'ready', text: string) => {
+              mirrorMonitorMessage(text)
+              await deliverAuditMilestone(job, phase, text, executionContext,
+                key => store.commentarySourceDelivered(job.id, key), {
+                  signal: executionController.signal,
+                  cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
+                })
+            }
+            await milestone('initializing', 'セキュリティ12工程が利用可能かどうかを調べています。共通設定とプロジェクト構成を確認し、初回に不足する検査対象だけをこのスレッドで確認します。')
+            // Only durable authorized replies are settings answers, never the original request.
+            const settings = await initializeAudit(job, dir, answers, {...executorPidLifecycle, signal: executionController.signal, cancelled: () => store.get(job.id)?.cancelRequestedAt != null})
+            store.finishAuditSetup(job.id, job.inputRevision)
             const progress = createSecurityAuditProgress(job, executionContext, mirrorMonitorMessage, log)
             let raw: JobExecutionResult
             try { raw = await executeSecurityAudit(job, {
-              stateDir: dir, signal: executionController.signal,
+              stateDir: dir, settings, signal: executionController.signal,
               ...executorPidLifecycle,
               cancelled: () => store.get(job.id)?.cancelRequestedAt != null,
               progress: progress.report,
+              milestone,
             }) } finally { progress.close() }
             const auditResult = finalizeSuccessfulExecution(job, raw, dir, log)
             store.ensureExecutionResultStaged(job.id, auditResult.sessionId, auditResult.result)
             return auditResult
           }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
-          const previousAudit = store.previousSecurityAudit(executionJob)
+          const previousAudit = store.previousSecurityAudit(executionJob, id => !auditHasReadinessOnlyResult(dir, id))
           if (previousAudit) {
             try {
               executionJob.auditReportPath = copyAuditReportForFollowup(executionJob, dir, previousAudit)
@@ -19056,11 +18790,13 @@ async function runCli(): Promise<void> {
             }
           }
           executionJob.previousSlackDelivery = store.previousSlackDelivery(job.id)
-          const execution = await executeCodexJob(executionJob, {
+          const primaryExecutor = executionJob.runtime === 'claude-code' ? executeClaudeJob : executeCodexJob
+          const execution = await primaryExecutor(executionJob, {
             signal: executionController.signal,
             stateDir: dir,
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
+            selectModel: (requests, models, signal) => store.taskModels().resolve(job.id, requests, models, signal),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
@@ -19074,283 +18810,7 @@ async function runCli(): Promise<void> {
               },
               publish: event => executionContext.reportCommentary(event),
             }),
-            liveControls: {
-              recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
-              next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
-              nextInterjection: () => store.nextPendingInterjection(job.id, job.controlEpoch),
-              bindTurn: (executorNonce, threadId, turnId) => store.bindAppServerTurn(
-                job.id,
-                job.workerId!,
-                job.controlEpoch,
-                executorNonce,
-                threadId,
-                turnId,
-              ),
-              bindNativeTurn: (nonce, threadId, parentTurnId, turnId) => (
-                store.bindNativeAppServerTurn(
-                  job.id, job.workerId!, job.controlEpoch, nonce, threadId, parentTurnId, turnId,
-                )
-              ),
-              beginInitialDispatch: ({
-                executorNonce, threadId, requestId, inputRevision, inputDigest,
-              }) => (
-                store.beginInitialTurnDispatch({
-                  jobId: job.id,
-                  attempt: job.attempts,
-                  epoch: job.controlEpoch,
-                  executorNonce,
-                  threadId,
-                  requestId,
-                  inputRevision,
-                  inputDigest,
-                })
-              ),
-              acknowledgeInitialDispatch: ({
-                executorNonce, threadId, turnId, requestId,
-              }) => store.acknowledgeInitialTurnDispatch({
-                jobId: job.id,
-                workerId: job.workerId!,
-                attempt: job.attempts,
-                epoch: job.controlEpoch,
-                executorNonce,
-                threadId,
-                turnId,
-                requestId,
-              }),
-              initialDispatchAmbiguous: (requestId, error) => (
-                store.markInitialTurnDispatchAmbiguous({
-                  jobId: job.id,
-                  attempt: job.attempts,
-                  requestId,
-                  error,
-                })
-              ),
-              initialDispatchRejected: (requestId, error) => (
-                store.markInitialTurnDispatchRejected({
-                  jobId: job.id,
-                  attempt: job.attempts,
-                  requestId,
-                  error,
-                })
-              ),
-              preparePhaseDispatch: ({
-                phaseSequence, stage, logicalNonce, threadId, inputRevision, inputDigest,
-              }) => store.prepareAppServerPhaseDispatch({
-                jobId: job.id,
-                attempt: job.attempts,
-                epoch: job.controlEpoch,
-                phaseSequence,
-                stage,
-                logicalNonce,
-                threadId,
-                inputRevision,
-                inputDigest,
-              }),
-              beginPhaseDispatch: ({
-                phaseSequence, logicalNonce, threadId, requestId,
-                inputRevision, inputDigest,
-              }) => store.beginAppServerPhaseDispatch({
-                jobId: job.id,
-                attempt: job.attempts,
-                epoch: job.controlEpoch,
-                phaseSequence,
-                logicalNonce,
-                threadId,
-                requestId,
-                inputRevision,
-                inputDigest,
-              }),
-              acknowledgePhaseDispatch: ({
-                phaseSequence, logicalNonce, threadId, turnId, requestId,
-              }) => store.acknowledgeAppServerPhaseDispatch({
-                jobId: job.id,
-                workerId: job.workerId!,
-                attempt: job.attempts,
-                epoch: job.controlEpoch,
-                phaseSequence,
-                logicalNonce,
-                threadId,
-                turnId,
-                requestId,
-              }),
-              phaseDispatchAmbiguous: (phaseSequence, requestId, error) => (
-                store.markAppServerPhaseDispatchAmbiguous({
-                  jobId: job.id,
-                  attempt: job.attempts,
-                  phaseSequence,
-                  requestId,
-                  error,
-                })
-              ),
-              phaseDispatchRejected: (phaseSequence, requestId, error) => (
-                store.markAppServerPhaseDispatchRejected({
-                  jobId: job.id,
-                  attempt: job.attempts,
-                  phaseSequence,
-                  requestId,
-                  error,
-                })
-              ),
-              sealPhaseResult: ({
-                logicalNonce, threadId, inputRevision, inputDigest, execution,
-              }) => (
-                store.sealAppServerPhaseResult({
-                  jobId: job.id,
-                  epoch: job.controlEpoch,
-                  logicalNonce,
-                  threadId,
-                  inputRevision,
-                  inputDigest,
-                  execution,
-                })
-              ),
-              beginDispatch: ({
-                control, executorNonce, threadId, turnId, requestId,
-              }) => {
-                if (control.kind === 'interjection') {
-                  if (!turnId) throw new Error('interjection pause omitted its active turn')
-                  store.beginInterjectionPause({
-                    interjectionId: control.id,
-                    jobId: job.id,
-                    epoch: job.controlEpoch,
-                    executorNonce,
-                    threadId,
-                    turnId,
-                    requestId,
-                  })
-                  return
-                }
-                store.beginControlDispatch({
-                  controlId: control.id,
-                  jobId: job.id,
-                  epoch: job.controlEpoch,
-                  executorNonce,
-                  threadId,
-                  turnId,
-                  requestId,
-                })
-              },
-              acknowledge: (control, requestId, turnId) => {
-                if (control.kind === 'interjection') {
-                  store.acknowledgeInterjectionPause(control.id, requestId, turnId)
-                  return
-                }
-                store.acknowledgeControl(control.id, requestId, turnId)
-              },
-              ambiguous: (control, error) => {
-                if (control.kind === 'interjection') {
-                  store.markInterjectionAmbiguous(control.id, error)
-                  return
-                }
-                store.markControlAmbiguous(control.id, error)
-              },
-              deferToNextTurn: (
-                control, requestId, executorNonce, threadId, turnId, error,
-              ) => {
-                if (control.kind === 'interjection') {
-                  store.deferInterjectionPause({
-                    interjectionId: control.id,
-                    requestId,
-                    executorNonce,
-                    threadId,
-                    turnId,
-                    error,
-                  })
-                  return
-                }
-                store.deferControlToNextTurn({
-                  controlId: control.id,
-                  requestId,
-                  executorNonce,
-                  threadId,
-                  turnId,
-                  error,
-                })
-              },
-              finishTurn: ({
-                executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
-                rateLimitReason, rateLimitSafeToReplay,
-              }) => store.finishAppServerTurn({
-                jobId: job.id,
-                epoch: job.controlEpoch,
-                executorNonce,
-                threadId,
-                turnId,
-                retainInput,
-                rateLimitResumeAt,
-                rateLimitReason,
-                rateLimitSafeToReplay,
-              }),
-              recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
-                store.recordAppServerRateLimit({
-                  jobId: job.id,
-                  epoch: job.controlEpoch,
-                  executorNonce,
-                  threadId,
-                  turnId,
-                  resumeAt,
-                })
-              ),
-              prepareInterjectionAnswer: ({ interjection, logicalNonce, threadId }) => (
-                store.prepareInterjectionAnswer({
-                  interjectionId: interjection.id,
-                  jobId: job.id,
-                  epoch: job.controlEpoch,
-                  logicalNonce,
-                  threadId,
-                })
-              ),
-              beginInterjectionAnswer: ({
-                interjection, logicalNonce, threadId, requestId,
-              }) => store.beginInterjectionAnswer({
-                interjectionId: interjection.id,
-                jobId: job.id,
-                epoch: job.controlEpoch,
-                logicalNonce,
-                threadId,
-                requestId,
-              }),
-              acknowledgeInterjectionAnswer: ({
-                interjection, logicalNonce, threadId, turnId, requestId,
-              }) => store.acknowledgeInterjectionAnswer({
-                interjectionId: interjection.id,
-                jobId: job.id,
-                workerId: job.workerId!,
-                epoch: job.controlEpoch,
-                logicalNonce,
-                threadId,
-                turnId,
-                requestId,
-              }),
-              rejectInterjectionAnswer: ({
-                interjection, logicalNonce, threadId, requestId, error,
-              }) => store.rejectInterjectionAnswer({
-                interjectionId: interjection.id,
-                logicalNonce,
-                threadId,
-                requestId,
-                error,
-              }),
-              stageInterjectionAnswer: ({
-                interjection, logicalNonce, threadId, turnId, disposition, answer,
-              }) => store.stageInterjectionAnswer({
-                interjectionId: interjection.id,
-                jobId: job.id,
-                epoch: job.controlEpoch,
-                logicalNonce,
-                threadId,
-                turnId,
-                disposition,
-                answer,
-              }),
-              interjectionDelivered: interjection => (
-                store.interjectionIsDelivered(interjection.id)
-              ),
-              promoteInterjection: interjection => (
-                store.promoteDeliveredInterjection(interjection.id)
-              ),
-              cancellationRequested: () => store.get(job.id)?.cancelRequestedAt != null,
-            },
+            liveControls: createPrimaryLiveControlHooks(store, job),
             onMonitorMessage: message => mirrorMonitorMessage(message),
             onHandoffContext: cloudRuntime ? (key, text) => store.recordCloudContext(job.id, key, text) : undefined,
             parkOnUsageLimit: cloudRuntime !== null,

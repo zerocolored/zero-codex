@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
   decideChannelPolicy,
+  slackSenderId,
+  isSlackSenderEligible,
   resolveInboundWriteEnabled,
   canUseActiveThreadAuthority,
   isBotDMBlocked,
@@ -54,11 +56,11 @@ describe('channel member write access', () => {
     expect(resolveInboundWriteEnabled('D123', 'U123', ['U123'])).toBe(true)
     expect(resolveInboundWriteEnabled('D123', 'W123', ['W123'])).toBe(true)
   })
-  test('unknown conversations and non-human IDs cannot acquire write', () => {
+  test('unknown conversations and invalid IDs cannot acquire write', () => {
     for (const chat of ['', 'X123', 'C', 'D', 'C123/other']) {
       expect(resolveInboundWriteEnabled(chat, 'U123', ['U123'])).toBe(false)
     }
-    for (const user of ['', 'B123', 'U', 'U123/other']) {
+    for (const user of ['', 'B', 'U', 'U123/other']) {
       expect(resolveInboundWriteEnabled('C123', user, [user])).toBe(false)
       expect(resolveInboundWriteEnabled('D123', user, [user])).toBe(false)
     }
@@ -306,7 +308,7 @@ describe('decideChannelPolicy — every human channel participant', () => {
   })
 })
 
-describe('decideChannelPolicy — bots are always denied', () => {
+describe('decideChannelPolicy — bots require an explicit mention', () => {
   test('drops bot when channel has no policy', () => {
     expect(decideChannelPolicy(undefined, BOT, false, true)).toBe('drop')
   })
@@ -331,8 +333,8 @@ describe('decideChannelPolicy — bots are always denied', () => {
     expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, false, true)).toBe('drop')
   })
 
-  test('drops listed bot even when requireMention=true and isMention=true', () => {
-    expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, true, true)).toBe('drop')
+  test('accepts bot when explicitly mentioned regardless of legacy allowFrom', () => {
+    expect(decideChannelPolicy(policy({ requireMention: true, allowFrom: [BOT] }), BOT, true, true)).toBe('deliver')
   })
 
   test('a populated allowFrom containing only humans does not implicitly admit any bot', () => {
@@ -952,5 +954,54 @@ describe('effectiveDmAllowFrom — DM permission is independent from channels', 
   test('tolerates missing/undefined channel policies', () => {
     const access = { allowFrom: [HUMAN], channels: { C1: undefined } }
     expect(effectiveDmAllowFrom(access)).toEqual([HUMAN])
+  })
+})
+
+
+describe('explicit bot mention admission across live and recovery paths', () => {
+  const selfUser = 'UZERO'
+  const selfBot = 'BZERO'
+  const base = { ts: '1790000001.000001', thread_ts: '1790000000.000001',
+    text: '<@UZERO> ZIPを解析して', files: [{ id: 'FZIP' }] }
+  const shapes: SlackReply[] = [
+    { ...base, user: 'UREPORT', bot_id: 'BREPORT' },
+    { ...base, bot_id: 'BREPORT', subtype: 'bot_message' },
+    { ...base, user: 'UREPORT', bot_profile: { id: 'BREPORT' } },
+    { ...base, user: 'UREPORT', bot_id: 'BREPORT', subtype: 'file_share' },
+  ]
+  for (const [index, message] of shapes.entries()) {
+    test(`bot shape ${index}: live, catch-up and owned poll retain sender/ZIP and deduplicate`, () => {
+      expect(slackSenderId(message)).toBe('BREPORT')
+      expect(isSlackSenderEligible(message, selfUser, selfBot)).toBe(true)
+      expect(decideChannelPolicy(undefined, slackSenderId(message)!, true, true)).toBe('deliver')
+      expect(resolveInboundWriteEnabled('CCHANNEL', slackSenderId(message)!, [])).toBe(true)
+      const sweep = { channelId: 'CCHANNEL', channelType: 'channel' as const, oldestMs: 0 }
+      expect(planCatchupSweep([message], [], sweep, selfUser, selfBot)).toEqual([message])
+      expect(planCatchupSweep([message], [`CCHANNEL:${message.ts}`], sweep, selfUser, selfBot)).toEqual([])
+      expect(planThreadPoll([message], base.thread_ts, undefined, selfUser, selfBot).deliver).toEqual([message])
+      expect(planThreadPoll([message], message.ts!, undefined, selfUser, selfBot).deliver).toEqual([])
+      expect(planCatchupSweep([message], [], { ...sweep, channelType: 'im' }, selfUser, selfBot)).toEqual([])
+      expect(planDirectMessageThreadPoll([message], base.thread_ts, ['UREPORT', 'BREPORT'], selfUser).deliver).toEqual([])
+      expect(resolveInboundWriteEnabled('DDIRECT', 'BREPORT', ['BREPORT'])).toBe(false)
+      for (const text of ['続けて', '<@UOTHER> 実行して', '<@UZEROEXTRA> go']) {
+        const unmentioned = { ...message, text }
+        expect(isSlackSenderEligible(unmentioned, selfUser, selfBot)).toBe(false)
+        expect(planThreadPoll([unmentioned], base.thread_ts, { requireMention: false }, selfUser, selfBot).deliver).toEqual([])
+        expect(planCatchupSweep([unmentioned], [], { ...sweep, channelPolicy: { requireMention: false } }, selfUser, selfBot)).toEqual([])
+      }
+    })
+  }
+  test('own user and bot identities are excluded, including userless self posts', () => {
+    for (const identity of [{ user: selfUser }, { bot_id: selfBot }, { bot_profile: { id: selfBot } }]) {
+      const own = { ...base, ...identity }
+      expect(isSlackSenderEligible(own, selfUser, selfBot)).toBe(false)
+      expect(planThreadPoll([own], base.thread_ts, undefined, selfUser, selfBot).deliver).toEqual([])
+      expect(planCatchupSweep([own], [], { channelId: 'CCHANNEL', channelType: 'channel', oldestMs: 0 }, selfUser, selfBot)).toEqual([])
+    }
+  })
+  test('bot without a valid bot identity cannot become a human or use active authority', () => {
+    expect(slackSenderId({ ...base, user: 'UHUMAN', subtype: 'bot_message' })).toBeUndefined()
+    expect(slackSenderId({ ...base, user: 'UHUMAN', bot_id: 'invalid' })).toBeUndefined()
+    expect(decideChannelPolicy({ requireMention: false }, 'BREPORT', false, true, true)).toBe('drop')
   })
 })

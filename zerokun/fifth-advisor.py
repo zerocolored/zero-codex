@@ -146,6 +146,12 @@ class UnsafeRequest(ValueError):
     """The required fifth-advisor attempt cannot safely continue."""
 
 
+class _StartupUIUnavailable(UnsafeRequest):
+    def __init__(self, code: str) -> None:
+        self.code = code if code in {"authentication-ui", "rate-limit-ui", "billing-ui"} else "prohibited-ui"
+        super().__init__("ephemeral Claude has a prohibited startup UI (" + self.code + ")")
+
+
 class _ClaudeInvocationMismatch(UnsafeRequest):
     """Carry a bounded mismatch observation without exposing raw process values."""
 
@@ -2026,9 +2032,23 @@ def _process_inventory(workspace: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
+def _process_receipt(
+    workspace: Dict[str, object], recorded: Optional[Dict[str, object]] = None,
+    launch_executable: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     inventory = _process_inventory(workspace)
-    executable = _claude_executable_identity()
+    # Claude's self-updater changes the PATH symlink while the already running
+    # process keeps its old executable. Pin that process's launch identity;
+    # never reinterpret its argv against the next launch's binary.
+    if recorded is not None:
+        if (inventory.get("shell_pid") != recorded.get("shell_pid")
+                or inventory.get("process_group_id") != recorded.get("process_group_id")
+                or not any(process.get("pid") == recorded.get("claude_pid")
+                           for process in inventory["processes"])):
+            raise UnsafeRequest("ephemeral Claude process identity changed")
+        executable = recorded.get("executable")
+    else:
+        executable = launch_executable if launch_executable is not None else _claude_executable_identity()
     claude_matches = [
         process
         for process in inventory["processes"]
@@ -2056,7 +2076,9 @@ def _process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
     }
 
 
-def _settled_process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
+def _settled_process_receipt(
+    workspace: Dict[str, object], launch_executable: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
     """Wait for two consecutive observations of the same owned Claude core.
 
     Claude may briefly replace its launcher process while Herdr already shows
@@ -2066,10 +2088,11 @@ def _settled_process_receipt(workspace: Dict[str, object]) -> Dict[str, object]:
     identity, and semantically valid invocation must remain stable.
     """
     deadline = time.monotonic() + CLAUDE_PROCESS_SETTLE_TIMEOUT_SECONDS
-    previous = _process_receipt(workspace)
+    executable = launch_executable if launch_executable is not None else _claude_executable_identity()
+    previous = _process_receipt(workspace, launch_executable=executable)
     while time.monotonic() < deadline:
         time.sleep(0.25)
-        current = _process_receipt(workspace)
+        current = _process_receipt(workspace, launch_executable=executable)
         if _same_owned_process_identity(current, previous):
             return current
         previous = current
@@ -2221,22 +2244,57 @@ def _empty_claude_prompt_screen(text: str) -> bool:
     return _EMPTY_PROMPT_LINE.fullmatch(lines[prompt_lines[-1]]) is not None
 
 
+def _startup_project_display(line: str, project_root: str) -> bool:
+    """Exclude the known cwd display, not arbitrary lines containing a path."""
+    value = line.strip().lstrip("▝▜▛▐▌▀▄▘▗▖▙▟▞▚█ ").strip()
+    if not project_root or not value:
+        return False
+    if value == project_root:
+        return True
+    for prefix in ("…/", ".../"):
+        if value.startswith(prefix):
+            suffix = value[len(prefix):]
+            return bool(suffix) and project_root.endswith("/" + suffix)
+    return False
+
+
+def _startup_ui_text(text: str, project_root: str) -> str:
+    """Remove known cwd text while retaining every surrounding UI label.
+
+    The terminal may retain the shell's cd echo or use ~/ in the banner.
+    Removing whole lines here would also hide e.g. `Payment required <cwd>`.
+    """
+    home = str(Path.home())
+    paths = [project_root] if project_root else []
+    if project_root.startswith(home + "/"):
+        paths.append("~" + project_root[len(home):])
+    active = []
+    for line in text.splitlines():
+        if _startup_project_display(line, project_root):
+            continue
+        for path in paths:
+            line = line.replace(path, "")
+        active.append(line)
+    return "\n".join(active)
+
+
 _STARTUP_FORBIDDEN_UI = re.compile(
-    r"(?i)password|passkey|captcha|rate limit|payment|survey|sign in|log in|"
-    r"approve|allow access|grant permission|permissions? (?:request|required|needed)|"
-    r"(?:enter|provide|paste).*(?:token|credential)|(?:MFA|2FA)|authentication required"
+    r"(?i)\b(?:password|passkey|captcha|rate limits?|payment|survey|sign in|log in|"
+    r"approve|allow access|grant permission|permissions? (?:request|required|needed))\b|"
+    r"\b(?:enter|provide|paste)\b.*\b(?:tokens?|credentials?)\b|\b(?:MFA|2FA)\b|\bauthentication required\b"
 )
 
 
-def _keep_xhigh_screen(text: str) -> bool:
+def _keep_xhigh_screen(text: str, project_root: str = "") -> bool:
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
-    lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    lines = [line.strip() for line in plain.splitlines()
+             if line.strip() and not _startup_project_display(line, project_root)]
     return (
         sum(bool(re.fullmatch(r"Use Fable 5\.1 .*high effort.*default\?", line)) for line in lines) == 1
         and sum(line == "❯ Keep xhigh" for line in lines) == 1
         and sum(line == "Switch Fable 5.1 to high effort" for line in lines) == 1
         and sum("❯" in line for line in lines) == 1
-        and not any(_STARTUP_FORBIDDEN_UI.search(line) for line in lines)
+        and not _STARTUP_FORBIDDEN_UI.search(_startup_ui_text("\n".join(lines), project_root))
     )
 
 
@@ -2268,7 +2326,7 @@ def _trust_screen_choice(text: str, project_root: str) -> Optional[Tuple[str, st
     if path != project_root:
         return None
     active = lines[path_end + 1:end]
-    if _STARTUP_FORBIDDEN_UI.search("\n".join(lines[:start] + active)):
+    if _STARTUP_FORBIDDEN_UI.search(_startup_ui_text("\n".join(lines[:start] + active), project_root)):
         return None
     choices = []
     for line in active:
@@ -2291,12 +2349,23 @@ def _startup_screen_state(text: str, project_root: str) -> Tuple[str, str]:
     if trust:
         return ("trust-" + trust[0], trust[1])
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
-    active = "\n".join(line for line in plain.splitlines()
-                       if not _EMPTY_PROMPT_LINE.fullmatch(line) and line.strip() != project_root)
+    active = _startup_ui_text("\n".join(line for line in plain.splitlines()
+                       if not _EMPTY_PROMPT_LINE.fullmatch(line)), project_root)
     if _STARTUP_FORBIDDEN_UI.search(active):
-        return ("prohibited-ui", "")
-    if _keep_xhigh_screen(text):
+        # Retain only fixed categories before owned cleanup removes the UI.
+        # Never record the screen, account identity, credentials or input values.
+        code = ("rate-limit-ui" if re.search(r"(?i)\brate limits?\b", active)
+                else "billing-ui" if re.search(r"(?i)\bpayment\b", active)
+                else "authentication-ui" if re.search(
+                    r"(?i)\b(?:password|passkey|captcha|sign in|log in|MFA|2FA|authentication required)\b", active)
+                else "prohibited-ui")
+        return ("prohibited-ui", code)
+    if _keep_xhigh_screen(text, project_root):
         return ("keep-xhigh", "")
+    # A malformed or foreign known dialog must not fall through to a stray
+    # empty prompt while the terminal is repainting. No key or task is sent.
+    if "Accessing workspace:" in plain or "Keep xhigh" in plain:
+        return ("unrecognized-screen", "")
     if _empty_claude_prompt_screen(text):
         return ("empty-prompt", "")
     return ("unrecognized-screen", "")
@@ -2340,7 +2409,7 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
                 accepted_effort = True
             continue
         if last_state == "prohibited-ui":
-            raise UnsafeRequest("ephemeral Claude has a prohibited startup UI")
+            raise _StartupUIUnavailable(second_screen[1])
         if last_state in {"trust-trust", "trust-exit"}:
             if (not accepted_trust and second.get("agent_status") == "blocked"
                     and second.get("launch_pending") is True):
@@ -2375,6 +2444,8 @@ def _strict_trust_screen(text: str, project_root: str) -> bool:
 
 
 def _startup_failure_code(error: BaseException) -> str:
+    if isinstance(error, _StartupUIUnavailable):
+        return error.code
     message = str(error)
     if "prohibited startup UI" in message:
         return "prohibited-ui"
@@ -4223,6 +4294,7 @@ def _open_ephemeral_workspace(
                 "status": "start-will-be-attempted",
             },
         )
+        launch_executable = _claude_executable_identity()
         start_attempted = True
         started = _run_herdr(
             _claude_start_command(agent_name, str(pane_id), answer_directory, ui_artifacts),
@@ -4255,7 +4327,7 @@ def _open_ephemeral_workspace(
             root_metadata,
         )
         agent = _settle_visible_ready(agent_name, workspace_receipt)
-        processes = _settled_process_receipt(workspace_receipt)
+        processes = _settled_process_receipt(workspace_receipt, launch_executable)
         session = agent.get("agent_session")
         native_session = (
             session.get("value")
@@ -4463,7 +4535,7 @@ def _close_command_noninterruptible(args: argparse.Namespace) -> int:
             process_group_id = candidate_process_group_id
             process_group_ids = [candidate_process_group_id]
             try:
-                observed_processes = _process_receipt(workspace)
+                observed_processes = _process_receipt(workspace, agent_receipt)
                 if not _same_owned_process_identity(observed_processes, agent_receipt):
                     process_identity_error = UnsafeRequest(
                         "ephemeral Claude process changed before cleanup"
@@ -4623,7 +4695,7 @@ def _owned_target(
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
     if _startup_screen_state(_read_visible(target), str(workspace.get("project_root", "")))[0] != "empty-prompt":
         raise UnsafeRequest("ephemeral Claude is not at an empty visible prompt")
-    processes = _process_receipt(workspace)
+    processes = _process_receipt(workspace, agent_receipt)
     if not _same_owned_process_identity(processes, agent_receipt):
         raise UnsafeRequest("ephemeral Claude process changed before fifth-advisor prompt")
     _result, final_agent = _agent_information(target)
@@ -4639,7 +4711,7 @@ def _owned_target(
         or final_agent.get("state_change_seq") != agent.get("state_change_seq")
     ):
         raise UnsafeRequest("ephemeral Claude identity changed before fifth-advisor prompt")
-    final_processes = _process_receipt(workspace)
+    final_processes = _process_receipt(workspace, agent_receipt)
     if not _same_owned_process_identity(final_processes, agent_receipt):
         raise UnsafeRequest("ephemeral Claude process changed before fifth-advisor prompt")
     if observed is not None:

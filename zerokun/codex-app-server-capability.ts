@@ -17,6 +17,7 @@ const GENERATION_TIMEOUT_MS = 30_000
 type CapabilityContract = {
   relativePath: string
   required: RegExp[]
+  literalUnion?: { name: string; required: string[]; optional?: string[] }
 }
 
 const CAPABILITY_CONTRACTS: CapabilityContract[] = [
@@ -93,9 +94,11 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
   },
   {
     relativePath: 'v2/ThreadSourceKind.ts',
-    required: [
-      /export type ThreadSourceKind = "cli" \| "vscode" \| "exec" \| "appServer" \| "subAgent" \| "subAgentReview" \| "subAgentCompact" \| "subAgentThreadSpawn" \| "subAgentOther" \| "unknown";/,
-    ],
+    required: [],
+    literalUnion: { name: 'ThreadSourceKind', required: [
+      'cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+      'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown',
+    ] },
   },
   {
     relativePath: 'v2/ThreadListResponse.ts',
@@ -130,9 +133,8 @@ const CAPABILITY_CONTRACTS: CapabilityContract[] = [
   },
   {
     relativePath: 'v2/SubAgentActivityKind.ts',
-    required: [
-      /export type SubAgentActivityKind = "started" \| "interacted" \| "interrupted"(?: \| "completed")?;/,
-    ],
+    required: [],
+    literalUnion: { name: 'SubAgentActivityKind', required: ['started', 'interacted', 'interrupted'], optional: ['completed'] },
   },
   {
     relativePath: 'v2/ThreadTurnsListParams.ts',
@@ -270,6 +272,19 @@ function readGeneratedType(root: string, relativePath: string): string {
 export function assertCodexAppServerGeneratedCapabilities(outputDir: string): void {
   for (const contract of CAPABILITY_CONTRACTS) {
     const source = readGeneratedType(outputDir, contract.relativePath)
+    if (contract.literalUnion) {
+      const { name, required, optional = [] } = contract.literalUnion
+      const declaration = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+        .match(new RegExp(`export\\s+type\\s+${name}\\s*=\\s*([^;]+);`))?.[1]
+      const members = declaration?.trim().replace(/^\|/, '').split('|')
+        .map(value => value.trim().match(/^(?:"([^"\\]+)"|'([^'\\]+)')$/)?.slice(1).find(Boolean)) ?? []
+      // Child enumeration depends on the member set, not generated formatting
+      // or ordering. Unknown members still require updating the enumeration.
+      if (members.some(value => !value || ![...required, ...optional].includes(value))
+        || required.some(value => !members.includes(value))) {
+        throw new Error(`installed Codex App Server is missing Zeroちゃん capability ${contract.relativePath}: ${required.join(', ')}`)
+      }
+    }
     // Newer Codex schemas name the request cursor union and add item anchors.
     // Our caller still paginates with strings; validate that capability rather
     // than rejecting a compatible alias or accepting an anchor-only cursor.

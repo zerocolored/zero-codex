@@ -5,7 +5,6 @@ import { isAbsolute, join, relative, resolve, sep } from 'path'
 import { createServer } from 'net'
 import { z } from 'zod'
 import { ensureManagedDirectory } from './managed-path.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import { reencodeBrowserScreenshot } from './ui-approval.ts'
 
 /** Inputs describe the comparison, never grant paths or permissions. */
@@ -19,6 +18,7 @@ export type ClaudeUiProposal = z.infer<typeof claudeUiProposalSchema>
 export type ClaudeUiWorkspace = {
   version: 1; root: string; dev: number; ino: number; port: number
   width: 1280; height: 720
+  beforeWarning?: 'missing-before-image'
 }
 
 function digest(bytes: Uint8Array): string { return createHash('sha256').update(bytes).digest('hex') }
@@ -51,7 +51,6 @@ export async function createClaudeUiWorkspace(input: {
   stateDir: string; jobId: string; proposal: ClaudeUiProposal; projectRoots?: string[]
 }): Promise<ClaudeUiWorkspace> {
   const proposal = claudeUiProposalSchema.parse(input.proposal)
-  if (containsCredentialMaterial(proposal.comparison)) throw new Error('UI comparison contains credential material')
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-fable-gui-')))
   chmodSync(root, 0o700)
   const protectedRoots = [input.stateDir, ...(input.projectRoots ?? []),
@@ -75,16 +74,28 @@ export async function createClaudeUiWorkspace(input: {
       server.close(error => error ? reject(error) : resolve(address.port))
     })
   })
+  let beforeWarning: ClaudeUiWorkspace['beforeWarning']
+  let effectiveProposal = proposal
   if (proposal.beforeImage) {
     const outbox = ensureManagedDirectory(input.stateDir, join(input.stateDir, 'outbox', input.jobId))
     const source = join(outbox, proposal.beforeImage)
-    const bytes = readArtifact(source, 16 * 1024 * 1024)
-    const png = sanitizePng(bytes, 1280, 720)
-    writeFileSync(join(root, 'input', 'before.png'), png, { flag: 'wx', mode: 0o600 })
+    let bytes: Buffer | undefined
+    try { bytes = readArtifact(source, 16 * 1024 * 1024) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      beforeWarning = 'missing-before-image'
+      effectiveProposal = { comparison: proposal.comparison, beforeKind: 'unavailable' }
+    }
+    if (bytes) {
+      const png = sanitizePng(bytes, 1280, 720)
+      writeFileSync(join(root, 'input', 'before.png'), png, { flag: 'wx', mode: 0o600 })
+    }
   }
-  writeFileSync(join(root, 'input', 'comparison.json'), JSON.stringify(proposal), { flag: 'wx', mode: 0o600 })
+  writeFileSync(join(root, 'input', 'comparison.json'), JSON.stringify({ ...effectiveProposal,
+    ...(beforeWarning ? { requestedComparison: proposal, warning: beforeWarning,
+      limitation: 'The requested Before file was absent. Do not claim to have inspected it. Use an explicitly synthetic current state and disclose the comparison limitation.' } : {}),
+  }), { flag: 'wx', mode: 0o600 })
   const st = lstatSync(root)
-  return { version: 1, root, dev: st.dev, ino: st.ino, port, width: 1280, height: 720 }
+  return { version: 1, root, dev: st.dev, ino: st.ino, port, width: 1280, height: 720, ...(beforeWarning ? { beforeWarning } : {}) }
   } catch (error) {
     // No reviewer has received this root yet.
     rmSync(root, { recursive: true, force: true })
@@ -126,8 +137,8 @@ export function collectClaudeUiArtifacts(input: {
   const samplePath = join(workspace.root, 'prototype', 'index.html')
   const sample = readArtifact(samplePath, 2 * 1024 * 1024)
   const html = sample.toString('utf8')
-  if (containsCredentialMaterial(html) || /(?:\b(?:src|href|action)\s*=\s*["']|\burl\(\s*["']?)(?:https?:\/\/|\/\/|file:|ftp:)/i.test(html)) {
-    throw new Error('Fable sample contains credentials or an external resource; primary must inspect it')
+  if (/(?:\b(?:src|href|action)\s*=\s*["']|\burl\(\s*["']?)(?:https?:\/\/|\/\/|file:|ftp:)/i.test(html)) {
+    throw new Error('Fable sample contains an external resource; primary must inspect it')
   }
   const sourceDir = join(workspace.root, 'evidence')
   const source = join(sourceDir, 'after.png')

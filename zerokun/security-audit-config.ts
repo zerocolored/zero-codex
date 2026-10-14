@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { loadAuditSettings, saveAuditSettings } from './security-audit-setup.ts'
 import { realpathSync } from 'fs'
 import { join } from 'path'
 import { auditProjectKey, auditSettingsSchema } from './security-audit.ts'
@@ -22,13 +23,13 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     join(state, 'security-audit-settings'),
   )
   const path = join(root, `${auditProjectKey(project)}.json`)
-  const saved = readOptionalBoundedOwnerOnlyRegularFile(path, 30000)
-  const settings = auditSettingsSchema.parse(saved ? JSON.parse(saved) : {})
+  const settings = loadAuditSettings(state, project)
   if (command === 'status') {
     process.stdout.write(
       JSON.stringify(
         {
-          ...settings,
+          ...Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'codeqlLicensed')),
+          semgrepCredentialPresent: readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-semgrep-token'), 4096) !== null,
           socketCredentialPresent:
             readOptionalBoundedOwnerOnlyRegularFile(
               join(state, 'security-audit-socket-token'),
@@ -41,17 +42,18 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     )
     return
   }
-  if (command === 'socket-token') {
+  if (command === 'socket-token' || command === 'semgrep-token') {
     if (values.length)
       throw Error('トークンを引数へ渡さないでください。対話端末で入力します。')
-    const token = await terminalInput('Socket API token（非表示）')
-    if (!/^sktsec_[A-Za-z0-9_-]+$/.test(token))
-      throw Error('Socket token format invalid')
+    const semgrep = command === 'semgrep-token'
+    const token = await terminalInput(`${semgrep ? 'Semgrep' : 'Socket'} API token（非表示）`)
+    if (semgrep ? !/^[a-zA-Z0-9_.-]{16,2048}$/.test(token) : !/^sktsec_[A-Za-z0-9_-]+$/.test(token))
+      throw Error('API token format invalid')
     atomicWritePrivateFile(
-      join(state, 'security-audit-socket-token'),
+      join(state, semgrep ? 'security-audit-semgrep-token' : 'security-audit-socket-token'),
       token + '\n',
     )
-    process.stdout.write('Socket認証情報を保存しました（値は表示しません）。\n')
+    process.stdout.write('認証情報を保存しました（値は表示しません）。\n')
     return
   }
   if (command === 'target' && values.length === 1) {
@@ -82,12 +84,8 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     settings.e2ePort = Number(values[0])
   } else if (command === 'socket-org' && values.length === 1) {
     settings.socketOrg = values[0]
-  } else if (
-    command === 'codeql-license' &&
-    values.length === 1 &&
-    ['confirmed', 'off'].includes(values[0]!)
-  ) {
-    settings.codeqlLicensed = values[0] === 'confirmed'
+  } else if (command === 'semgrep-repo' && values.length === 1) {
+    settings.semgrepRepo = values[0]
   } else if (command === 'auth-probe' && values.length === 2) {
     settings.authenticatedPath = values[0]
     settings.loggedInPattern = values[1]
@@ -95,12 +93,11 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     settings.images = [...new Set([...settings.images, values[0]!])]
   } else
     throw Error(
-      '使い方: zerochan security status | target URL | active on|off | auth required|none | e2e-port PORT | auth-probe PATH LOGGED_IN_PATTERN | socket-org ORG | socket-token | codeql-license confirmed|off | image IMAGE',
+      '使い方: zerochan security status | target URL | active on|off | auth required|none | e2e-port PORT | auth-probe PATH LOGGED_IN_PATTERN | socket-org ORG | socket-token | semgrep-repo OWNER/REPO | semgrep-token | image IMAGE',
     )
-  atomicWritePrivateFile(
-    path,
-    JSON.stringify(auditSettingsSchema.parse(settings)) + '\n',
-  )
+  if (command === 'socket-org') {
+    atomicWritePrivateFile(path, JSON.stringify(auditSettingsSchema.parse(settings)) + '\n')
+  } else saveAuditSettings(state, project, settings)
   process.stdout.write('このプロジェクトの検査設定を保存しました。\n')
 }
 if (import.meta.main)

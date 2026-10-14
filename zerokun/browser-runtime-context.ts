@@ -1,4 +1,6 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'fs'
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'fs'
+import { randomUUID } from 'crypto'
+import { browserDialogCompatibility } from './browser-dialog-compat.ts'
 import { homedir } from 'os'
 import { delimiter, dirname, isAbsolute, join, relative, sep } from 'path'
 
@@ -114,6 +116,27 @@ export function stageBrowserRuntime(
         },
       })
     }
+    const servicePath = join(destination, 'scripts/browser-service.mjs')
+    try {
+      const compatibility = browserDialogCompatibility(readFileSync(servicePath, 'utf8'))
+      if (compatibility.applied) {
+        // Replace atomically: a read-only shipped file is valid, and failed
+        // compatibility writes must not discard or truncate the staged code.
+        const temporary = `${servicePath}.${randomUUID()}`
+        let fd: number | undefined, created = false
+        try {
+          fd = openSync(temporary, 'wx', 0o600); created = true
+          writeFileSync(fd, compatibility.source)
+          closeSync(fd); fd = undefined
+          renameSync(temporary, servicePath)
+        } finally {
+          if (fd !== undefined) closeSync(fd)
+          if (created) rmSync(temporary, { force: true })
+        }
+      } else process.stderr.write('zerochan: browser dialog compatibility not applicable to this runtime; official implementation retained\n')
+    } catch {
+      process.stderr.write('zerochan: browser dialog compatibility unavailable; staged transport retained\n')
+    }
     const server = config.mcp_servers.node_repl
     const services = JSON.parse(server.env.NODE_REPL_TRUSTED_SERVICES)
     services.browser = join(destination, 'scripts/browser-service.mjs')
@@ -167,5 +190,14 @@ export function browserRuntimeContext(
       'do not restore old plugin files, change trust settings, or ask for a website relogin.',
       'Preserve website approvals, explicit browser selection, and native permission decisions.',
       'Inspect the destination and previous effects before retrying any external write.',
+      'A click can open a JavaScript dialog before the click response times out. On a click',
+      'timeout, inspect that exact tab with getJsDialog() before repeating the click or',
+      'switching to app-wide Computer Use. Handle an observed dialog only when the user',
+      'authorized its effect, then verify the target page. A timeout is not proof of rejection.',
+      'If a previous execution already lost its connection behind a dialog, a whole-app',
+      'read denial does not prohibit a narrower read of the authorized site. When supported,',
+      'open a fresh tab at the same previously observed URL and inspect saved state there.',
+      'Keep the original tab and unsaved work; do not replay publication or other writes',
+      'until their previous effects and the intended saved content have been verified.',
   ].join('\n')
 }

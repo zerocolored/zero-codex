@@ -1,9 +1,4 @@
 import { createHash } from 'crypto'
-import {
-  containsCredentialMaterial,
-  normalizePublicGuardText,
-  redactCredentialMaterial,
-} from './public-output-guard.ts'
 
 export const THREAD_HISTORY_VERSION = 1 as const
 export const MAX_THREAD_HISTORY_JOBS = 64
@@ -83,41 +78,13 @@ function truncateUtf8(value: string, maxChars: number, maxBytes: number): string
 }
 
 /**
- * Historical text is less trusted than the current Slack request. Remove
- * credentials, machine-local paths and protocol-looking markers before it is
- * persisted or reintroduced to a fresh Codex session.
+ * Preserve historical content while separating host protocol metadata from
+ * ordinary text before it is reintroduced to a fresh Codex session.
  */
 export function sanitizeThreadHistoryText(value: string): string {
-  let sanitized = normalizePublicGuardText(value).replace(/\r\n?/g, '\n')
+  let sanitized = value.replace(/\r\n?/g, '\n')
   sanitized = sanitized.replace(/<zerokun_files>[\s\S]*?<\/zerokun_files>/gi, '')
   sanitized = sanitized.replace(/<zerokun_files>[\s\S]*$/gi, '')
-  sanitized = redactCredentialMaterial(sanitized, '[credential omitted]')
-  sanitized = sanitized.replace(/\bhttps?:\/\/[^\s<>]+/gi, '[link omitted from prior context]')
-  sanitized = sanitized.replace(
-    /\b(?:file|ftp|sftp|ssh|vscode):\/\/[^\s<>]+/gi,
-    '[local path omitted]',
-  )
-  // Quoted paths may contain spaces. Preserve the quote pair so surrounding
-  // prose remains readable, but never retain any of the machine-local path.
-  sanitized = sanitized.replace(
-    /(["'`])\/(?!\/)[^\n"'`]*\1/g,
-    (_match, quote: string) => `${quote}[local path omitted]${quote}`,
-  )
-  sanitized = sanitized.replace(
-    /(^|[\s([{:;,=])\/(?!\/)(?:[^\s<>"'`)\]},;]|\\ )+/gm,
-    '$1[local path omitted]',
-  )
-  sanitized = sanitized.replace(
-    /(?:\/Users\/|\/home\/|\/tmp\/|\/private\/|\/var\/|\/opt\/|\/etc\/|\/usr\/|\/Library\/|\/Applications\/|\/System\/|\/Volumes\/|\/dev\/|\/proc\/|\/run\/|\/srv\/|\/mnt\/|\/workspace\/)[^\s<>"'`]*/g,
-    '[local path omitted]',
-  )
-  sanitized = sanitized.replace(/\b[A-Za-z]:\\[^\s<>"']+/g, '[local path omitted]')
-  sanitized = sanitized.replace(/\b[A-Z][A-Z0-9]{8,}\b/g, '[Slack identifier omitted]')
-  sanitized = sanitized.replace(
-    /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
-    '[internal identifier omitted]',
-  )
-  sanitized = sanitized.replace(/\bZERO_[A-Z0-9_:-]+\b/g, '[historical marker omitted]')
   sanitized = sanitized.replace(
     /---\s*(?:end\s+)?(?:Prior Slack thread history|Slack request|Zero host (?:(?:phase )?control|attachment bindings))[^\n-]*---/gi,
     '[historical control delimiter omitted]',
@@ -218,9 +185,6 @@ export function createThreadHistoryArchive(input: {
   if (transcript.length > MAX_ARCHIVE_CHARS || utf8Length(transcript) > MAX_ARCHIVE_BYTES) {
     throw new Error('thread history archive exceeds its managed size limit')
   }
-  if (containsCredentialMaterial(transcript)) {
-    throw new Error('thread history archive contains credential material')
-  }
   const unsigned: Omit<ThreadHistoryArchive, 'digest'> = {
     version: THREAD_HISTORY_VERSION,
     jobId: input.jobId,
@@ -251,8 +215,7 @@ export function assertThreadHistoryArchive(value: ThreadHistoryArchive): void {
     || !Number.isSafeInteger(value.omittedEventCount) || value.omittedEventCount < 0
     || !Number.isSafeInteger(value.finishedAt) || value.finishedAt < 1
     || value.transcript.length > MAX_ARCHIVE_CHARS
-    || utf8Length(value.transcript) > MAX_ARCHIVE_BYTES
-    || containsCredentialMaterial(value.transcript)) {
+    || utf8Length(value.transcript) > MAX_ARCHIVE_BYTES) {
     throw new Error('thread history archive is invalid')
   }
 }
@@ -360,8 +323,7 @@ export function assertDurableThreadHistorySnapshot(
     || !Number.isSafeInteger(value.omittedCount) || value.omittedCount < 0
     || value.sourceCount > MAX_THREAD_HISTORY_JOBS
     || value.transcript.length > MAX_THREAD_HISTORY_CHARS
-    || utf8Length(value.transcript) > MAX_THREAD_HISTORY_BYTES
-    || containsCredentialMaterial(value.transcript)) {
+    || utf8Length(value.transcript) > MAX_THREAD_HISTORY_BYTES) {
     throw new Error('thread history snapshot is invalid')
   }
   if (binding && (value.jobId !== binding.jobId || value.attempt !== binding.attempt

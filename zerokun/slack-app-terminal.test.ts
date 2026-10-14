@@ -12,7 +12,7 @@ try:
     while b' n: ' not in output and time.monotonic() < deadline:
         if select.select([master], [], [], .1)[0]: output += os.read(master, 4096)
     assert b' n: ' in output
-    os.write(master, b'2\r')
+    os.write(master, b'AZNEW\r')
     while proc.poll() is None and time.monotonic() < deadline:
         if select.select([master], [], [], .1)[0]: output += os.read(master, 4096)
     assert proc.wait(timeout=2) == 0, output.decode(errors='replace')
@@ -50,7 +50,7 @@ print('interactive app switch passed')
 test('real PTY echoes selection and edits but keeps subsequent registration tokens hidden', () => {
   const program = String.raw`
 import os, pty, select, subprocess, sys, termios, time
-for action in ('number', 'new', 'ctrlc', 'ctrld'):
+for action in ('number', 'new', 'known-id', 'new-id', 'retry', 'ctrlc', 'ctrld'):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     proc = subprocess.Popen([sys.argv[1], '--no-env-file', '-e', sys.argv[2]], stdin=slave, stdout=slave, stderr=slave)
@@ -67,28 +67,35 @@ for action in ('number', 'new', 'ctrlc', 'ctrld'):
         assert not termios.tcgetattr(slave)[3] & termios.ECHO
         start = len(output)
         # Empty backspace must not erase the prompt; arrow controls must not echo.
-        os.write(master, b'\x7f\x1b[A12\x7f\b' + (b'n' if action == 'new' else b'1'))
-        wait_for(b'12\b \b\b \b' + (b'n' if action == 'new' else b'1'))
-        assert output[start:] == b'12\b \b\b \b' + (b'n' if action == 'new' else b'1'), 'selection echo mismatch'
+        choice = b'n' if action == 'new' else b'ANEW' if action == 'new-id' else b'ATEST' if action == 'known-id' else b'0' if action == 'retry' else b'1'
+        os.write(master, b'\x7f\x1b[A12\x7f\b' + choice)
+        wait_for(b'12\b \b\b \b' + choice)
+        assert output[start:] == b'12\b \b\b \b' + choice, 'selection echo mismatch'
         os.write(master, b'\x03' if action == 'ctrlc' else b'\x04' if action == 'ctrld' else b'\r')
-        if action == 'new':
+        if action == 'retry':
+            wait_for('一覧の番号、Aで始まる App ID、または新規登録の n を入力してください。'.encode())
+            time.sleep(.05)
+            os.write(master, b'ATEST\r')
+            wait_for(b' n: ATEST\r\n')
+        if action in ('new', 'new-id'):
             wait_for('Bot Token xoxb-（非表示）: '.encode())
             time.sleep(.05)
             os.write(master, b'xoxb-synthetic-only-12345\r')
             wait_for('App-Level Token xapp-（非表示）: '.encode())
             time.sleep(.05)
             os.write(master, b'xapp-1-ANEW-synthetic-only-12345\r')
-        proc.wait(timeout=10)
+        try: proc.wait(timeout=10)
+        except subprocess.TimeoutExpired: raise AssertionError('command did not finish: ' + action + '; ' + output.decode(errors='replace')) from None
         while select.select([master], [], [], .05)[0]: output += os.read(master, 4096)
         assert b'xoxb-synthetic-only-12345' not in output and b'xapp-1-ANEW-synthetic-only-12345' not in output, 'token echoed'
         flags = termios.ECHO | termios.ICANON | termios.ISIG
         assert termios.tcgetattr(slave)[3] & flags == before[3] & flags, 'terminal not restored'
         assert proc.returncode == (1 if action in ('ctrlc', 'ctrld') else 0)
-        if action in ('number', 'new'): assert ('Slackアプリ登録: ' + ('ANEW' if action == 'new' else 'ATEST')).encode() in output
+        if action not in ('ctrlc', 'ctrld'): assert ('Slackアプリ登録: ' + ('ANEW' if action in ('new', 'new-id') else 'ATEST')).encode() in output
     finally:
         if proc.poll() is None: proc.kill(); proc.wait()
         os.close(master); os.close(slave)
-print('4 command PTY scenarios passed')
+print('7 command PTY scenarios passed')
 `
   const javascript = `
     import { mkdtempSync, mkdirSync, rmSync, realpathSync } from 'fs';
@@ -108,7 +115,7 @@ print('4 command PTY scenarios passed')
   `
   const result = Bun.spawnSync(['/usr/bin/python3', '-c', program, process.execPath, javascript], { timeout: 45_000 })
   expect(result.exitCode, result.stderr.toString()).toBe(0)
-  expect(result.stdout.toString()).toContain('4 command PTY scenarios passed')
+  expect(result.stdout.toString()).toContain('7 command PTY scenarios passed')
 }, 50_000)
 
 test('real PTY hides input and restores echo after enter, Ctrl-C and termination', () => {

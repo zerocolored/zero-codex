@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { ensureTaskGoal, readTaskGoal, taskGoalObjective, type NativeGoal } from './codex-goal.ts'
+import { ensureTaskGoal, readTaskGoal, retainGoalForAdvisors, taskGoalObjective, type NativeGoal } from './codex-goal.ts'
 
 function fixture(goal: NativeGoal | null) {
   const calls: Array<{ method: string; params: Record<string, unknown> }> = []
@@ -54,3 +54,20 @@ test('blocked goal must lead the Slack reply with one concrete ask', () => {
   // 依頼が無いときも、その旨を同じ1行目で言わせる（黙って情報だけ出させない）。
   expect(objective).toContain('If you truly need nothing from the reader')
 })
+test('completed parent collects its existing advisor round without launching a replacement', async () => {
+  const goal = { objective: 'task', status: 'complete' as const }, session = fixture(goal)
+  const result = await retainGoalForAdvisors(session, 'root', 'job', goal,
+    { phase: 'investigation', round: 1, inputRevision: 2 })
+  expect(result?.status).toBe('active')
+  expect(session.calls).toHaveLength(1)
+  expect(session.calls[0]!.params.objective).toContain('advisor_round_poll')
+  expect(session.calls[0]!.params.objective).toContain('Do not launch another round')
+  expect(session.calls[0]!.params.objective).toContain('unresolved approval wait')
+})
+test.each(['paused', 'blocked', 'usageLimited', 'budgetLimited', 'active'] as const)(
+  'advisor collection preserves %s goal', async status => {
+    const goal = { objective: 'task', status }, session = fixture(goal)
+    expect(await retainGoalForAdvisors(session, 'root', 'job', goal,
+      { phase: 'investigation', round: 1, inputRevision: 1 })).toEqual(goal)
+    expect(session.calls).toHaveLength(0)
+  })

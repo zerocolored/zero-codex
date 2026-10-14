@@ -65,8 +65,8 @@ export function validateLegacyThreadMap(value: unknown): {
 /**
  * Channel access is intentionally membership-based: Slack only delivers
  * channel events to an app that is present in that conversation, every human
- * participant is accepted, and bot-authored/unknown-sender events are always
- * rejected. New roots still need a real mention; an already adopted live
+ * participant is accepted. Other bots require an explicit mention; unknown
+ * senders are rejected. New roots still need a real mention; an already adopted live
  * thread is the address for later human replies.
  */
 export function decideChannelPolicy(
@@ -76,7 +76,8 @@ export function decideChannelPolicy(
   isBot: boolean,
   activeHumanThreadAuthority = false,
 ): 'deliver' | 'drop' {
-  if (isBot || !SLACK_USER_ID_RE.test(senderId)) return 'drop'
+  if (isBot) return SLACK_BOT_ID_RE.test(senderId) && isMention ? 'deliver' : 'drop'
+  if (!SLACK_USER_ID_RE.test(senderId)) return 'drop'
   const requireMention = policy?.requireMention ?? true
   if (requireMention && !isMention && !activeHumanThreadAuthority) return 'drop'
   return 'deliver'
@@ -98,8 +99,7 @@ export function canUseActiveThreadAuthority(options: {
 }
 
 /**
- * Bot DMs are unconditionally dropped. Channel bot posts are rejected by
- * `decideChannelPolicy`, independently of any legacy access state.
+ * Bot DMs are unconditionally dropped. Channel bots must explicitly mention Zero.
  */
 export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): boolean {
   return isBot && channelType === 'im'
@@ -107,15 +107,16 @@ export function isBotDMBlocked(channelType: 'im' | 'channel', isBot: boolean): b
 
 // Slack user ids are "U…", or "W…" on Enterprise Grid. Bot ids are "B…".
 export const SLACK_USER_ID_RE = /^[UW][A-Z0-9]+$/
+export const SLACK_BOT_ID_RE = /^B[A-Z0-9]+$/
 
-/** Called after admission/routing: channel humans may write; DM grants stay explicit. */
+/** Called only after admission/routing: channel participants may write; DM grants stay explicit. */
 export function resolveInboundWriteEnabled(
   chatId: string,
   userId: string,
   writeAllowFrom: readonly string[],
 ): boolean {
+  if (/^[CG][A-Z0-9]+$/.test(chatId)) return SLACK_USER_ID_RE.test(userId) || SLACK_BOT_ID_RE.test(userId)
   if (!SLACK_USER_ID_RE.test(userId)) return false
-  if (/^[CG][A-Z0-9]+$/.test(chatId)) return true
   return /^D[A-Z0-9]+$/.test(chatId) && writeAllowFrom.includes(userId)
 }
 
@@ -173,6 +174,27 @@ export function isSlackBotAuthored(message: SlackReply): boolean {
     || message.bot_profile
     || message.subtype === 'bot_message',
   )
+}
+
+/** Preserve bot provenance in durable sender IDs, including replay after restart. */
+export function slackSenderId(message: SlackReply): string | undefined {
+  if (!isSlackBotAuthored(message)) {
+    return message.user && SLACK_USER_ID_RE.test(message.user) ? message.user : undefined
+  }
+  const profile = message.bot_profile as { id?: unknown } | undefined
+  const id = message.bot_id ?? profile?.id
+  return typeof id === 'string' && SLACK_BOT_ID_RE.test(id) ? id : undefined
+}
+
+export function isOwnSlackMessage(message: SlackReply, botUserId?: string, botId?: string): boolean {
+  return Boolean((botUserId && message.user === botUserId)
+    || (botId && slackSenderId(message) === botId))
+}
+
+/** Apply before any thread classifier, downloads, acknowledgement or control handling. */
+export function isSlackSenderEligible(message: SlackReply, botUserId?: string, botId?: string): boolean {
+  return Boolean(slackSenderId(message)) && !isOwnSlackMessage(message, botUserId, botId)
+    && (!isSlackBotAuthored(message) || mentionsBot(message.text ?? '', botUserId))
 }
 
 /**
@@ -479,6 +501,7 @@ export function planCatchupSweep(
   deliveredKeys: Iterable<string>,
   policy: CatchupSweepPolicy,
   botUserId: string | undefined,
+  botId?: string,
 ): SlackReply[] {
   const delivered = new Set(deliveredKeys)
   const limit = Math.max(1, Math.floor(policy.limit ?? 20))
@@ -493,10 +516,10 @@ export function planCatchupSweep(
       && message.subtype !== 'thread_broadcast') {
       return false
     }
-    if (botUserId && message.user === botUserId) return false
+    if (!isSlackSenderEligible(message, botUserId, botId)) return false
 
     const isBot = isSlackBotAuthored(message)
-    const senderId = isBot ? message.bot_id : message.user
+    const senderId = slackSenderId(message)
     if (!senderId) return false
     if (isBotDMBlocked(policy.channelType, isBot)) return false
     if (policy.channelType === 'im') return true
@@ -519,9 +542,12 @@ export function planCatchupSweep(
 export function decideThreadReplyDelivery(
   policy: ChannelPolicy | undefined,
   reply: SlackReply,
-  _botUserId: string | undefined,
+  botUserId: string | undefined,
 ): 'deliver' | 'drop-policy' {
-  if (decideChannelPolicy(policy, reply.user!, true, false) !== 'deliver') return 'drop-policy'
+  const isBot = isSlackBotAuthored(reply)
+  const senderId = slackSenderId(reply)
+  if (!senderId || decideChannelPolicy(policy, senderId,
+    isBot ? mentionsBot(reply.text ?? '', botUserId) : true, isBot) !== 'deliver') return 'drop-policy'
   // Semantic audience is intentionally not decided here. Every human channel
   // reply is passed to the durable LLM gate in server.ts before it can produce
   // any reaction, queue item, control message or attachment download.
@@ -570,13 +596,14 @@ export function planThreadPoll(
   cursorTs: string,
   policy: ChannelPolicy | undefined,
   botUserId: string | undefined,
+  botId?: string,
 ): ThreadPollPlan {
   const plan: ThreadPollPlan = {
     cursor: advanceReadCursor(replies, cursorTs),
     deliver: [],
     skipped: [],
   }
-  for (const reply of selectNewReplies(replies, cursorTs, botUserId)) {
+  for (const reply of selectNewReplies(replies, cursorTs, botUserId, botId)) {
     const verdict = decideThreadReplyDelivery(policy, reply, botUserId)
     if (verdict === 'deliver') plan.deliver.push(reply)
     else plan.skipped.push({ reply, reason: 'policy' })
@@ -602,7 +629,7 @@ export function planDirectMessageThreadPoll(
     skipped: [],
   }
   for (const reply of selectNewReplies(replies, cursorTs, botUserId)) {
-    if (reply.user && allowed.has(reply.user)) plan.deliver.push(reply)
+    if (!isSlackBotAuthored(reply) && reply.user && allowed.has(reply.user)) plan.deliver.push(reply)
     else plan.skipped.push({ reply, reason: 'policy' })
   }
   return plan
@@ -651,8 +678,8 @@ export function pruneDeliveredKeys(keys: Iterable<string>, limit: number): strin
 
 /**
  * From every reply in a thread, pick the ones the poller should deliver:
- * strictly newer than `cursorTs`, authored by a human (not the bot itself and
- * not another bot — bots reach the bridge through the live app_mention path),
+ * strictly newer than `cursorTs`, authored by a human or explicitly addressed
+ * by another bot (never by this app itself),
  * and not a system subtype (channel_join, message_changed, …). `file_share`
  * and human `thread_broadcast` are kept so uploads and “also send to channel”
  * replies in a followed thread still come through exactly once. Returned
@@ -662,16 +689,15 @@ export function selectNewReplies(
   replies: SlackReply[],
   cursorTs: string,
   botUserId: string | undefined,
+  botId?: string,
 ): SlackReply[] {
   const cursor = parseFloat(cursorTs)
   return replies
     .filter((r) => {
       if (!r.ts) return false
       if (parseFloat(r.ts) <= cursor) return false
-      if (isSlackBotAuthored(r)) return false
-      if (!r.user || !SLACK_USER_ID_RE.test(r.user)) return false
-      if (botUserId && r.user === botUserId) return false
-      if (r.subtype && r.subtype !== 'file_share' && r.subtype !== 'thread_broadcast') return false
+      if (!isSlackSenderEligible(r, botUserId, botId)) return false
+      if (r.subtype && r.subtype !== 'bot_message' && r.subtype !== 'file_share' && r.subtype !== 'thread_broadcast') return false
       return true
     })
     .sort((a, b) => parseFloat(a.ts!) - parseFloat(b.ts!))

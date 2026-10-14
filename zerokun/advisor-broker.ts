@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { captureClaudeUsage, ownedClaudeUsageSession } from './task-usage.ts'
 
 import { createHash, randomBytes, timingSafeEqual } from 'crypto'
@@ -25,14 +26,21 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
+import { GrokOAuthBrowserSession, GROK_BROWSER_ANSWERS, GROK_BROWSER_ABORT_REASONS, advisorRecoveryProgress } from './grok-oauth-browser.ts'
 import { readNativeAdvisorRegistrations, registerNativeAdvisor } from './native-advisor-recovery.ts'
+import { HostedCodexAdvisors } from './hosted-codex-advisor.ts'
+import { readPrimaryToolsContext } from './primary-tools-broker.ts'
+import { verifyOfficialCodexSnapshot } from './standalone-codex.ts'
+import { buildCodexChildEnvironment } from './codex-executor.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
-import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, sanitizeClaudeAnswer, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
+import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
+import { connectGrokChrome, driveGrokChrome, type GrokChromeControl } from './grok-oauth-chrome.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
 import { watchAdvisorStopRequest } from './advisor-settlement.ts'
+import { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
+export { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeouts.ts'
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
 import { observeProcessGeneration, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
@@ -106,7 +114,6 @@ import {
   readAdvisorInputSnapshot,
   type AdvisorInputSnapshot,
 } from './advisor-input.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import {
   advisorPerspectiveForPhase,
   threeAdvisorRepositoryDeltaDigest,
@@ -134,6 +141,7 @@ import {
   claudeReadFailure,
   claudeReadCommandFailure,
   parseClaudeStartupDiagnostic,
+  claudeStartupFailure,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
   type ClaudeDiagnosticRead,
@@ -312,9 +320,7 @@ const MAX_TRANSCRIPT_CHARS = 256 * 1024
 const MAX_OUTPUT_BYTES = 256 * 1024
 export const MAX_ADVISOR_PROMPT_BYTES = 2 * 1024 * 1024
 // Reviewer infrastructure must never hold a completed task indefinitely.
-export const GROK_REVIEW_TIMEOUT_MS = 15 * 60_000
 export const CLAUDE_REVIEW_TIMEOUT_MS = 60 * 60_000
-export const GROK_OAUTH_TIMEOUT_MS = 10 * 60 * 1_000
 export const CLAUDE_HELPER_TIMEOUT_MS = 140_000
 // Open includes Herdr's 310s process budget, startup dialogs/painting and
 // exact-workspace cleanup. The transport must not kill a valid slow startup.
@@ -554,7 +560,7 @@ export async function executeGrokPanelWithRecovery<
       return [{
         ...options.unavailable(perspective, recovery.reason),
         authenticationRecoveryAttempted: true,
-        failure: { advisor: 'grok', cause: 'auth-check' },
+        failure: { advisor: 'grok', cause: 'auth-recovery' },
       }]
     }
     authState = recovery.state
@@ -571,7 +577,8 @@ export async function executeGrokPanelWithRecovery<
   oauthAttempted = true
   const recovery = await options.runRecovery(authState)
   if (!recovery.recovered) {
-    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true }
+    outcomes[0] = { ...outcomes[0]!, authenticationRecoveryAttempted: true,
+      reason: recovery.reason, failure: { advisor: 'grok', cause: 'auth-recovery' } }
     return outcomes
   }
   outcomes[0] = {
@@ -581,6 +588,60 @@ export async function executeGrokPanelWithRecovery<
   return outcomes
 }
 
+
+export async function recoverGrokAuthentication(
+  baseline: GrokAuthState,
+  onBrowser: (browser: GrokOAuthBrowserSession | undefined) => void,
+  chromeEntrypoint?: string,
+): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> {
+  if (process.platform !== 'darwin') {
+    return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
+  }
+  const current = classifyGrokAuthState(baseline.home)
+  if (!sameGrokAuthState(baseline, current)) {
+    return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
+  }
+  let browser: GrokOAuthBrowserSession | undefined
+  let chrome: GrokChromeControl | undefined
+  try {
+    const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
+    if (chromeEntrypoint) chrome = await connectGrokChrome(chromeEntrypoint)
+    const browserAbort = new AbortController()
+    browser = new GrokOAuthBrowserSession(() => browserAbort.abort(), !!chrome)
+    const activeBrowser = browser
+    onBrowser(browser)
+    let stopped = false
+    const driving = chrome ? driveGrokChrome(browser, chrome, () => stopped) : undefined
+    let result: ProcessResult
+    try {
+      result = await runBounded([helper], {
+        cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
+        terminationGraceMs: 5_000, signal: browserAbort.signal,
+        onStdin: write => activeBrowser.connect(write), onStdout: chunk => activeBrowser.feed(chunk),
+      })
+    } finally {
+      stopped = true
+      browser.finish()
+      onBrowser(undefined)
+      await driving
+      await chrome?.close()
+      chrome = undefined
+    }
+    if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
+      || result.outputTruncated || result.stderr !== ''
+      || !grokOAuthCompletionOutput(result.stdout)) {
+      return { recovered: false, reason: browser.failureReason() ?? 'bounded Grok OAuth recovery did not complete' }
+    }
+    const after = classifyGrokAuthState(baseline.home)
+    if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
+      return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
+    }
+    return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
+  } catch (error) {
+    await chrome?.close().catch(() => {})
+    return { recovered: false, reason: browser?.failureReason() ?? `Grok OAuth recovery was unavailable: ${error}` }
+  }
+}
 
 type BrokerContext = {
   version: 4
@@ -614,6 +675,24 @@ type ProcessResult = {
   forcedCleanup: boolean
   outputTruncated: boolean
   trackingWarning?: string
+}
+
+/** Preserve host-observed failure facts without publishing raw model output. */
+export function grokFailureDiagnostics(result: Pick<ProcessResult,
+  'exitCode' | 'timedOut' | 'forcedCleanup' | 'outputTruncated' | 'stderr'>) {
+  return {
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    forcedCleanup: result.forcedCleanup,
+    outputTruncated: result.outputTruncated,
+    timeoutMs: GROK_REVIEW_TIMEOUT_MS,
+    reason: result.timedOut
+      ? `Grok reviewer exceeded its response time limit (${GROK_REVIEW_TIMEOUT_MS} ms; exit ${result.exitCode})`
+      : `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
+    failure: result.timedOut
+      ? { advisor: 'grok', cause: 'timeout' } as const
+      : classifyAdvisorFailure('grok', result.stderr),
+  }
 }
 
 type FingerprintPaths = { allow: string, deny: string }
@@ -699,8 +778,8 @@ function parseContext(pathInput: string, stateDir: string): BrokerContext {
 }
 
 function safeInput(value: string, label: string, maximum = MAX_INPUT_CHARS): string {
-  if (!value || value.length > maximum || value.includes('\0') || containsCredentialMaterial(value)) {
-    throw new Error(`${label} is empty, too large, or contains protected credential material`)
+  if (!value || value.length > maximum || value.includes('\0')) {
+    throw new Error(`${label} is empty, too large, or contains a NUL character`)
   }
   return value
 }
@@ -1266,6 +1345,7 @@ export function advisorPrompt(
       '他者へ再委任せず、指定された非秘密情報のread-only確認と独立の分析だけを返してください。',
     ]),
     '他advisorの結論は参照しないでください。',
+    PROPORTIONATE_DESIGN_INSTRUCTIONS,
     '',
     `入力revision: ${input.revision}`,
     `入力digest: ${input.digest}`,
@@ -1525,7 +1605,7 @@ export function requiredAdvisorPhases(
 async function main(): Promise<void> {
   const [
     contextInput, stateInput, runtimeInput, fingerprintAllow, fingerprintDeny,
-    phaseScopeInput = 'complete', processNonceInput, claudeLookupInput,
+    phaseScopeInput = 'complete', processNonceInput, claudeLookupInput, primaryCoreInput = 'codex',
   ] = process.argv.slice(2)
   if (!contextInput || !stateInput || !runtimeInput || !fingerprintAllow || !fingerprintDeny) {
     throw new Error(
@@ -1536,6 +1616,7 @@ async function main(): Promise<void> {
     throw new Error('advisor broker phase scope is invalid')
   }
   const phaseScope = phaseScopeInput as 'prepare' | 'review' | 'complete'
+  if (!['codex', 'claude-code'].includes(primaryCoreInput)) throw new Error('invalid advisor primary core')
   if (!processNonceInput || !/^[0-9a-f]{32}$/.test(processNonceInput)) {
     throw new Error('advisor broker process nonce is invalid')
   }
@@ -1544,6 +1625,18 @@ async function main(): Promise<void> {
   const stateDir = requireManagedStateRoot(stateInput)
   const advisorRuntimeDir = requireManagedDirectory(stateDir, runtimeInput)
   const context = parseContext(contextInput, stateDir)
+  // Parent-created, per-process capability; never infer a transport from an
+  // installed path here, since the user may have disabled it in effective config.
+  let grokChromeEntrypoint: string | undefined
+  try {
+    const capability = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(
+      join(advisorRuntimeDir, 'grok-oauth-chrome.json'), 16 * 1024) ?? 'null')
+    if (capability?.version === 1 && capability.jobId === context.jobId
+      && capability.attemptNonce === context.attemptNonce && capability.processNonce === processNonce
+      && typeof capability.entrypoint === 'string' && isAbsolute(capability.entrypoint)) {
+      grokChromeEntrypoint = capability.entrypoint
+    }
+  } catch { /* No capability: retain the official browser protocol. */ }
   if (!contained(stateDir, fingerprintAllow) || !contained(stateDir, fingerprintDeny)
     || basename(fingerprintAllow) !== 'allow' || basename(fingerprintDeny) !== 'deny'
     || dirname(fingerprintAllow) !== dirname(fingerprintDeny)) {
@@ -1555,6 +1648,22 @@ async function main(): Promise<void> {
     deny: fingerprintDeny,
   }
   const contextDigest = createHash('sha256').update(JSON.stringify(context)).digest('hex')
+  const hostedCodex = primaryCoreInput === 'claude-code' ? new HostedCodexAdvisors(
+    contextInput, context.attemptNonce, async ({ registration, onSpawn, signal }) => {
+      const tools = readPrimaryToolsContext(join(advisorRuntimeDir, 'readonly-tools.json'))
+      verifyOfficialCodexSnapshot(tools.codex)
+      const overrides = tools.permissionOverrides.map(value => value.startsWith('model=')
+        ? 'model="gpt-6-astra"' : value.startsWith('model_reasoning_effort=')
+          ? `model_reasoning_effort=${JSON.stringify(registration.reasoningEffort)}` : value)
+      return runBounded([tools.codex.physical, 'exec', '--ignore-user-config', '--ignore-rules',
+        '--json', '--skip-git-repo-check', '-C', context.repoPath,
+        ...overrides.flatMap(value => ['-c', value]), '-'], {
+        cwd: context.repoPath, env: buildCodexChildEnvironment(), onSpawn, signal,
+        stdin: `You are the independent ${registration.perspective === 'solution' ? 'solution_analyst' : 'risk_reviewer'}.\n`
+          + 'Do not perform the primary task or invoke another model/agent. Read-only; approvals are never.\n'
+          + registration.prompt,
+      })
+    }) : undefined
   const projectLayout: AdvisorProjectLayout = resolveAdvisorProjectLayout(context.repoPath)
   if (projectLayout.gitRoot !== context.gitRoot
     || JSON.stringify(projectLayout.gitRoots) !== JSON.stringify(context.gitRoots)) {
@@ -1906,8 +2015,7 @@ async function main(): Promise<void> {
           executionState: 'start-unconfirmed',
           containmentVerified: true,
           durationMs: Date.now() - startedAt,
-          reason: `Grok reviewer ended without a complete response (exit ${result.exitCode})`,
-          failure: classifyAdvisorFailure('grok', result.stderr),
+          ...grokFailureDiagnostics(result),
         }
       }
       return {
@@ -1940,47 +2048,6 @@ async function main(): Promise<void> {
   }
 
   let grokBrowserRecovery: GrokOAuthBrowserSession | undefined
-  const runGrokOAuthRecovery = async (
-    baseline: GrokAuthState,
-  ): Promise<{ recovered: boolean, reason: string, state?: GrokAuthState }> => {
-    if (process.platform !== 'darwin') {
-      return { recovered: false, reason: 'automatic Grok OAuth recovery is available only on macOS' }
-    }
-    const current = classifyGrokAuthState(baseline.home)
-    if (!sameGrokAuthState(baseline, current)) {
-      return { recovered: false, reason: 'Grok authentication state changed before OAuth recovery' }
-    }
-    try {
-      const helper = resolveDedicatedGrokOAuthHelper(baseline.home)
-      const browserAbort = new AbortController()
-      const browser = new GrokOAuthBrowserSession(() => browserAbort.abort())
-      grokBrowserRecovery = browser
-      let result: ProcessResult
-      try {
-        result = await runBounded([helper], {
-          cwd: '/', env: brokerEnvironment(), timeoutMs: GROK_OAUTH_TIMEOUT_MS,
-          terminationGraceMs: 5_000, signal: browserAbort.signal,
-          onStdin: write => browser.connect(write), onStdout: chunk => browser.feed(chunk),
-        })
-      } finally {
-        browser.finish()
-        if (grokBrowserRecovery === browser) grokBrowserRecovery = undefined
-      }
-      if (result.exitCode !== 0 || result.timedOut || result.forcedCleanup
-        || result.outputTruncated || result.stderr !== ''
-        || !grokOAuthCompletionOutput(result.stdout)) {
-        return { recovered: false, reason: 'bounded Grok OAuth recovery did not complete' }
-      }
-      const after = classifyGrokAuthState(baseline.home)
-      if (!grokAuthRecoveryTransitionIsSafe(baseline, after)) {
-        return { recovered: false, reason: 'Grok OAuth completion did not produce a safe auth transition' }
-      }
-      return { recovered: true, reason: 'Grok OAuth authentication recovered', state: after }
-    } catch (error) {
-      return { recovered: false, reason: `Grok OAuth recovery was unavailable: ${error}` }
-    }
-  }
-
   const runGrokPanel = async (
     input: AdvisorInputSnapshot,
     phase: AdvisorPhase,
@@ -1994,7 +2061,13 @@ async function main(): Promise<void> {
         perspective,
         initialAuth: classifyGrokAuthState(),
         runAttempt: value => runGrokOnce(input, phase, round, value, evidence, reviewContext),
-        runRecovery: runGrokOAuthRecovery,
+        runRecovery: baseline => {
+          let owned: GrokOAuthBrowserSession | undefined
+          return recoverGrokAuthentication(baseline, browser => {
+            if (browser) { owned = browser; grokBrowserRecovery = browser }
+            else if (grokBrowserRecovery === owned) grokBrowserRecovery = undefined
+          }, grokChromeEntrypoint)
+        },
         unavailable: unavailableGrok,
         claimRecovery: () => claimGrokOAuthRecovery(phase),
       })
@@ -2184,9 +2257,19 @@ async function main(): Promise<void> {
       diagnosticOperation = 'prompt-files'
       const continuationInput = continuingInterruptedRequest ? readAdvisorInputSnapshot(stateDir, context.jobId) : undefined
       if (uiProposal) {
-        uiWorkspace = await createClaudeUiWorkspace({ stateDir, jobId: context.jobId, proposal: uiProposal,
-          projectRoots: [context.repoPath, ...context.gitRoots] })
-        atomicWritePrivateFile(join(requestDir, 'ui-artifacts.json'), JSON.stringify(uiWorkspace))
+        try {
+          uiWorkspace = await createClaudeUiWorkspace({ stateDir, jobId: context.jobId, proposal: uiProposal,
+            projectRoots: [context.repoPath, ...context.gitRoots] })
+          const { beforeWarning, ...artifactManifest } = uiWorkspace
+          atomicWritePrivateFile(join(requestDir, 'ui-artifacts.json'), JSON.stringify(artifactManifest))
+          if (uiWorkspace.beforeWarning) cleanupWarnings.push(uiWorkspace.beforeWarning)
+        } catch {
+          // Optional proposal inputs must not prevent the independent analysis.
+          // Do not pass a rejected path or raw decoder output to the reviewer.
+          uiWorkspace = undefined
+          uiArtifacts = { status: 'unavailable', producer: 'claude-fable-5-1',
+            reason: 'GUI artifact preparation failed; Claude continued as a read-only design advisor.' }
+        }
       }
       const prompt = advisorPrompt(reviewContext, input, phase, round, evidence, uiWorkspace)
         + (continuationInput && continuationInput.digest !== input.digest
@@ -2219,6 +2302,7 @@ async function main(): Promise<void> {
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
         startupCode = parseClaudeStartupDiagnostic(opened.stdout)
+        failure = claudeStartupFailure(startupCode)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
       target = parseEphemeralClaudeOpen(opened.stdout)
@@ -2390,23 +2474,21 @@ async function main(): Promise<void> {
                       stateChangedDuringRead = true
                       break
                     }
-                    const sanitized = sanitizeClaudeAnswer(fileAnswer.response)
                     const responseMetadata = {
-                      responseSha256: createHash('sha256').update(sanitized.response).digest('hex'),
-                      responseBytes: Buffer.byteLength(sanitized.response), redacted: sanitized.redacted,
+                      responseSha256: createHash('sha256').update(fileAnswer.response).digest('hex'),
+                      responseBytes: Buffer.byteLength(fileAnswer.response), redacted: false,
                     }
                     const directory = ensureManagedDirectory(stateDir,
                       join(journalRoot, `revision-${input.revision}-${input.digest.slice(0, 16)}`))
                     const path = join(directory, `claude-answer-${diagnosticAttempt}.json`)
-                    // Keep original receipt evidence separate from the sanitized
-                    // response digest. Never persist the unredacted answer.
+                    // Preserve the original answer bytes and its receipt evidence.
                     atomicWritePrivateFile(path, JSON.stringify({ version: 1, phase, round,
                       marker, sha256: fileAnswer.sha256, bytes: fileAnswer.bytes,
-                      ...responseMetadata, response: sanitized.response }))
+                      ...responseMetadata, response: fileAnswer.response }))
                     answerArtifact = { path: relative(stateDir, path),
                       sha256: fileAnswer.sha256, bytes: fileAnswer.bytes, ...responseMetadata }
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = fileAnswer.response
+                    responseRedacted = false
                     stateChangeSeqAfter = current.state_change_seq
                     observation.outcome = 'complete'
                     diagnosticTranscript = transcript
@@ -2419,9 +2501,8 @@ async function main(): Promise<void> {
                   diagnosticTranscript = transcript
                   diagnosticTranscriptReadIndex = diagnosticReads.length - 1
                   if (completeResponse && modelStartObserved) {
-                    const sanitized = sanitizeClaudeAnswer(completeResponse)
-                    response = sanitized.response
-                    responseRedacted = sanitized.redacted
+                    response = completeResponse
+                    responseRedacted = false
                     reason = 'Claude response obtained but subsequent cleanup validation did not complete'
                     stateChangeSeqAfter = current.state_change_seq
                     break
@@ -3078,6 +3159,10 @@ async function main(): Promise<void> {
   const startRound = async ({
     phase, round, inputRevision, inputDigest, primaryEvidence, nativeAdvisors, roundTwoBasis, retryUnavailable, inputUpdateIsRecoveryOnly, reviewWorktrees, uiProposal,
   }: RoundRequest, automaticContinuation = false): Promise<ReturnType<typeof toolText>> => {
+    if (hostedCodex && (phase === 'investigation' || phase === 'review') && (round === 1 || round === 2)) {
+      try { await hostedCodex.verify(phase, round, nativeAdvisors) }
+      catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    }
     if (uiProposal && (phaseScope !== 'complete' || phase !== 'investigation' || round !== 1 || !context.writeEnabled)) {
       return toolText({ complete: false, reason: 'UI artifacts are only available in the writable workflow initial-design round' }, true)
     }
@@ -4035,6 +4120,12 @@ async function main(): Promise<void> {
       executionState: result.executionState,
       containmentVerified: result.containmentVerified === true,
       containmentStatus: result.containmentStatus,
+      durationMs: result.durationMs,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      forcedCleanup: result.forcedCleanup,
+      outputTruncated: result.outputTruncated,
+      timeoutMs: result.timeoutMs,
       processId: result.adopted === true || result.executionState === 'started-no-response'
         ? result.processId
         : undefined,
@@ -4223,6 +4314,51 @@ async function main(): Promise<void> {
       waitingForAdvisors: false, retryable: false, continuationUnavailable: true,
       nextAction: '中断した相談の自動続行を終了しました。取得済み回答と不足理由を保持し、本作業を継続してください。' })
   }
+  if (hostedCodex) {
+    server.registerTool('advisor_codex_start', {
+      description: 'Start the one independent read-only GPT-6 Astra slot for a Claude primary. Durable and idempotent: repeated calls retain the original process/outcome, never launch a replacement. Investigation uses medium effort, review uses low. Supply the same request/evidence as the external reviewers. Round 2 requires an adopted mandatory fix and an actual nonempty task-owned delta.',
+      inputSchema: {
+        phase: z.enum(['investigation', 'review']), round: z.union([z.literal(1), z.literal(2)]),
+        inputRevision: z.number().int().min(1), inputDigest: z.string().regex(/^[0-9a-f]{64}$/),
+        request: z.string().min(1).max(MAX_INPUT_CHARS), roundTwoBasis: advisorRoundInputSchema.roundTwoBasis,
+      },
+    }, async request => {
+      try {
+        const input = readAdvisorInputSnapshot(stateDir, context.jobId)
+        if (request.inputRevision !== input.revision || request.inputDigest !== input.digest) {
+          return toolText({ complete: false, staleInput: true, inputRevision: input.revision, inputDigest: input.digest }, true)
+        }
+        if (!validThreeAdvisorPhaseRound(request.phase, request.round)) throw new Error('invalid advisor phase/round')
+        if (request.round === 2) {
+          const basis = request.roundTwoBasis, first = unifiedRoundLedger('review', 1)
+          if (!basis || first.invalid || first.entries.length !== 1) throw new Error('review round 2 requires the completed first review and its mandatory-fix basis')
+          const prior = first.entries[0]!
+          if (prior.journal.status !== 'completed') throw new Error('review round 1 must be fully obtained first')
+          for (const source of basis.roundOneSources) {
+            const values = prior.journal[source]
+            if (!(Array.isArray(values) ? values : [values]).some(value => value && typeof value === 'object' && (value as any).adopted === true)) {
+              throw new Error('round 2 cited an unadopted source')
+            }
+          }
+          const baseline = readReviewDeltaBaseline(prior.input)
+          if (!baseline) throw new Error('review round 1 repository baseline unavailable')
+          const extra = baseline.snapshot.gitRoots.filter(root => !projectLayout.gitRoots.includes(root))
+            .map(root => relative(projectLayout.projectPath, root))
+          const current = extra.length ? snapshotAdvisorReviewWorktrees(projectLayout, extra) : snapshotAdvisorRepository(projectLayout)
+          const delta = summarizeAdvisorTaskOwnedFixChanges(baseline.snapshot, current, basis.taskOwnedFixPaths)
+          if (!delta.changed || delta.layoutChanged || delta.repositories.length === 0) throw new Error('round 2 has no observed task-owned fix delta')
+        } else if (request.roundTwoBasis) throw new Error('round-two basis is only valid for review round 2')
+        return toolText(await hostedCodex.start({ ...request, contextPath: contextInput, attemptNonce: context.attemptNonce }))
+      } catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    })
+    server.registerTool('advisor_codex_poll', {
+      description: 'Wait for the original hosted GPT slot. Return nativeAdvisors verbatim to advisor_round. Polling never repeats an attempted launch or changes its original question.',
+      inputSchema: { phase: z.enum(['investigation', 'review']), round: z.union([z.literal(1), z.literal(2)]) },
+    }, async ({ phase, round }) => {
+      try { return toolText(await hostedCodex.poll(phase, round, 30_000)) }
+      catch (error) { return toolText({ complete: false, reason: String(error) }, true) }
+    })
+  }
   server.registerTool('advisor_native_prepare', {
     description: 'Before spawning the native GPT slot, durably register its original request. Repeated calls return the SAME taskName, prompt and input binding; never spawn a duplicate after interruption.',
     inputSchema: {
@@ -4231,6 +4367,7 @@ async function main(): Promise<void> {
       request: z.string().min(1).max(MAX_INPUT_CHARS),
     },
   }, async request => {
+    if (hostedCodex) return toolText({ complete: false, reason: 'Claude primary uses advisor_codex_start/poll for its one GPT slot.' }, true)
     try {
       const input = readAdvisorInputSnapshot(stateDir, context.jobId)
       if (request.inputRevision !== input.revision || request.inputDigest !== input.digest) {
@@ -4248,11 +4385,12 @@ async function main(): Promise<void> {
 
   server.registerTool('advisor_grok_oauth_respond', {
     description: 'Reply once to the current Grok OAuth browser request returned by advisor_round_poll. Use official Chrome control to observe only opaque tab IDs until authorization UI verification is requested. Never pass URLs, credentials, tab contents or input values. Reuse the existing OAuth flow; never start another login.',
-    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS) },
-  }, async ({ requestId, answer }) => {
+    inputSchema: { requestId: z.string().uuid(), answer: z.enum(GROK_BROWSER_ANSWERS), abortReason: z.enum(GROK_BROWSER_ABORT_REASONS).optional() },
+  }, async ({ requestId, answer, abortReason }) => {
     try {
       if (!grokBrowserRecovery) throw Error('Grok browser recovery is not active')
-      await grokBrowserRecovery.respond(requestId, answer)
+      if (grokBrowserRecovery.pending()?.hostManaged && answer !== 'abort') throw Error('Host-managed browser recovery accepts only cancellation from the model')
+      await grokBrowserRecovery.respond(requestId, answer, abortReason)
       return toolText({ accepted: true, nextAction: '同じadvisor roundをpollして次の状態を確認してください。' })
     } catch (error) { return toolText({ accepted: false, reason: String(error) }, true) }
   })
@@ -4477,6 +4615,11 @@ async function main(): Promise<void> {
   })
 
   await server.connect(new StdioServerTransport())
+  if (hostedCodex) {
+    const stopHosted = () => { void hostedCodex.close().then(() => { process.exit(0) }, () => { process.exit(1) }) }
+    server.server.onclose = stopHosted
+    process.once('SIGTERM', stopHosted); process.once('SIGINT', stopHosted)
+  }
   // The parent may resume without issuing another advisor tool call. A
   // retired unsent slot is still this same consultation, so continue it when
   // its broker is recreated. Never require the LLM to remember a retry flag.

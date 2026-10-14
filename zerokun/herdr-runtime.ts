@@ -71,7 +71,7 @@ const HERDR_RUNTIME_KEYS = [
   'socketInode', 'paneId', 'tabId', 'terminalId', 'workspaceId',
 ] as const satisfies ReadonlyArray<keyof HerdrRuntimeIdentity>
 
-function parseHerdrRuntimeIdentity(value: unknown): HerdrRuntimeIdentity {
+export function parseHerdrRuntimeIdentity(value: unknown): HerdrRuntimeIdentity {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('pinned Herdr runtime identity is invalid')
   }

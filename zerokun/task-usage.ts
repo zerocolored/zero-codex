@@ -67,6 +67,10 @@ export class CodexUsageTracker {
     else if (event.method !== 'turn/started') return
     this.persist?.(this.document(false))
   }
+  setModel(model: string): void {
+    if (!MODEL.test(model)) throw Error('invalid usage model')
+    this.model = model
+  }
   markPartial(): void { this.partial = true }
   document(closed: boolean): UsageDocument {
     return { version: 1, provider: 'codex', closed, partial: this.partial, turns: [...this.turns.values()] }

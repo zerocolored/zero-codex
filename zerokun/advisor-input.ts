@@ -177,7 +177,7 @@ export function readAdvisorInputSnapshot(
     const snapshot = db.transaction(() => {
       const job = db.query<JobInputRow, [string]>(
         `SELECT id, message_id, user_id, write_enabled, task, attachments_json, input_revision
-         FROM jobs WHERE id = ? AND runtime = 'codex'`,
+         FROM jobs WHERE id = ? AND runtime IN ('codex', 'claude-code')`,
       ).get(jobId)
       if (!job) throw new Error(`advisor input job is missing: ${jobId}`)
       const controls = db.query<ControlInputRow, [string]>(

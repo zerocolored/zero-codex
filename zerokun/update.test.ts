@@ -32,6 +32,7 @@ import {
   fastForwardRepositories,
   nativeExecutableHeaderSupported,
   preflightRepositories,
+  publishReleaseCommands,
   processGroupCleanupIsUncertain,
   processStateIsAlive,
   resolveSetupTimeoutMs,
@@ -574,6 +575,57 @@ function spawnStandaloneSetup(
 }
 
 describe('updater helpers', () => {
+  test('release公開は旧checkoutのzerokun-statusも更新し再更新でも最新版を使う', () => {
+    const home = fixtureDir()
+    const bin = join(home, '.local', 'bin')
+    mkdirSync(bin, { recursive: true })
+    const status = join(bin, 'zerokun-status')
+    const old = join(home, 'old-checkout', 'zerokun', 'status.ts')
+    mkdirSync(dirname(old), { recursive: true })
+    writeFileSync(old, 'throw new Error("unsupported old config")\n')
+    symlinkSync(old, status)
+    expect(Bun.spawnSync([process.execPath, status], { stderr: 'pipe' }).exitCode).not.toBe(0)
+    for (const version of ['first', 'second']) {
+      const root = join(home, version)
+      mkdirSync(join(root, 'zerokun'), { recursive: true })
+      writeFileSync(join(root, 'codex-channel.sh'), '#!/bin/sh\n')
+      writeFileSync(join(root, 'zerokun', 'status.ts'), `console.log('${version}')\n`)
+      publishReleaseCommands({ version: 1, sha: 'a'.repeat(40), path: root }, home)
+      const child = Bun.spawnSync([process.execPath, status], { stdout: 'pipe', stderr: 'pipe' })
+      expect(child.exitCode).toBe(0)
+      expect(child.stdout.toString().trim()).toBe(version)
+      for (const name of ['zerochan', 'zerokun', 'codex-channel']) {
+        expect(realpathSync(join(bin, name))).toBe(realpathSync(join(root, 'codex-channel.sh')))
+      }
+    }
+  })
+  test.each(['missing', 'dangling'])('release公開は未設置のstatusを修復する: %s', kind => {
+    const home = fixtureDir()
+    const bin = join(home, '.local', 'bin')
+    mkdirSync(bin, { recursive: true })
+    const status = join(bin, 'zerokun-status')
+    if (kind === 'dangling') symlinkSync(join(home, 'removed', 'zerokun', 'status.ts'), status)
+    const root = join(home, 'release')
+    publishReleaseCommands({ version: 1, sha: 'a'.repeat(40), path: root }, home)
+    expect(readlinkSync(status)).toBe(join(root, 'zerokun', 'status.ts'))
+  })
+  test.each(['regular', 'foreign-link'])('release公開は無関係なstatusを保持し既存commandも切り替えない: %s', kind => {
+    const home = fixtureDir()
+    const bin = join(home, '.local', 'bin')
+    mkdirSync(bin, { recursive: true })
+    const old = join(home, 'codex-channel.sh')
+    writeFileSync(old, '#!/bin/sh\n')
+    symlinkSync(old, join(bin, 'zerochan'))
+    const status = join(bin, 'zerokun-status')
+    const foreign = join(home, 'status.ts')
+    writeFileSync(foreign, 'unrelated')
+    if (kind === 'regular') writeFileSync(status, 'unrelated')
+    else symlinkSync(foreign, status)
+    expect(() => publishReleaseCommands({ version: 1, sha: 'a'.repeat(40), path: join(home, 'release') }, home)).toThrow()
+    expect(readFileSync(status, 'utf8')).toBe('unrelated')
+    expect(readlinkSync(join(bin, 'zerochan'))).toBe(old)
+    expect(existsSync(join(bin, 'zerokun'))).toBe(false)
+  })
   test('service readiness ignores upgrade metadata but requires the freshly created terminal', () => {
     const fixture = updaterFixture()
     const identity = requireHerdrRuntime(serviceUpdaterEnvironment(fixture, 'generation-change'))

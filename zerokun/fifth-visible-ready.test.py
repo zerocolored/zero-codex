@@ -1,5 +1,7 @@
 import runpy
 import unittest
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -119,6 +121,79 @@ class VisibleReadyTests(unittest.TestCase):
         self.m['_settle_visible_ready']('owned', {})
         self.assertEqual(self.keys, [])
 
+    def test_owned_cwd_and_closed_placeholder_are_not_interactive_requests(self):
+        root = '/tmp/password-manager/approved-project'
+        for screen in ['Claude Code v2.1.295\n ▝▝   ▝▝   …/password-manager/approved-project\n❯',
+                       '❯ Try "approve payment changes"',
+                       'Update installed · Restart to update\n❯']:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            self.m['_settle_visible_ready']('owned', {'project_root': root})
+        self.assertEqual(self.keys, [])
+        for screen in ['…/password-manager/foreign\n❯',
+                       'Payment required /tmp/password-manager/approved-project\n❯',
+                       '❯ Try "hello"\nPassword:',
+                       '❯ Try "hello\nSign in\n❯ Continue',
+                       '❯ Try "hello\nSign in"',
+                       '❯ Try "hello\nSign in\nto continue"']:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            with self.assertRaises(self.m['UnsafeRequest']):
+                self.m['_settle_visible_ready']('owned', {'project_root': root})
+        self.assertEqual(self.keys, [])
+
+    def test_actual_blocking_ui_records_fixed_category_without_screen_content(self):
+        for label, code in [('Sign in', 'authentication-ui'), ('Rate limit reached', 'rate-limit-ui'),
+                            ('Payment required', 'billing-ui'), ('Approve access', 'prohibited-ui')]:
+            self.g['_read_visible'] = lambda _, text=label: text + '\nprivate-account-value\n❯'
+            with self.assertRaises(self.m['UnsafeRequest']) as caught:
+                self.m['_settle_visible_ready']('owned', {})
+            self.assertEqual(self.m['_startup_failure_code'](caught.exception), code)
+            self.assertNotIn('private-account-value', str(caught.exception))
+        self.assertEqual(self.keys, [])
+
+    def test_owned_cwd_is_excluded_consistently_in_trust_and_effort_dialogs(self):
+        root = '/tmp/password-manager/project'
+        header = 'shell> cd ' + root + '\nClaude Code v2.1.295\n ▝▝   ▝▝   …/password-manager/project\n'
+        trust = ('Accessing workspace:\n' + root + '\nExplanation\n'
+                 '❯ Yes, I trust this folder\nNo, exit\nEnter to confirm · Esc to cancel')
+        blocked = {'state_change_seq': 1, 'agent_status': 'blocked', 'launch_pending': True}
+        ready = {'state_change_seq': 2, 'agent_status': 'idle', 'interactive_ready': True}
+        for dialog in [trust, self.effort]:
+            self.keys.clear()
+            states = iter([blocked] * 2 + [ready] * 2)
+            frames = iter([header + dialog] * 2 + [header + '❯'] * 2)
+            self.g['_agent_information'] = lambda _: ({}, next(states))
+            self.g['_read_visible'] = lambda _: next(frames)
+            self.m['_settle_visible_ready']('owned', {'project_root': root})
+            self.assertEqual(self.keys, [['agent', 'send-keys', 'owned', 'Enter']])
+        for dialog in [trust.replace(root, '/tmp/foreign'),
+                       self.effort.replace('❯ Keep xhigh', 'Keep xhigh')]:
+            self.assertEqual(self.m['_startup_screen_state'](header + dialog + '\n❯', root)[0], 'unrecognized-screen')
+
+    def test_home_abbreviated_cwd_does_not_hide_surrounding_payment_request(self):
+        root = str(Path.home() / 'dev/payment-service')
+        short = '~/dev/payment-service'
+        for display in [root, short]:
+            self.assertEqual(self.m['_startup_screen_state']('shell> cd ' + display + '\n❯', root)[0], 'empty-prompt')
+            self.assertEqual(self.m['_startup_screen_state']('Payment required ' + display + '\n❯', root),
+                             ('prohibited-ui', 'billing-ui'))
+
+    def test_uuid_containing_2fa_is_not_a_two_factor_authentication_dialog(self):
+        # The incident's project UUID contained 2fa, but its original screen
+        # was not retained. Synthetic shell/cwd text reproduces this mechanism.
+        root = '/tmp/workspaces/00000000-0000-4000-8000-2faaaaaaaaaa/project'
+        for screen in ['shell> cd ' + root + '\nClaude Code v2.1.295\n❯',
+                       'Claude Code v2.1.295\n' + root + '\n' + self.effort]:
+            frames = iter([screen] * 2 + ['❯'] * 2)
+            self.g['_read_visible'] = lambda _: next(frames)
+            self.m['_settle_visible_ready']('owned', {'project_root': root})
+        self.assertEqual(self.keys, [['agent', 'send-keys', 'owned', 'Enter']])
+        self.keys.clear()
+        for label in ['2FA required', 'MFA code', 'Enter token', 'Provide credentials']:
+            self.g['_read_visible'] = lambda _, text=label: text + '\n❯'
+            with self.assertRaises(self.m['UnsafeRequest']):
+                self.m['_settle_visible_ready']('owned', {'project_root': root})
+        self.assertEqual(self.keys, [])
+
     def test_trust_lingering_after_confirmation_is_never_confirmed_twice(self):
         trust = ('Accessing workspace:\n/tmp/project\nNew explanation\n'
                  '❯ 1. Yes, I trust this folder\n2. No, exit\nEnter to confirm · Esc to cancel')
@@ -223,6 +298,74 @@ class ShellReadyTests(unittest.TestCase):
         self.assertFalse(validate(base + ['--add-dir=' + directory, '--add-dir=/Users'], directory))
         command = self.m['_claude_start_command']('owned', 'w1:p1', directory)
         self.assertEqual(command[-1], '--add-dir=' + directory)
+
+
+class RunningExecutableTests(unittest.TestCase):
+    def test_self_update_keeps_running_identity_but_replacement_or_bad_argv_fails(self):
+        m = runpy.run_path(str(Path(__file__).with_name('fifth-advisor.py')), run_name='test')
+        g = m['_process_receipt'].__globals__
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            old, new, lookup = root / 'claude-old', root / 'claude-new', root / 'claude'
+            for binary in [old, new]:
+                binary.write_text('#!/bin/sh\nexit 0\n')
+                binary.chmod(0o700)
+            lookup.symlink_to(old)
+            previous_path = os.environ.get('PATH', '')
+            previous_pin = os.environ.get('ZEROKUN_CLAUDE_BIN_PATH')
+            os.environ['PATH'] = str(root)
+            os.environ['ZEROKUN_CLAUDE_BIN_PATH'] = str(lookup)
+            try:
+                argv = [str(old), *m['CLAUDE_ARGUMENTS']]
+                process = {'pid': 111, 'argv': argv, 'argv0': str(old)}
+                inventory = {'shell_pid': 110, 'process_group_id': 111,
+                             'process_ids': [110, 111], 'processes': [process]}
+                g['_process_inventory'] = lambda _: inventory
+                recorded = m['_process_receipt']({})
+                def update(_):
+                    lookup.unlink()
+                    lookup.symlink_to(new)
+                g['time'] = SimpleNamespace(monotonic=lambda: 0, sleep=update)
+                # A self-update between the two ready observations keeps the
+                # first launch identity instead of rejecting its old argv.
+                settled = m['_settled_process_receipt']({})
+                self.assertTrue(m['_same_owned_process_identity'](settled, recorded))
+                g['time'] = SimpleNamespace(monotonic=lambda: 0, sleep=lambda _: None)
+                # Also cover the updater running before the first observation:
+                # open retained the executable identity before agent start.
+                settled = m['_settled_process_receipt']({}, recorded['executable'])
+                self.assertTrue(m['_same_owned_process_identity'](settled, recorded))
+                lookup.unlink()
+                lookup.symlink_to(new)
+                observed = m['_process_receipt']({}, recorded)
+                self.assertTrue(m['_same_owned_process_identity'](observed, recorded))
+                self.assertEqual(observed['executable']['resolved_path'], str(old))
+                # A new launch still resolves the updated binary normally.
+                process['argv'] = [str(new), *m['CLAUDE_ARGUMENTS']]
+                process['argv0'] = str(new)
+                self.assertEqual(m['_process_receipt']({})['executable']['resolved_path'], str(new))
+                with self.assertRaises(m['UnsafeRequest']):
+                    m['_process_receipt']({}, recorded)
+                process['argv'], process['argv0'] = argv, str(old)
+                for key, value in [('shell_pid', 210), ('process_group_id', 211)]:
+                    original = inventory[key]
+                    inventory[key] = value
+                    with self.assertRaises(m['UnsafeRequest']):
+                        m['_process_receipt']({}, recorded)
+                    inventory[key] = original
+                process['pid'] = 211
+                with self.assertRaises(m['UnsafeRequest']):
+                    m['_process_receipt']({}, recorded)
+                process['pid'] = 111
+                process['argv'] = argv + ['--model=foreign-model']
+                with self.assertRaises(m['UnsafeRequest']):
+                    m['_process_receipt']({}, recorded)
+            finally:
+                os.environ['PATH'] = previous_path
+                if previous_pin is None:
+                    os.environ.pop('ZEROKUN_CLAUDE_BIN_PATH', None)
+                else:
+                    os.environ['ZEROKUN_CLAUDE_BIN_PATH'] = previous_pin
 
 
 if __name__ == '__main__':

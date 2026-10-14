@@ -43,7 +43,7 @@ Slack bot
   Slackの再送がなくても常駐workerがbackoff後に再判定して既存フローを再開します。
 - 論理履歴の永続archive自体をscopeごとの直近64 jobに圧縮し、省略件数だけを台帳へ残します。
   各実行snapshotも直近64 job blockかつ128 Ki文字／256 KiBまでです。現在の依頼とhost権限が常に優先され、
-  過去の回答は参考情報として再確認されます。credential、local path、内部ID、成果物pathは保存前に除去し、
+  過去の回答は参考情報として再確認されます。本文・URL・path・IDは書き換えず、成果物タグとhost制御metadataだけを分離し、
   添付はSlackスレッドへ永続的にひも付け、同じスレッドの継続・失敗後の再開・Codex sessionの
   rotation・zerochan再起動後にも、検証済みの同一ファイルを読み取り専用で再利用します。導入前にすでに30日GCされた
   jobは復元できません。
@@ -68,13 +68,14 @@ Slack bot
   受付には`eyes`、正常完了時には元メッセージへ`white_check_mark` reactionを付けます。本文は
   Slackアシスタントとして一人称の簡潔で温かい日本語と自然な絵文字1〜2個を使い、固定の表示名や
   質問や回答に含まれる製品名・実装名を理由に、回答を削除したり非公開の定型文へ置き換えたりしません。
-  APIキーなどの認証情報、実行環境のパス・内部IDの保護は維持します。
+  依頼・回答に含まれる認証情報らしい表現、URL、path、IDは、内容パターンで拒否・伏字にしません。
 - Codex 子プロセスには Slack token や任意の親process環境を渡しません。Slack 投稿は gateway/runner の bot 経路だけです。
 - 起動時のHerdr socket・pane・terminal・workspaceを固定し、job開始前に同じidentityを再検証します。
   staleなHerdr環境ではCodexを起動しません。
 - job開始時に同じHerdr workspaceへ非フォーカスの`Zeroちゃん #<queue>`監視tabを1つ作り、実行中の
-  開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。生のJSON-RPC、コマンド全文、
-  絶対path、内部ID、認証情報は表示せず、診断用stdout/stderrだけをowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
+  開始・調査・テスト・レビュー・完了を人が読める日本語タイムラインで表示します。command eventはカテゴリで示し、
+  commentary内のURL・path・ID・技術例は内容判定で書き換えません。端末制御文字と表示長だけを制限します。
+  診断用stdout/stderrはowner-onlyの`job-logs`へ保存します。監視tab内でCodexを
   再起動することはなく、rate-limit再開中は
   同じtabを保持します。正常完了と中止ではCodexとその所有processの終了・SQLite terminal確定後に
   自動で閉じます。通常失敗では、安全な固定分類の原因と最終出力を表示してtabを確認用に残します。
@@ -94,9 +95,13 @@ Slack bot
 - 新規依頼にはメインCodexの標準Goalを設定します。途中の回答だけでは終了せず、Goalがactiveの間は
   App Serverの自動継続ターンを追跡します。同じ未完了スレッドの再開では目標と使用履歴を保持します。
   判断・認証・権限などが必要な待機は未完了として通知し、完了リアクションを付けません。
+  待機終了時は同じ入力revisionへの説明と訂正を保持し、最後の待機文だけで置き換えません。
+  異なる入力revisionの回答や撤回済みの添付は混ぜず、正常完了時は最終報告を優先します。
   停止指示とレート制限は従来の処理を維持します。Goalは依頼範囲を広げる許可ではありません。
-  Claude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
-- 設定済みチャンネルの人間の参加者は、個別登録なしでrepository・`.git` writeとネットワークを使えます。
+  advisorのClaude・Grok・補助CodexにはGoalを設定せず、更新候補の検証でも有効化しません。
+- 設定済みチャンネルの人間の参加者と、Zeroちゃんを明示メンションした他のBotは、
+  個別登録なしでrepository・`.git` writeとネットワークを使えます。Botは添付付き投稿にも対応し、
+  所有済みスレッドでも毎回明示メンションが必要です。自己投稿とBot DMは受け付けません。
   DMだけは`writeAllowFrom`の明示許可が必要です。Mac全体のsandboxは解除しません。
 - write許可されたWebタスクでは、primary Codexへ利用可能なBrowser／Chrome能力を渡し、localhostだけでなく
   依頼対象の公開HTTPS環境も実際に開いて確認できます。設定済みの`go-chrome-mcp`は起動時に取得した
@@ -110,16 +115,16 @@ Slack bot
   操作には明示的な`tabId`が必要です。同じタブはjob間で予約し、Chrome操作も直列化します。
   作業終了時は`release_tab`で予約を解除します。スクリーンショットは画像として受け取り、
   browser toolからhostの任意pathへ保存することはできません。
-  Chrome拡張との接続にはhost側の既存bridgeを使いますが、Codex shellのHOMEはjob scratchへ隔離したままです。
+  Chrome拡張との接続にはhost側の既存bridgeを使いますが、書込みprimaryのCodex shellは通常のHOME・XDG設定探索先を引き継ぎます。read-only段は隔離したままです。
   それ以外の一般MCPは無効のままです。localhost用には
   `verify_local_page`も残し、署名済みGoogle Chromeをowner-onlyの一時profileで起動して、明示したorigin以外の
   HTTP/WebSocketを遮断します。HTTP 2xx、描画後DOMの期待文字列、1280×720 PNG、遮断request数、
   Chrome子processと一時profileの回収をまとめて返します。
   UI/UX承認前は製品repositoryを書き換えず、現在画面とscratch内だけの提案画面を撮影します。画像は
   完全decode後にpixel-bearing chunkだけへ再封印し、metadataとローカルpathをSlackへ持ち出しません。
-- advisorを使用する設計・レビューでは、GPT・Grok・Claudeの3回答取得が必須です。GrokとClaudeには
+- advisorを使用する設計・レビューでは、GPT・Grok・Claudeの3枠を試行します。GrokとClaudeには
   認証情報をモデルへ渡さない`zerokun_advisors` transportを提供します。
-  各phaseの実測状態を返し、欠員は成功扱いせず未完了で復旧します。
+  各phaseの実測状態を返し、取得できた回答と欠員の理由を保持して本作業を継続します。
   秘密・credential・個人情報をSlack依頼へ貼り付けないでください。
 - Socket Mode 停止中の DM・メンションと、採用済みスレッドの未メンション返信を履歴から回収します。
 
@@ -320,6 +325,14 @@ zerochan start
 別Appならキューと稼働状態は分離しますが、同じOSユーザーのCodex・Claude・Grok認証や
 利用上限は別枠になりません。別PCではそのPC用のAppを登録してください。
 
+このプロジェクトだけSlackから切り離すには `zerochan unset slack-app` を実行します。
+アプリ・チャンネルの紐付けを解除し、既存スレッドやDMを含む新規依頼の受付を停止します。
+受付済みの作業・結果通知・その作業の停止操作は継続し、アプリ登録・トークン・履歴・他のプロジェクトは保持します。
+`zerochan status` は「未設定（解除済み）」になります。再接続は `zerochan set slack-app` →
+`zerochan set slack-channel <channel-id>` の順です。解除中の投稿は再接続後も実行しません。
+以前このプロジェクトを担当したアプリも含め、古い実行版が残る場合は先に該当アプリを `zerochan update` で更新してください。
+解除が中断した場合は `zerochan unset slack-app` の再実行で復旧できます。
+
 `zerochan update` は同じソースを使う登録済みAppの作業終了を待ち、まとめて更新します。
 起動中は既定で30分ごとにリモートの `main` を確認し、更新があれば同じ更新処理を自動実行します。
 実行中の作業は中断せず、更新中に届いた依頼はキューへ保持し、再起動後に再開します。
@@ -473,9 +486,51 @@ symlink、Gitではない直下項目は作業対象に含めません。
 Codexは変更せず回答し、公開依頼なら他者の未commit作業を保持したまま必要なrepositoryだけを操作します。
 Zeroちゃんはmember境界をpermissionへ反映しますが、対象選択、review、publication planを上書きしません。
 
-`zerochan start` はHerdr外からの起動を拒否します。引数やexportは不要です。実行した物理directoryを
+主担当はprojectごとに選択できます。未設定時は従来どおりCodexです。
+
+```bash
+zerochan set core          # 対話で選択
+zerochan set core claude   # Claude Code（最新Opus）
+zerochan start             # 起動確認後、新規依頼へ反映
+zerochan status            # 設定した担当と新規依頼の担当を確認
+zerochan set core codex    # Codexへ戻す場合も、その後start
+```
+
+設定変更前に受付済みのジョブは元の担当で続行します。Claude Codeモードでは、Herdrに専用tabを
+1つ作り、Claude自身が主担当として進めます。新規タスクはClaudeの`opus` aliasを解決し、実際の
+モデル名を保存してタスク中の再開にも使います。CodexとClaudeの会話sessionは混用しません。
+Claudeの利用可能なsubscription認証を起動時に確認し、未認証の場合はstartを終了して現在の担当を保持します。
+Codex CLIは実行sandboxと独立GPTレビューにも使うため、Claudeモードでも必要です。
+主担当の設定は`.zerochan/primary-core.json`へ保存し、既存のチャンネル設定形式は変更しません。
+
+Claude CodeモードでUnityプロジェクトを扱う場合は、ホスト側の
+`zerokun_runtime.unity_editor`（`open` / `status`）でEditorを起動し、公式Unity MCPの
+`editor_status`応答まで確認します。対象は現在のprojectに固定され、任意のコマンド、別project、
+project内の`.mcp.json`をホスト権限で実行する機能ではありません。
+ただし通常のUnity起動と同様、project内のEditorスクリプトやパッケージのコードは
+Editorのホスト権限で実行されます。依頼で許可されたproject作業に限って使用します。
+macOSのUnity Hub標準配置にある、ProjectVersion.txtと一致するUnity署名済みEditorと、
+導入済みのUnity署名済みCLIを使います。未導入Editorの自動インストールやversion変更はしません。
+通常のshell sandboxにはUnityのライセンス／Package Manager／GUI通信を開放せず、
+この起動経路だけを分離しています。読取り専用依頼・割込み質問には公開しません。
+初回の規約同意や本人loginは本人操作が必要です。起動したEditorはjob終了後も開いたままで、
+既存Editorをこのツールから終了させることはありません。Codexモードの設定は変わりません。
+旧版のrunnerが稼働中の場合は、現在のサービスを保持して起動を終了します。更新後に再起動してから設定を反映してください。
+基準タグへ戻す場合は、受付済みのClaudeジョブを完了または取消し、`zerochan set core codex`、`zerochan stop`を実行してから旧版へ切り替えてください。
+設計・最終レビューのGPT・Fable 5.1・Grokの3枠、Slackの通知と成果物配信は両モードで共通です。
+レビュー基盤の障害だけで主担当の作業を停止せず、取得結果と不足理由を保持します。
+
+`zerochan start` はHerdr外から実行すると専用workspaceを作って引き継ぎます。引数やexportは不要です。実行した物理directoryを
 対象projectとして、現在のHerdr workspaceへ新しい `Zeroちゃん runtime` tabを作り、gatewayとrunnerの
-安定起動を確認して元のterminalへ戻ります。既に正常稼働中なら何も入れ替えません。
+安定起動を確認して元のterminalへ戻ります。既に正常稼働中ならprocessを入れ替えず、主担当の設定を新規依頼へ反映します。
+
+正常に起動した接続は、このMacにApp単位で保存します。Macを再起動して同じユーザーでログインすると、
+watchdogがHerdrとZeroちゃんを自動復旧します（ログイン前は起動しません）。同じSlack Appを使うprojectは
+1つのgatewayを共有し、保存済みchannel設定で再接続します。`zerochan stop`、`stop --force`、
+Ctrl-Cで意図的に停止したAppは自動再開しません。再開する場合は`zerochan start`を実行してください。
+ネットワーク未接続やprojectのdisk未接続は、起動履歴を消さずに約1分ごとの監視で再試行します。
+最後に起動したprojectが使えない場合は、同じAppで起動済みの別projectから復旧します。
+標準のHerdr sessionは自動起動できます。独自socket pathを使うHerdrは、そのserver側の起動設定も必要です。
 
 runtime log tabを作り直す場合は `zerochan stop` → `zerochan start` を使います。`stop`はrunnerの
 新規job取得を止めてから実行中jobが0件であることを再確認し、実行中ならprocessへsignalせず拒否します。
@@ -575,22 +630,28 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - Codex 0.149.0+ の named permission profile を使います。書込み許可済みの主実行は、
   通常のhost読取り、対象repositoryへの書込み、OSの一時領域を許可します。
   実行ファイル・SDKの配置先ごとの読取りallowlistは使いません。読取り専用工程は
-  従来のminimal runtimeのままです。Zeroのstate、他アプリのSlack登録領域、Codex設定領域は保護します。
+  従来のminimal runtimeのままです。主担当にはOSの読取り隔離を追加せず、秘密の取得・表示禁止と
+  基底profileでのstate等への書込み制限を維持します。
 - read senderはrepository readのみ、write senderだけrepository・`.git` writeとnetworkを許可し、
-  どちらも `-a never` で対話的な権限昇格を行いません。
+  read-only段は `never`、書込み主担当は `on-request` / `auto_review` でCodex標準の権限審査を使います。
 - host runtimeをSlack経由で書き換えられないよう、Zeroちゃん自身のrepositoryへのwrite jobは拒否します。
-  Codex shellのHOME/TMPDIRはjob scratchへ隔離し、commitには固定の中立identityを使います。
+  書込みprimaryのshellは通常のHOME・XDG設定探索先を使い、TMPDIRはジョブ専用に分離します。read-only段のHOMEはscratchへ隔離し、commitには固定の中立identityを使います。
   GitHub認証はrepository限定brokerへ渡します。書込み許可済み主担当のCloud操作は通常のgcloudを使い、
   SDKと既存Cloud SDK設定だけを追加許可します（認証cache更新のため設定directoryはwrite）。
   主実行のhost読取りにはHOME内の通常設定も含みますが、HOME全体への書込みや認証情報のコピーは行いません。
   このCLI経路は同じshellからoperatorのcredentialを隔離する方式ではありません。
+  HOME・XDG探索先を復元し、設定更新は対象pathの追加許可、OS認証ストアは正規CLIのnative escalationで扱います。
 - 通常cloneに加え、Gitの登録・back pointer・gitlink・`core.worktree`を検証できる正規の
   linked worktree/submoduleを許可します。偽の`.git` pointerは拒否します。読取り専用工程にはHOMEを公開しません。
   brokerはlogin済み`gh`をcredential helperとして使い、
   current projectのcanonical `github.com` repositoryだけを操作します。作業判断はCodexが行います。
 - App Serverは認証済み`CODEX_HOME`を使うためuser configも読みます。そのため起動直前の
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
-  primary model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から上書きして実効値を照合し、
+  プロセスの既定model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から設定します。
+  タスク本文での明示モデル指定は独立LLMで判定し、言い間違いと旧版名も意図した系列の最新版へ解決し、取得したモデル一覧と照合・保存した値をthread/turnへ渡します。
+  `keep going`や「続けて」だけの継続入力は独立LLMを起動せず、保存済みモデル（未指定ならAstra）を引き継ぎます。追加の指定を含む入力は全文を判定します。
+  引用や比較だけでは変更せず、曖昧・非対応・判定失敗では別モデルへ自動フォールバックしません。未解決の指定は保持し、判定が一時的に失敗した場合は次の継続時に元の入力を再判定します。診断には入力や生のエラーを含めず固定の失敗種別を残します。
+  thread開始・再開時にも実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
 - Codexが返す`instructionSources`を照合し、存在するglobal `AGENTS.md`とproject
@@ -601,13 +662,21 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - apps・plugins・hookと一般MCPは無効化し、localhost表示確認用`zerokun_browser`、認証情報を
   隠したGitHub transport用`zerokun_github`、ログ取得用`zerokun_cloud_logging`、およびoperatorが設定済みの検証済みChrome transportだけを
   必要なwrite jobで有効にします。
-  Web検索はwrite許可jobだけに限定し、write jobのcommand networkはproxyを通してSlack関連domainを拒否します。
+  Web検索はwrite許可jobだけに限定します。書込みprimaryのcommand networkはproxyを通し、Zeroちゃん独自のサービス別domain制限は重ねません。
+  read-only／review工程の通信制限と、依頼のないSlack直接送信の禁止は維持します。
+- 書込みprimaryから起動するnative Codex子エージェントは親の権限を引き継ぎます。
+  roleの`read-only`／`never`指定だけでは、ホストHOME・private stateのOS読取り隔離を保証しません。
+  別プロセスで起動するread-only工程・review工程と外部advisorには、それぞれの隔離設定を適用します。
+  認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更の禁止はnative子にも適用します。
 - 通常の受付・開始はリアクションのみです。ただし、先行作業による待機通知を送信済みの依頼は、
   実行開始時に同じSlackスレッドへ「作業を開始しました。」を新規投稿します。
   開始通知はジョブ単位で保存し、再開・再起動による重複を防ぎ、通信失敗時は同じ通知IDで再送します。
 - Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
   `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、各round 3枠の
   実測状態を返すtransportに限定します。利用不能なadvisorだけを理由にSlack jobを失敗させません。
+  親turnの終了だけで実行中のadvisorを停止せず、既存の取得期限内で同じroundを回収します。
+  親が早期完了した場合は同じnative goalで回答を取り込みます。承認待ち・取消・利用上限は維持します。
+  GPTの取得数はApp Serverの実回答で検証し、停止receiptなどの補助fileを回答証拠と混同しません。
   Slackの完全一致`中止`では現在turnを明示的に止めます。
 - App Serverの`turn/completed`と、fullな`agentMessage`を含むturn履歴が同じthread/turn IDで揃った
   時点を論理完了として封印します。その後、同じsupervisor世代だけを停止し、

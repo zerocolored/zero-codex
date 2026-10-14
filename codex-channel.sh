@@ -24,6 +24,7 @@ done
 . "$REPO_DIR/zerokun/state-dir.sh"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+unset ZEROKUN_STARTUP_LEASE
 # Remove untrusted child-process transport and test overrides before the first
 # Bun helper, including project selection.
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
@@ -41,11 +42,26 @@ if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "auto-update" ]; then
   [ "$#" -eq 2 ] || { echo '使い方: zerochan auto-update on|off|status' >&2; exit 2; }
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/auto-update.ts" "$2"
 fi
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "core" ]; then
+  { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo '使い方: zerochan set core [codex|claude]' >&2; exit 2; }
+  shift 2
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/core-command.ts" set "$(pwd -P)" "$@"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "set" ] && [ "${2:-}" = "slack-app" ]; then
   [ "$#" -eq 2 ] || { echo '使い方: zerochan set slack-app（トークンは対話入力）' >&2; exit 2; }
   exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-command.ts" "$(pwd -P)"
 fi
 STATE_DIR="$(zerokun_resolve_state_dir)"
+if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "unset" ] && [ "${2:-}" = "slack-app" ]; then
+  [ "$#" -eq 2 ] || { echo '使い方: zerochan unset slack-app' >&2; exit 2; }
+  exec bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" unset "$(pwd -P)"
+fi
+if [ "$INVOKED_AS" = "zerochan" ] && [ "$#" -eq 1 ] && [ "$1" = "status" ]; then
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/core-command.ts" status "$(pwd -P)"
+  status_result=0
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-unset.ts" status "$(pwd -P)" || status_result=$?
+  [ "$status_result" -eq 3 ] || exit "$status_result"
+fi
 if [ "$INVOKED_AS" = "zerochan" ] && [ "${1:-}" = "security" ]; then
   STATE_DIR="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" "$(pwd -P)" "$STATE_DIR")"
   shift
@@ -105,7 +121,7 @@ case "$INVOKED_AS" in
       LAUNCH_MODE="status"
       PROJECT="$(pwd -P)"
     else
-      echo "使い方: zerochan | zerochan start | zerochan stop [--force] | zerochan update [--recover-only] | zerochan --restart | zerochan set slack-app | zerochan set slack-channel <channel-id> | zerochan unset slack-channel | zerochan status" >&2
+      echo "使い方: zerochan <command>（引数なしは従来方式の起動）" >&2
       echo "コマンド一覧: zerochan help / 詳細: zerochan <command> --help" >&2
       exit 2
     fi
@@ -152,13 +168,31 @@ if [ "$LAUNCH_MODE" = "update" ]; then
     "$REPO_DIR/zerokun/update.ts"
 fi
 
-# Resolve once to a physical release. Children keep this version even while a
-# different app activates a newer one. Preserve the command basename on dispatch.
-PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
-if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
-  PINNED_COMMAND="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR" "$INVOKED_AS")" || exit 1
-  exec /bin/bash "$PINNED_COMMAND" "$@"
-fi
+# Project configuration is owned by the installed CLI, just like set/unset
+# slack-app. An App's older runtime must not parse configuration written by a
+# newer management command. Only service execution follows the App's pin.
+case "$LAUNCH_MODE" in
+  set-channel|unset-channel|status) ;;
+  *)
+    PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
+    if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
+      case "$LAUNCH_MODE" in
+        start|managed-start|restart)
+          bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/project-app-state.ts" \
+            check-runtime "$PROJECT" "$PINNED_REPO" || exit 1
+          ;;
+      esac
+      PINNED_COMMAND="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR" "$INVOKED_AS")" || exit 1
+      # Older stop/restart launchers resolve the App from cwd before their
+      # mode-specific dispatch. The current CLI already selected STATE_DIR;
+      # avoid asking their old config reader to parse the invoking project.
+      case "$LAUNCH_MODE" in
+        managed-stop|managed-force-stop|restart) cd "$STATE_DIR" ;;
+      esac
+      exec /bin/bash "$PINNED_COMMAND" "$@"
+    fi
+    ;;
+esac
 
 # stop is global to this installed Slack App and intentionally does not select,
 # sync, or mutate a project route. The service controller still verifies the
@@ -198,7 +232,7 @@ JOB_RUNNER_STARTER_LOCK="$STATE_DIR/job-runner-starter.lock"
 RESTART_MAINTENANCE_DIR="$STATE_DIR/restart.lock"
 RESTART_MAINTENANCE_LOCK="$RESTART_MAINTENANCE_DIR/pid"
 RESTART_MAINTENANCE_LEASE=""
-EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1"
+EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v2"
 
 export ZEROKUN_STATE_DIR="$STATE_DIR"
 export ZEROKUN_JOB_DB="$JOB_DB"
@@ -304,7 +338,7 @@ fi
 # launcher use that did not pass through bootstrap's interactive Slack setup.
 bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/slack-app-identity.ts" verify-file "$STATE_DIR/.env" \
   || { echo "❌ Slack Bot/App token identityを検証できませんでした。既存processは停止しません。" >&2; exit 1; }
-EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID"
+EXPECTED_RUNNER_RUNTIME="zerokun-codex-runner-v2:$RUNNER_RUNTIME_ID"
 
 # A normal/legacy launcher must not race a managed stop/start or updater. The
 # authorized updater restart already owns this same lock and is the sole
@@ -323,8 +357,11 @@ fi
 # Keep a generation-bound lease only while this launcher is responsible for
 # the gap; it is released before the final gateway exec so later real failures
 # can still alert normally.
-if [ "$LAUNCH_MODE" = "restart" ] && [ "$INVOKED_AS" = "zerochan" ]; then
+if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ] \
+   && { [ "$LAUNCH_MODE" = "start" ] || [ "$LAUNCH_MODE" = "restart" ]; }; then
   acquire_restart_maintenance || exit 1
+  bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/service-control.ts" \
+    assert-idle "$STATE_DIR" || exit 1
 fi
 
 # candidateへfast-forwardした直後にcrashした場合でも、候補版の最小Codex versionや
@@ -398,7 +435,7 @@ if [ -n "$existing_bridge_pid" ]; then
   fi
   shared_runner_runtime=0
   case "$existing_runner_runtime" in
-    "zerokun-codex-runner-v1:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
+    "zerokun-codex-runner-v2:$RUNNER_RUNTIME_ID:"*) shared_runner_runtime=1 ;;
   esac
   if [ "$LAUNCH_MODE" = "start" ] && [ "$INVOKED_AS" = "zerochan" ] \
      && bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/readiness.ts" \
@@ -467,6 +504,15 @@ if [ -n "$existing_bridge_pid" ]; then
   if [ "${ZEROKUN_DRY_RUN:-0}" = "1" ]; then
     echo "   (dry-run: 実際には停止・起動しません)" >&2
     exit 0
+  fi
+  # Interactive replacement has the same planned outage as --restart. Publish
+  # its lease before stopping the gateway, then recheck the mutation barrier.
+  if [ "$AUTHORIZED_UPDATE_RESTART" != "1" ]; then
+    if [ -z "$RESTART_MAINTENANCE_LEASE" ]; then
+      acquire_restart_maintenance || exit 1
+    fi
+    bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/service-control.ts" \
+      assert-idle "$STATE_DIR" || exit 1
   fi
   lock_process_is "$LOCK_FILE" "$existing_bridge_pid" 'server\.ts' || {
     echo "❌ gateway identityが確認待ちの間に変化したためsignalしません。" >&2
@@ -670,6 +716,10 @@ echo "   runtime : verified Herdr pane + job単位のCodex"
 echo "   trust   : read/writeともrepository sandbox / advisorは固定broker"
 echo "   caffeinate: ON (Ctrl-Cでgatewayを停止)"
 
-release_restart_maintenance || exit 1
+# Keep the lease across exec and asynchronous Slack connection. The gateway
+# consumes it before creating children and releases it only after readiness.
+if [ -n "$RESTART_MAINTENANCE_LEASE" ]; then
+  export ZEROKUN_STARTUP_LEASE="$RESTART_MAINTENANCE_LEASE"
+fi
 trap - EXIT
 exec caffeinate -dimsu bun --config=/dev/null --no-env-file "$REPO_DIR/server.ts"

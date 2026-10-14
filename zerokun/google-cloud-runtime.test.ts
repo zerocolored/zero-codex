@@ -49,14 +49,14 @@ test('does not grant an arbitrary executable wrapper parent as an SDK', () => {
   expect(resolveGoogleCloudRuntime({ home: f.home, path: bin, config: f.config })).toBeNull()
 })
 
-test('native auth is primary-only and cannot reopen managed state or repository roots', () => {
+test('native auth write grants are primary-only and cannot reopen state or repository roots', () => {
   const f = fixture()
   const settings = buildCodexPermissionOverrides(f.job, f.options).join('\n')
   expect(settings).toContain(`${JSON.stringify(f.config)}="write"`)
   expect(settings).toContain(`"CLOUDSDK_CONFIG"=${JSON.stringify(f.config)}`)
   expect(settings).toContain('\":root\"=\"read\"')
   expect(settings).not.toContain(`${JSON.stringify(realpathSync(homedir()))}="deny"`)
-  expect(settings).toContain(`${JSON.stringify(f.state)}="deny"`)
+  expect(settings).toContain(`${JSON.stringify(f.state)}="read"`)
   for (const [job, options] of [
     [{ ...f.job, writeEnabled: false }, f.options],
     [f.job, { ...f.options, executionWriteEnabled: false }],
@@ -74,16 +74,16 @@ test('native auth is primary-only and cannot reopen managed state or repository 
 })
 
 test.skipIf(process.platform !== 'darwin' || !Bun.which('codex'))(
-  'real Codex sandbox runs native CLI/cache refresh while unrelated state stays denied', () => {
+  'real Codex sandbox runs native CLI/cache refresh while unrelated state writes stay denied', () => {
     const f = fixture()
-    writeFileSync(join(f.state, 'unrelated'), 'must stay hidden')
+    writeFileSync(join(f.state, 'unrelated'), 'synthetic-state')
     const overrides = buildCodexPermissionOverrides(f.job, f.options)
     const setting = overrides.find(value => value.startsWith('shell_environment_policy.set='))!
     const env = (Bun.TOML.parse(setting) as any).shell_environment_policy.set
     const result = Bun.spawnSync(['codex', 'sandbox', ...overrides.flatMap(value => ['-c', value]),
       '-P', 'zerokun_job', '-C', f.repo, '--', '/usr/bin/env', '-i',
       ...Object.entries(env).map(([key, value]) => `${key}=${value}`),
-      '/bin/sh', '-c', 'gcloud && if cat "$1" >/dev/null 2>&1; then exit 99; fi',
+      '/bin/sh', '-c', 'gcloud && if (printf changed > "$1") 2>/dev/null; then exit 99; fi',
       'probe', join(f.state, 'unrelated')], { stdout: 'pipe', stderr: 'pipe', timeout: 30_000 })
     expect(result.exitCode, result.stderr.toString()).toBe(0)
     expect(result.stdout.toString()).toBe('cli-auth-and-cache-ok')

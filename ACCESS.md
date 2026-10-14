@@ -1,6 +1,7 @@
 # Access Control Reference
 
-設定済みチャンネルでは、人間の参加者全員が個別登録なしで利用・repository変更を依頼できます。
+設定済みチャンネルでは、人間の参加者全員と、Zeroちゃんを明示メンションした他のBotが、
+個別登録なしで利用・repository変更を依頼できます。
 DMだけは受信許可と書込み許可を分離し、pairingだけでは書込み権限は付きません。
 
 設定ファイルは既定で `~/.codex/zerokun/access.json` にあります。旧版の
@@ -70,7 +71,7 @@ zerochan-access write allow U0123456789
 zerochan-access write deny U0123456789
 ```
 
-- チャンネルの人間の参加者: 個別登録なしでrepositoryと`.git`のwrite、依頼に必要なnetworkを許可します。
+- チャンネルの人間の参加者と、明示メンションで受け付けたBot: 個別登録なしでrepositoryと`.git`のwrite、依頼に必要なnetworkを許可します。
 - DMで`writeAllowFrom` にいない sender: minimal runtimeから組み立てたnamed profileでrepository readと
   job専用outbox writeだけを許可します。調査と回答だけです。
 - DMで`writeAllowFrom` にいる sender: minimal runtimeから組み立てたnamed profileでrepositoryと`.git`の
@@ -84,25 +85,34 @@ zerochan-access write deny U0123456789
   完全一致の`中止`も同じthread-scoped操作として受け付けます。
 - commit、push、deploy、PR は write 許可だけでは自動実行されず、Slack request が求めた範囲に
   限られます。
-- HOMEのcredential/configはCodexへ公開しません。commitには固定の実行用identityを使い、
-  認証付きGitHub操作はrepository限定broker、Cloud Logging検索は明示project指定の読取専用brokerへ渡します。
+- 書込みprimaryはホストのHOME・XDG設定と既存CLI認証を利用できます。commitには固定の実行用identityを使い、
+  repository限定GitHub brokerや明示project指定の読取専用Cloud Logging brokerも補助経路として利用できます。
   Cloud Loggingのアクセス可否はホストのGoogle Cloud IAMで判断し、repository別の追加許可設定は不要です。
-  ホストの認証が使える限り、scratch HOMEに認証がないことだけではblockしません。
+  CLIの未認証表示だけで本人のログイン不足とせず、実行環境の設定探索先と必要なnative permissionを確認します。
 - 通常cloneに加え、Git自身の登録情報・back pointer・gitlink・`core.worktree`が一致する正規の
   linked worktree/submoduleを利用できます。任意pathを指す偽の`.git` pointerは拒否します。
+
+書込みprimaryから起動するnative Codex子エージェントは親の権限を引き継ぎます。
+roleの`read-only`／`never`指定だけでは、ホストHOME・private stateのOS読取り隔離を保証しません。
+別プロセスで起動するread-only工程・review工程と外部advisorには、それぞれの隔離設定を適用します。
+認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更の禁止はnative子にも適用します。
 
 ## Channel policy
 
 利用するSlack Appをchannelへ招待し、対象projectで
 `zerochan set slack-channel <channel-id>`を実行すると、そのchannelの人は誰でも利用できます。
-利用者allowlistはありません。bot投稿とSlack user IDでないsenderは常に無視します。
+利用者allowlistはありません。他のBotからも、そのSlack Appへの明示メンションがあれば、
+ZIPなどの添付を含む依頼を受け付けて同じthreadへ返信します。自己投稿、送信者IDが不正な投稿、Bot DMは無視します。
+Botは所有済みthreadや`requireMention: false`でも毎回明示メンションが必要です。
+Bot自身の発言やメンションのない自動通知に反応しないことで連鎖を抑えますが、
+相互にメンションし続ける別Botとの連携は送信側でもループを避けてください。
 
 - 新しいchannel依頼は、そのSlack Appへのメンションが必要です。
 - いったんそのAppが採用したthreadの人による返信は、senderが変わってもメンション不要です。
 - 実行中の同じthreadへの返信は安全に一時停止して先に回答し、別threadは独立したFIFO jobになります。
 - 招待・最初のlive mentionでchannelを内部記録し、再起動後の履歴回収に使います。
 - 新しいthreadはproject-localの`.zerochan/config.json`で紐付けたprojectへ固定されます。
-  `zerochan unset slack-channel <channel-id>`で解除でき、同じchannelを2つのprojectへ重複登録は
+  `zerochan unset slack-channel`でそのprojectの紐付けをすべて解除でき、同じchannelを2つのprojectへ重複登録は
   できません。既存threadの固定先は解除後も変わらず、`routes.json`は不要です。
 
 ## 設定 schema
@@ -135,11 +145,14 @@ zerochan-access write deny U0123456789
   pairing追加とwrite revokeが競合しても古い権限を復活させません。
 - `access.json`、`.env`、SQLite DB は mode 0600、state directory は mode 0700 を使います。
 - Codex 子プロセスには Slack token、GitHub/AWS等の任意環境変数、state path変数を渡しません。
-- HOME/state/shared tempをsandboxでdenyし、repository、当該jobの添付、scratch、outboxだけを
-  pathごとに再許可します。
+- read-only工程ではHOME/state/shared tempをsandboxでdenyし、repository、当該jobの添付、scratch、outboxを
+  pathごとに再許可します。書込みprimaryは通常のホスト読取りを許可し、private stateや他ジョブのOS読取り隔離を保証しません。
+  基本の書込み許可には対象repository・Git metadata、当該jobのscratch/outbox/temp、および通常のOS一時領域を含みます。
+  これを超える追加path・OS認証ストアの利用はCodex標準の承認審査へ渡します。
+  認証情報本文・bot管理状態・他ジョブの取得、コピー、表示、変更は指示で禁止します。
 - 添付ファイルは認可後に gateway が state の `inbox/` へ保存し、そのjobに記録したfileだけを
   Codex profileへread許可します。
 - 成果物 upload は50MBまでで、job専用 `outbox/<job-id>/` 直下の空でないregular fileだけを許可します。
   symlinkによるoutbox外へのescape、device、FIFO、他jobのfileは拒否します。
-- 成果物のfile形式は制限しません。送信byte列の明白な平文credentialだけをbest-effortで検出して省略し、
-  archive展開・復号・OCRは行わないため、社内利用でも成果物へ秘密を含めない運用を前提とします。
+- 成果物のfile形式・内容パターンによる拒否や伏字は行いません。本文・URL・ID・添付名・添付byte列を保持します。
+  fileの所有範囲・種類・サイズと配送先の検証は維持します。

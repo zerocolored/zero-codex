@@ -56,7 +56,13 @@ import {
   createServiceControlPauseRequest,
   serviceControlPauseAcknowledged,
   writeIntentionalServiceStop,
+  intentionalServiceStopIsSet,
 } from './service-control-state.ts'
+import { missingPane, recoveryControlRuntime } from './herdr-recovery.ts'
+import { assertSlackProjectAdmission } from './slack-project-admission.ts'
+import { readLastConnectedProject, readStartedProjects, rememberStartedProject } from './project-selection.ts'
+import { readProjectChannelConfig } from './project-channel-config.ts'
+import { registeredSlackAppForState } from './slack-app-registry.ts'
 
 type ManagedProcess = {
   label: string
@@ -1210,7 +1216,7 @@ function runnerBelongsToAttempt(
 ): boolean {
   const runtime = readRunnerRuntime(stateDir)
   return Boolean(runtime
-    && runtime.startsWith(`zerokun-codex-runner-v1:${expectedAppId}:`)
+    && runtime.startsWith(`zerokun-codex-runner-v2:${expectedAppId}:`)
     && runtime.endsWith(`:${herdrRuntimeFingerprint(attemptedRuntime)}`))
 }
 
@@ -1338,7 +1344,7 @@ async function requireRunningServiceCompatible(
     fail('稼働中serviceと現在のHerdr control planeが一致しません')
   }
   const runnerRuntime = readRunnerRuntime(stateDir)
-  const prefix = `zerokun-codex-runner-v1:${expectedAppId}:`
+  const prefix = `zerokun-codex-runner-v2:${expectedAppId}:`
   const suffix = `:${herdrRuntimeFingerprint(pinned)}`
   if (!runnerRuntime?.startsWith(prefix) || !runnerRuntime.endsWith(suffix)) {
     fail('稼働中job runnerのSlack AppまたはHerdr runtimeが一致しません')
@@ -1392,6 +1398,7 @@ export async function startManagedService(
           )),
       )
       if (launcher.pid) {
+        rememberStartedProject(stateDir, projectDir, expectedAppId)
         clearIntentionalServiceStop(stateDir)
         return {
           status: 'already-running',
@@ -1465,6 +1472,7 @@ export async function startManagedService(
         }
         throw error
       }
+      rememberStartedProject(stateDir, projectDir, expectedAppId)
       clearIntentionalServiceStop(stateDir)
       return {
         status: 'already-running',
@@ -1480,6 +1488,9 @@ export async function startManagedService(
     // All managed service processes are absent above. A restored/foreign old
     // tab is not a running service: preserve it and create a fresh owned tab.
     await cleanupRecordedTab(stateDir, controlRuntime, projectDir, close)
+    // An accepted start supersedes an explicit stop. A failed launch is an
+    // outage, not a user-requested stop; keep watchdog reporting enabled.
+    clearIntentionalServiceStop(stateDir)
     launchAttempted = true
     const started = await startBot({
       rootRepo,
@@ -1500,6 +1511,7 @@ export async function startManagedService(
     if (started.gatewayPid !== health.gatewayPid) {
       fail('起動確認中にgateway generationが変わりました')
     }
+    rememberStartedProject(stateDir, projectDir, expectedAppId)
     clearIntentionalServiceStop(stateDir)
     return {
       status: 'started',
@@ -1557,7 +1569,6 @@ export async function startManagedService(
         || activeCounts(stateDir).running > 0) {
         fail('起動失敗generationの完全停止を確認できません')
       }
-      writeIntentionalServiceStop(stateDir)
       if (attemptedRuntime) {
         const tabCleanup = await cleanupRecordedTab(
           stateDir,
@@ -1578,8 +1589,110 @@ export async function startManagedService(
   }
 }
 
+/** OS watchdog entrypoint, independent of every service pane/process. */
+export async function recoverManagedService(
+  rootRepoInput: string,
+  stateDirInput: string,
+  hooks: ServiceControlHooks & {
+    recoveryRuntime?: typeof recoveryControlRuntime
+    registryHome?: string
+  } = {},
+): Promise<'healthy' | 'stopped' | 'not-started' | 'busy' | 'recovered'> {
+  const rootRepo = realpathSync(rootRepoInput)
+  const stateDir = requireManagedStateRoot(stateDirInput)
+  const verify = hooks.verifyControlRuntime ?? (runtime => verifyHerdrRuntimeIdentityAsync(
+    runtime, environmentForPinnedHerdrRuntime(runtime),
+  ))
+  const restartInProgress = () => {
+    const status = inspectProcessLock(join(stateDir, 'restart.lock', 'pid')).status
+    return status === 'active' || status === 'unknown'
+  }
+  // The common healthy tick must not pause an active runner or acquire a
+  // service mutation lock. Recheck all decisions inside the lock below.
+  if (intentionalServiceStopIsSet(stateDir)) return 'stopped'
+  if (restartInProgress()) return 'busy'
+  if (inspectManagedServiceStatus(stateDir).status === 'running') {
+    try {
+      await verify(readPinnedHerdrRuntime(stateDir))
+      return 'healthy'
+    } catch (error) { if (!missingPane(error)) throw error }
+  }
+  if (inspectProcessLock(join(stateDir, 'update.lock', 'pid')).status === 'active') return 'busy'
+  const operation = acquireUpdateLock(stateDir)
+  try {
+    assertSharedSourceReady(stateDir)
+    requireNoInterruptedUpdate(stateDir)
+    if (intentionalServiceStopIsSet(stateDir)) return 'stopped'
+    if (restartInProgress()) return 'busy'
+    const ready = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
+    // Readiness is deliberately deleted on gateway startup/shutdown. The last
+    // successful connection persists across both and authorizes retries.
+    const last = readLastConnectedProject(stateDir)
+    const registered = registeredSlackAppForState(stateDir, hooks.registryHome)
+    const appIdValue = registered?.appId ?? ready?.slackAppId
+    if (!appIdValue) return 'not-started'
+    const appId = requireExpectedAppId(appIdValue)
+    const candidates = [...new Set([
+      ...readStartedProjects(stateDir, appId), last?.projectDir, ready?.projectDir,
+    ].filter((path): path is string => !!path))]
+    if (!candidates.length) return 'not-started'
+    let projectDir: string | undefined
+    for (const candidate of candidates) {
+      try {
+        const physical = realpathSync(candidate)
+        assertSlackProjectAdmission(physical, String(Date.now() / 1000))
+        const binding = readProjectChannelConfig(physical).slackAppId
+        if (binding !== undefined && binding !== appId) continue
+        projectDir = physical
+        break
+      } catch { /* Keep unavailable/disconnected projects for later ticks. */ }
+    }
+    if (!projectDir) throw new Error('自動復旧できる起動済みプロジェクトがまだ利用できません')
+    const previous = readPinnedHerdrRuntime(stateDir)
+    if (inspectManagedServiceStatus(stateDir).status === 'running') {
+      try {
+        await verify(previous)
+        return 'healthy'
+      } catch (error) { if (!missingPane(error)) throw error }
+    }
+    // A dead runner can leave stale running rows. Its replacement owns the
+    // existing interrupted-job/executor reconciliation; never rewrite jobs here.
+    if (inspectManagedServiceStatus(stateDir).runnerPid && activeCounts(stateDir).running > 0) return 'busy'
+    // Obtain a usable control plane before touching services. Transient Herdr
+    // outages leave the existing processes and work intact for the next tick.
+    const processesBeforeRecovery = inspectManagedServiceStatus(stateDir)
+    const control = await (hooks.recoveryRuntime ?? recoveryControlRuntime)(stateDir, projectDir, previous, {
+      // A power loss may leave a launch receipt with no live generations.
+      // The receipt still needs reconciliation, but is not a live process.
+      allowColdStart: !processesBeforeRecovery.gatewayPid && !processesBeforeRecovery.runnerPid
+        && !processesBeforeRecovery.launcherPid,
+    })
+    await verify(control)
+    const sleep = hooks.sleep ?? (milliseconds => Bun.sleep(milliseconds))
+    await quiesceRunnerAndLauncher(stateDir, sleep, hooks.pauseTimeoutMs)
+    const gateway = serviceProcesses(stateDir).gateway
+    if (gateway.pid) await stopLockedProcess(gateway.lockFile, gateway.pid, gateway.label, gateway.pattern)
+    await cleanupRecordedTab(stateDir, control, projectDir, hooks.closeRecordedTab ?? closeRecordedHerdrServiceTab)
+    // Retain the user's desired-running state on failure. Never call public
+    // stop here: it records an intentional stop and disables later recovery.
+    const started = await (hooks.startBot ?? startBotInHerdr)({
+      rootRepo, stateDir, projectDir, controlRuntime: control,
+      startupTimeoutMs: 60_000, reuseRecordedTab: false,
+    })
+    const health = await stableServiceHealth(rootRepo, stateDir, projectDir, appId)
+    if (health.gatewayPid !== started.gatewayPid) fail('recovery gateway generation changed')
+    return 'recovered'
+  } finally { operation.release() }
+}
+
 async function main(): Promise<void> {
   const [command, ...args] = process.argv.slice(2)
+  if (command === 'recover') {
+    if (args.length !== 2) fail('usage: service-control.ts recover ROOT_REPO STATE_DIR')
+    const result = await recoverManagedService(args[0]!, args[1]!)
+    process.stdout.write(`service recovery: ${result}\n`)
+    return
+  }
   if (command === 'assert-idle') {
     if (args.length !== 1) fail('usage: service-control.ts assert-idle STATE_DIR')
     assertSharedSourceReady(args[0]!)
@@ -1609,12 +1722,13 @@ async function main(): Promise<void> {
     }
     return
   }
-  const result = await startManagedService(
+  const { startWithSelectedCore } = await import('./core-command.ts')
+  const result = await startWithSelectedCore(projectDir!, () => startManagedService(
     rootRepo,
     stateDir,
     projectDir!,
     expectedAppId!,
-  )
+  ))
   if (result.status === 'already-running') {
     process.stdout.write('✅ 既に稼働中です。\n')
     process.stdout.write('   ログtabを作り直す場合は zerochan stop → zerochan start を実行してください。\n')

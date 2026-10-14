@@ -103,11 +103,17 @@ describe('outside-Herdr start handoff', () => {
   test('既存serviceが正常なら新しいworkspaceを作らない', async () => {
     const { root, state, project } = fixture()
     let invoked = false
+    let verified = false
     try {
       const result = await startZeroInHerdrWorkspace(root, state, project, {
         inspectStatus: () => ({
           status: 'running', gatewayPid: 333, runnerPid: 444, launcherPid: 555,
         }),
+        reuseRunningService: async input => {
+          verified = true
+          expect(input.projectDir).toBe(realpathSync(project))
+          return { status: 'running', gatewayPid: 333, runnerPid: 444, launcherPid: 555 }
+        },
         invoke: async () => {
           invoked = true
           return {}
@@ -117,6 +123,7 @@ describe('outside-Herdr start handoff', () => {
         status: 'already-running', gatewayPid: 333, runnerPid: 444, launcherPid: 555,
       })
       expect(invoked).toBe(false)
+      expect(verified).toBe(true)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -131,7 +138,7 @@ describe('outside-Herdr start handoff', () => {
         inspectStatus: () => ({
           status: 'partial', gatewayPid: 111, runnerPid: 222,
         }),
-        repairMissingLauncher: async input => {
+        reuseRunningService: async input => {
           repaired = true
           expect(input).toEqual({
             rootRepo: realpathSync(root),

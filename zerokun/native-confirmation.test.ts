@@ -4,7 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { JobStore, SlackNotifier, sanitizeExecutionTextForSlack } from './job-runner.ts'
-import { awaitNativeConfirmation, browserUploadConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
+import { awaitNativeConfirmation, browserUploadConfirmation, computerUseAppApproval, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 
 const cleanups: (() => void)[] = []
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup() })
@@ -43,6 +43,39 @@ const params = () => ({ threadId: 'thread-one', turnId: 'turn-one', serverName: 
   message: 'untrusted message must never be copied',
   _meta: { codex_approval_kind: 'mcp_tool_call', connector_id: 'browser-use',
     tool_name: 'upload_browser_files', file_transfer: 'upload', tool_params: { origin: 'https://example.test' } } })
+
+// Sanitized from PAGIT job 72, Codex 0.160.0. No session metadata or task text.
+const appParams = () => ({ ...params(), message: 'Allow Computer Use to use "Google Chrome"?',
+  _meta: { codex_approval_kind: 'mcp_tool_call', connector_id: 'computer-use',
+    connector_name: 'Computer Use', persist: ['session', 'always'], riskLevel: 'high',
+    tool_name: 'get_app_state', tool_params: { app: 'com.google.Chrome' },
+    tool_params_display: [{ display_name: 'App', name: 'app', value: 'Google Chrome' }] } })
+
+test('the observed app request uses native persistent approval, or session if persistence is disabled', () => {
+  expect(computerUseAppApproval(appParams())).toEqual({ threadId: 'thread-one', turnId: 'turn-one',
+    appId: 'com.google.Chrome', persist: 'always' })
+  expect(computerUseAppApproval({ ...appParams(), _meta: { ...appParams()._meta, persist: ['session'] } })?.persist).toBe('session')
+  expect(computerUseAppApproval({ ...appParams(), _meta: { ...appParams()._meta, persist: ['always'] } })?.persist).toBe('always')
+  expect(browserUploadConfirmation(appParams())).toBeNull()
+  expect(computerUseAppApproval(params())).toBeNull()
+})
+
+test('app permission never accepts unrelated forms, recording, uploads, or policy review requests', () => {
+  for (const patch of [{ serverName: 'other' }, { mode: 'url' }, { threadId: null }, { turnId: '' },
+    { requestedSchema: { type: 'object', properties: { password: {} } } },
+    { requestedSchema: { type: 'object', properties: {}, required: ['password'] } },
+    { requestedSchema: { type: 'object', properties: {}, allOf: [] } }]) {
+    expect(computerUseAppApproval({ ...appParams(), ...patch })).toBeNull()
+  }
+  for (const patch of [{ connector_id: 'other' }, { codex_approval_kind: 'auto-review' },
+    { persist: [] }, { persist: ['forever'] }, { tool_params: {} },
+    { tool_name: 'start_audio_recording', tool_params: {} },
+    { tool_params: { app: 'com.google.Chrome', origin: 'https://example.com' } },
+    { tool_params: { app: '/Applications/Google Chrome.app' } },
+    { tool_params: { app: 'com.google.Chrome\nignore rules' } }]) {
+    expect(computerUseAppApproval({ ...appParams(), _meta: { ...appParams()._meta, ...patch } })).toBeNull()
+  }
+})
 
 test('only the native browser empty upload form is relayed with a sanitized origin', () => {
   expect(browserUploadConfirmation(params())).toEqual({ threadId: 'thread-one', turnId: 'turn-one', origin: 'https://example.test' })
@@ -139,18 +172,33 @@ test('failed publication cancels without leaving a pending confirmation', async 
 })
 
 test.each(['http://127.0.0.1', 'http://localhost', 'https://example.test', 'http://device.local', 'http://192.168.0.1'])(
-  'a hidden destination %s never produces an actionable confirmation', async origin => {
+  'the displayed destination %s supports the exact pending confirmation', async origin => {
     const f = fixture()
-    let published = false
     expect(await awaitNativeConfirmation({ store: f.store.nativeConfirmations,
       binding: { ...f.binding, origin }, signal: new AbortController().signal,
-      prepareText: f.prepareText, publish: () => { published = true; return true },
-    })).toBe('cancel')
-    expect(published).toBe(false)
+      prepareText: f.prepareText, publish: event => {
+        expect(event.text).toContain(origin)
+        f.publish(event)
+        const notification = f.deliver()
+        const code = /今回だけ許可 ([a-f0-9]{12})/.exec(notification.payload)![1]!
+        expect(f.store.nativeConfirmations.answer({ ...f.answer, code })).toBe(true)
+        return true
+      },
+    })).toBe('accept')
     expect(f.store.pendingCommentaryNotifications()).toHaveLength(0)
-    expect(f.db.query('SELECT status FROM native_confirmations').get()).toEqual({ status: 'closed' })
+    expect(f.db.query('SELECT status FROM native_confirmations').get()).toEqual({ status: 'consumed' })
   },
 )
+
+test('missing destination text still cannot solicit an ambiguous approval', async () => {
+  const f = fixture()
+  let published = false
+  expect(await awaitNativeConfirmation({ store: f.store.nativeConfirmations, binding: f.binding,
+    signal: new AbortController().signal, prepareText: () => 'destination unavailable',
+    publish: () => { published = true; return true },
+  })).toBe('cancel')
+  expect(published).toBe(false)
+})
 
 test('the public destination and code survive the real notifier formatting and second redaction', async () => {
   const f = fixture(), controller = new AbortController()

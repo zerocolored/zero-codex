@@ -17,7 +17,7 @@ import {
   buildSetupEnvironment,
   buildUpdaterEnvironment,
 } from './child-environment'
-import { observeProcessGeneration, readProcessIdentity } from './process-generation'
+import { observeProcessGeneration, readProcessIdentity, readProcessTable, type ProcessIdentity } from './process-generation'
 import { runTmuxCommand } from './tmux-command'
 
 const tempDirs: string[] = []
@@ -424,10 +424,7 @@ describe('Slack update request', () => {
   test('更新workerはhangしたupdaterをdeadline後に停止して失敗outcomeを保存する', async () => {
     const stateDir = fixtureDir()
     const updater = join(stateDir, 'hanging-updater.ts')
-    const updaterPid = join(stateDir, 'hanging-updater.pid')
     writeFileSync(updater, [
-      "import { writeFileSync } from 'fs'",
-      `writeFileSync(${JSON.stringify(updaterPid)}, String(process.pid))`,
       "process.on('SIGTERM', () => {})",
       'await Bun.sleep(30_000)',
       '',
@@ -438,20 +435,29 @@ describe('Slack update request', () => {
       launchWorker: () => {},
     })
     const notifications: string[] = []
+    let gateIdentity: ProcessIdentity | undefined
+    let updaterFailure: unknown
     const startedAt = Date.now()
-    const running = runUpdateWorker('request-timeout', {
+    const result = await runUpdateWorker('request-timeout', {
       stateDir,
-      updaterPath: updater,
-      updaterTimeoutMs: 50,
-      updaterTermGraceMs: 50,
+      executeUpdater: async () => {
+        try {
+          return await executeUpdater(updater, join(stateDir, 'update-request.log'), 50, 50, {
+            HOME: stateDir, PATH: process.env.PATH, ZEROKUN_STATE_DIR: stateDir,
+          }, {
+            // The gate is observed before the deadline starts. The updater can
+            // legitimately time out before its own Bun runtime executes code.
+            onGateIdentity: identity => { gateIdentity = identity },
+          })
+        } catch (error) {
+          updaterFailure = error
+          throw error
+        }
+      },
       notify: async (_request, text) => { notifications.push(text) },
     })
-    let deadline = Date.now() + 2_000
-    while (!existsSync(updaterPid) && Date.now() < deadline) await Bun.sleep(10)
-    expect(existsSync(updaterPid)).toBe(true)
-    const childIdentity = readProcessIdentity(Number(readFileSync(updaterPid, 'utf8')))
-    expect(childIdentity).toBeDefined()
-    const result = await running
+    expect(gateIdentity).toBeDefined()
+    expect(updaterFailure).toEqual(new Error('zerochan updateが50msでtimeoutしました'))
     expect(Date.now() - startedAt).toBeLessThan(2_000)
     expect(result).toEqual({ success: false, exitCode: 1, notificationSent: true })
     expect(notifications[0]).toContain('このMacの管理ログ')
@@ -459,7 +465,8 @@ describe('Slack update request', () => {
     const saved = JSON.parse(readFileSync(join(stateDir, 'update-request.json'), 'utf8'))
     expect(saved.outcome.success).toBe(false)
     expect(saved.outcome.notifiedAt).toBeNumber()
-    expect(observeProcessGeneration(childIdentity!).status).toBe('dead')
+    expect(observeProcessGeneration(gateIdentity!).status).toBe('dead')
+    expect(readProcessTable().filter(process => process.pgid === gateIdentity!.pgid)).toEqual([])
   })
 
   test('live detached gateがrequestへ残る間はworkerを二重起動しない', async () => {

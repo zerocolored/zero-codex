@@ -12,7 +12,6 @@ import { buildCodexChildEnvironment, buildCodexPermissionOverrides, buildCodexTr
 import { resolveOfficialStandaloneCodex, verifyOfficialCodexSnapshot } from './standalone-codex.ts'
 import { ensureJobTempDirectory } from './job-temp.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import { delegateProcessLock, undelegateProcessLock, releaseProcessLock, tryAcquireProcessLock, type ProcessLockDelegate } from './process-lock.ts'
 import { runBounded, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 import type { JobRecord } from './job-runner.ts'
@@ -45,7 +44,7 @@ export function reproductionRequest(context: ReproductionContext, requestPath: s
   const bytes = readOptionalBoundedAtomicOwnedFile(path, 256 * 1024, 'reproduction request')
   if (!bytes?.length || bytes.includes(0)) throw new Error('empty or invalid reproduction request')
   const prompt = bytes.toString('utf8')
-  if (!Buffer.from(prompt).equals(bytes) || containsCredentialMaterial(prompt)) throw new Error('unsafe reproduction request')
+  if (!Buffer.from(prompt).equals(bytes)) throw new Error('unsafe reproduction request')
   const promptSha256 = createHash('sha256').update(bytes).digest('hex')
   const id = createHash('sha256').update(JSON.stringify([context.job.id, cwd, promptSha256])).digest('hex')
   return { cwd, bytes, promptSha256, id }

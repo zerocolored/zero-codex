@@ -1,5 +1,5 @@
 /** Stable user-facing classifications; raw CLI output never goes to Slack. */
-export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'auth-check', 'connection', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
+export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'auth-check', 'auth-recovery', 'connection', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
 export type AdvisorFailure = {
   advisor: 'codex' | 'grok' | 'claude'
   cause: typeof ADVISOR_FAILURE_CAUSES[number]
@@ -39,6 +39,7 @@ export function advisorFailureMessage(failure: AdvisorFailure): string {
     billing: '支払い・残高・契約に関するエラーが報告されました。利用アカウントの契約状態を確認してください。',
     configuration: '必要なログイン方式または実行設定と一致しません。このMacの設定を確認してください。',
     'auth-check': 'ログイン状態の確認処理に失敗しました。未ログインや課金不足と確定したわけではありません。',
+    'auth-recovery': '自動再認証を完了できませんでした。停止理由を実行記録に保存しています。',
     connection: '連携状態の確認に失敗しました。レビュー回答の時間切れではありません。',
     network: '通信障害により回答を取得できませんでした。',
     'rate-limit': '利用制限またはモデル混雑により回答を取得できません。',

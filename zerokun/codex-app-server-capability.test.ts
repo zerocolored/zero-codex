@@ -283,6 +283,19 @@ describe('Codex App Server capability gate', () => {
     expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('ThreadSourceKind')
   })
 
+  test('同じ列挙値の順序・空白・引用符の違いは必要機能の欠落ではない', () => {
+    const root = fixture()
+    writeFileSync(join(root, 'v2/ThreadSourceKind.ts'), `export type ThreadSourceKind =
+      | 'unknown' | 'subAgentOther' | 'subAgentThreadSpawn' | 'subAgentCompact'
+      | 'subAgentReview' | 'subAgent' | 'appServer' | 'exec' | 'vscode' | 'cli';`)
+    writeFileSync(join(root, 'v2/SubAgentActivityKind.ts'), `export type SubAgentActivityKind =
+      | 'completed' | 'interrupted' | 'interacted' | 'started';`)
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).not.toThrow()
+    writeFileSync(join(root, 'v2/SubAgentActivityKind.ts'), `export type SubAgentActivityKind =
+      'started' | 'interacted' /* interrupted is not a member */;`)
+    expect(() => assertCodexAppServerGeneratedCapabilities(root)).toThrow('interrupted')
+  })
+
   test('userMessage clientIdを履歴へ残さないreleaseをfail-closeする', () => {
     const root = fixture()
     const path = join(root, 'v2/ThreadItem.ts')

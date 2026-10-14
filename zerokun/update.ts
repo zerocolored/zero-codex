@@ -1275,7 +1275,7 @@ export function activeJobCounts(raw: string): { queued: number; running: number 
   // The first Codex update may still call an older installed runner whose
   // records have no runtime field, so those remain relevant. Once migrated,
   // explicit Claude history must not block Codex updates forever.
-  const relevant = jobs.filter(job => job.runtime === undefined || job.runtime === 'codex')
+  const relevant = jobs.filter(job => job.runtime !== 'claude')
   return {
     queued: relevant.filter(job => job.status === 'queued').length,
     running: relevant.filter(job => job.status === 'running').length,
@@ -1292,7 +1292,7 @@ export function activeJobCountsFromDatabase(dbPath: string): {
     const hasRuntime = columns.some(column => column.name === 'runtime')
     const rows = db.query<{ status: string; count: number }, []>(
       `SELECT status, COUNT(*) AS count FROM jobs
-       WHERE status IN ('queued', 'running')${hasRuntime ? " AND runtime = 'codex'" : ''}
+       WHERE status IN ('queued', 'running')${hasRuntime ? " AND runtime <> 'claude'" : ''}
        GROUP BY status`,
     ).all()
     return {
@@ -3798,7 +3798,7 @@ async function installInstanceRuntime(target: ReleaseTarget, root: string, lease
     cwd: root, processGroupLease: lease,
     env: { ...buildSetupEnvironment(), ZEROKUN_REPO_DIR: undefined, ZEROKUN_STATE_DIR: target.stateDir, ZEROKUN_PROJECT_DIR: target.projectDir, ZEROKUN_LEGACY_CUTOVER: legacyCutoverForState(target.stateDir) },
   })
-  for (const name of ['job-runner.ts', 'codex-executor.ts']) {
+  for (const name of ['job-runner.ts', 'codex-executor.ts', 'service-control.ts']) {
     const link = join(target.stateDir, name)
     const temporary = `${link}.${randomUUID()}`
     symlinkSync(join(root, 'zerokun', name), temporary)
@@ -3810,18 +3810,28 @@ async function installInstanceRuntime(target: ReleaseTarget, root: string, lease
   chmodSync(join(target.stateDir, 'watchdog.sh'), 0o700)
 }
 
-function publishReleaseCommands(release: RuntimeRelease): void {
-  const bin = join(homedir(), '.local', 'bin')
+export function publishReleaseCommands(release: RuntimeRelease, home = homedir()): void {
+  const bin = join(home, '.local', 'bin')
   mkdirSync(bin, { recursive: true, mode: 0o700 })
-  for (const name of ['zerochan', 'zerokun', 'codex-channel']) {
+  const commands = [
+    ['zerochan', 'codex-channel.sh'],
+    ['zerokun', 'codex-channel.sh'],
+    ['codex-channel', 'codex-channel.sh'],
+    ['zerokun-status', 'zerokun/status.ts'],
+  ] as const
+  // Validate every existing entry before switching any shared command.
+  for (const [name, relative] of commands) {
     const path = join(bin, name)
     try {
       if (!lstatSync(path).isSymbolicLink()) fail(`既存commandを上書きできません: ${name}`)
       const old = realpathSync(path)
-      if (basename(old) !== 'codex-channel.sh') fail(`無関係なcommandを保持しました: ${name}`)
+      if (!old.endsWith(`/${relative}`)) fail(`無関係なcommandを保持しました: ${name}`)
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
+  for (const [name, relative] of commands) {
+    const path = join(bin, name)
     const tmp = `${path}.${randomUUID()}`
-    symlinkSync(join(release.path, 'codex-channel.sh'), tmp)
+    symlinkSync(join(release.path, relative), tmp)
     renameSync(tmp, path)
   }
 }

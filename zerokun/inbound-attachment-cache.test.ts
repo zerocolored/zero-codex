@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -18,6 +19,7 @@ import {
 } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { createServer, get, type IncomingMessage } from 'http'
 import {
   loadCachedInboundAttachment,
   removeRenamedInboundAttachment,
@@ -42,6 +44,127 @@ function fixture(): { root: string; inbox: string; message: string } {
 }
 
 describe('durable inbound attachment cache', () => {
+  const body = Buffer.from('name,value\n日本語,1\n')
+  const bom = Buffer.from([0xef, 0xbb, 0xbf])
+
+  async function receiveHttp(
+    target: ReturnType<typeof fixture>,
+    bytes: Buffer,
+    metadataSize: number,
+    framing: 'length' | 'chunked',
+    interrupt?: 'truncated' | 'abort',
+  ) {
+    const server = createServer(async (_request, response) => {
+      response.writeHead(200, framing === 'length'
+        ? { 'Content-Length': bytes.length + (interrupt === 'truncated' ? 3 : 0) }
+        : { 'Transfer-Encoding': 'chunked' })
+      for (const chunk of [bytes.subarray(0, 1), bytes.subarray(1, 2), bytes.subarray(2)]) {
+        if (response.destroyed) return
+        response.write(chunk)
+        await Bun.sleep(5)
+      }
+      if (interrupt === 'truncated') response.socket?.end()
+      else response.end()
+    })
+    await new Promise<void>(resolve => { server.listen(0, '127.0.0.1', resolve) })
+    const address = server.address() as { port: number }
+    const controller = new AbortController()
+    const temporary = join(target.message, 'FBOM123.txt.partial-test')
+    const destination = join(target.message, 'FBOM123.txt')
+    let descriptor: number | undefined
+    try {
+      const response = await new Promise<IncomingMessage>((resolve, reject) => {
+        const request = get(`http://127.0.0.1:${address.port}/`, { signal: controller.signal }, resolve)
+        request.on('error', reject)
+      })
+      descriptor = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+      let received = 0
+      for await (const chunk of response) {
+        received += chunk.byteLength
+        writeAllSync(descriptor, chunk)
+        if (interrupt === 'abort') controller.abort()
+      }
+      verifyInboundDownloadBeforeRename(descriptor, received, metadataSize, response)
+      closeSync(descriptor)
+      descriptor = undefined
+      renameSync(temporary, destination)
+      return loadCachedInboundAttachment({
+        inboxDir: target.inbox, messageTs: '1900000000.000100', fileId: 'FBOM123', ordinal: 0,
+      })!
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor)
+      rmSync(temporary, { force: true })
+      server.closeAllConnections()
+      await new Promise<void>(resolve => { server.close(() => resolve()) })
+    }
+  }
+
+  for (const framing of ['length', 'chunked'] as const) {
+    test.each([
+      ['BOM added', Buffer.concat([bom, body]), body.length],
+      ['BOM removed', body, bom.length + body.length],
+      ['BOM retained', Buffer.concat([bom, body]), bom.length + body.length],
+      ['plain text', body, body.length],
+      ['empty', Buffer.alloc(0), 0],
+      ['binary', Buffer.from([0xff, 0xfe, 0, 0, 0x81, 0xff]), 6],
+    ] as const)(`HTTP ${framing} preserves actual bytes and cache across restart: %s`, async (_label, bytes, metadataSize) => {
+      const target = fixture()
+      const downloaded = await receiveHttp(target, bytes, metadataSize, framing)
+      expect(downloaded.size).toBe(bytes.length)
+      expect(readFileSync(downloaded.path)).toEqual(bytes)
+      expect(downloaded.digest).toBe(createHash('sha256').update(bytes).digest('hex'))
+      expect(loadCachedInboundAttachment({
+        inboxDir: target.inbox, messageTs: '1900000000.000100', fileId: 'FBOM123', ordinal: 0,
+        manifest: JSON.parse(JSON.stringify(downloaded)),
+      })).toEqual(downloaded)
+    })
+  }
+
+  test.each([
+    ['length', 'truncated'], ['chunked', 'truncated'],
+    ['length', 'abort'], ['chunked', 'abort'],
+  ] as const)('incomplete HTTP download is not published: %s/%s', async (framing, interrupt) => {
+    const target = fixture()
+    // Matching catalog size does not make a truncated HTTP representation valid.
+    await expect(receiveHttp(target, body, body.length, framing, interrupt)).rejects.toThrow()
+    expect(readdirSync(target.message)).toEqual([])
+    expect(loadCachedInboundAttachment({
+      inboxDir: target.inbox, messageTs: '1900000000.000100', fileId: 'FBOM123', ordinal: 0,
+    })).toBeNull()
+  })
+
+  test('HTTP framing and complete response are checked even when catalog size matches', () => {
+    const target = fixture()
+    const path = join(target.message, 'file')
+    writeFileSync(path, body, { mode: 0o600 })
+    const descriptor = openSync(path, constants.O_RDONLY)
+    const valid = { statusCode: 200, headers: { 'content-length': String(body.length) }, complete: true, aborted: false }
+    try {
+      for (const invalid of [
+        { ...valid, statusCode: 206 },
+        { ...valid, statusCode: 204 },
+        { ...valid, complete: false },
+        { ...valid, aborted: true },
+        { ...valid, headers: { 'content-range': 'bytes 0-22/26' } },
+        { ...valid, headers: { 'content-length': String(body.length + 3) } },
+        { ...valid, headers: { 'content-length': String(body.length - 3) } },
+        { ...valid, headers: { 'content-length': 'invalid' } },
+        { ...valid, headers: { 'content-length': '-1' } },
+        { ...valid, headers: { 'content-length': String(50 * 1024 * 1024 + 1) } },
+        { ...valid, headers: { 'content-length': String(body.length), 'transfer-encoding': 'chunked' } },
+        { ...valid, headers: { 'content-encoding': 'gzip' } },
+        { ...valid, headers: { 'transfer-encoding': 'gzip, chunked' } },
+      ]) {
+        expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, body.length, invalid)).toThrow()
+      }
+      expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, 50 * 1024 * 1024 + 1, valid)).toThrow()
+      expect(() => verifyInboundDownloadBeforeRename(descriptor, 50 * 1024 * 1024 + 1, undefined, valid)).toThrow()
+      // Close-delimited responses retain the metadata check; no +/-3 exception.
+      expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, body.length + 3, { ...valid, headers: {} })).toThrow()
+      expect(verifyInboundDownloadBeforeRename(descriptor, body.length, body.length, { ...valid, headers: {} })).toHaveProperty('ino')
+    } finally { closeSync(descriptor) }
+  })
+
   test('short writeを最後まで再試行しSlack metadataのsizeとrename前に照合する', () => {
     const { message } = fixture()
     const temporary = join(message, 'FWRITE123.bin.partial-test')

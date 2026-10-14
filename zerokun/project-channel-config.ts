@@ -12,7 +12,11 @@ import {
   realpathSync,
   unlinkSync,
 } from 'fs'
-import { join } from 'path'
+import { dirname, join } from 'path'
+import { Database } from 'bun:sqlite'
+import { runtimeRootForState } from './runtime-release.ts'
+import { DEFAULT_PRIMARY_CORE, isPrimaryCore, type PrimaryCore } from './primary-core.ts'
+import { SlackProjectDisconnectedError } from './slack-project-admission.ts'
 import { JobStore } from './job-runner.ts'
 import {
   inspectProcessLock,
@@ -42,7 +46,8 @@ const MUTATION_LOCK_WAIT_MS = 5_000
 export interface ProjectChannelConfig {
   version: typeof CONFIG_VERSION
   slackChannels: string[]
-  slackAppId?: string
+  slackAppId?: string | null
+  slackAcceptAfter?: number
 }
 
 interface RouteJournal {
@@ -185,16 +190,38 @@ export function readProjectChannelConfig(repoPathInput: string): ProjectChannelC
   }
   const record = value as Record<string, unknown>
   if (record.version !== CONFIG_VERSION
-    || !['slackChannels,version', 'slackAppId,slackChannels,version'].includes(Object.keys(record).sort().join(','))) {
+    || !['slackChannels,version', 'slackAppId,slackChannels,version'].includes(Object.keys(record).filter(key => key !== 'slackAcceptAfter').sort().join(','))) {
     throw new Error(`未対応のZeroちゃん設定形式です: ${path}`)
   }
   const config: ProjectChannelConfig = {
     version: CONFIG_VERSION,
     slackChannels: normalizeChannels(record.slackChannels),
-    ...(record.slackAppId === undefined ? {} : { slackAppId: requireSlackAppId(String(record.slackAppId)) }),
+    ...(record.slackAppId === undefined ? {} : { slackAppId: record.slackAppId === null ? null : requireSlackAppId(String(record.slackAppId)) }),
   }
+  if (record.slackAcceptAfter !== undefined) {
+    if (!Number.isSafeInteger(record.slackAcceptAfter) || Number(record.slackAcceptAfter) <= 0) throw new Error('Slack受付時刻が不正です')
+    config.slackAcceptAfter = Number(record.slackAcceptAfter)
+  }
+  if (config.slackAppId === null && config.slackChannels.length) throw new Error('解除済みプロジェクトにチャンネル設定があります')
   sameDirectory(dir, identity)
   return config
+}
+
+/** Binding an unrouted stopped App must remain possible so its normal updater
+ * can select a project. Publishing routes requires a compatible pinned runtime,
+ * including when another project or the watchdog starts that App later. */
+function assertReconnectGatewayCompatible(config: ProjectChannelConfig, appId: string, stateDir: string, checkPinnedRuntime = true): void {
+  if (config.slackAppId !== null && config.slackAcceptAfter === undefined) return
+  if (checkPinnedRuntime && !existsSync(join(runtimeRootForState(stateDir, dirname(import.meta.dir)), 'zerokun', 'slack-project-admission.ts'))) {
+    throw new Error(`Slackアプリ ${appId} の実行版は再接続の受付時刻に未対応です。このプロジェクトで zerochan update を実行してください（設定は変更していません）`)
+  }
+  const gateway = inspectProcessLock(join(stateDir, 'plugin.lock'), /server\.ts(?:\s|$)/)
+  const ready = readGatewayReadiness(join(stateDir, 'gateway-ready.json'))
+  if (gateway.status === 'unknown'
+    || (gateway.status === 'active' && (ready?.pid !== gateway.pid
+      || ready.slackAppId !== appId || ready.projectDisconnectVersion !== 1))) {
+    throw new Error(`Slackアプリ ${appId} の稼働中gatewayは再接続の受付時刻に未対応です。zerochan update で更新してください（設定は変更していません）`)
+  }
 }
 
 function withProjectConfigLock<T>(repoPath: string, action: () => T): T {
@@ -212,14 +239,51 @@ function withProjectConfigLock<T>(repoPath: string, action: () => T): T {
   }
 }
 
+export function projectPrimaryCore(repoPath: string): { desired: PrimaryCore; active: PrimaryCore } {
+  const dir = configDirectory(realpathSync(repoPath))
+  const defaults = { desired: DEFAULT_PRIMARY_CORE, active: DEFAULT_PRIMARY_CORE }
+  if (!existsSync(dir)) return defaults
+  const identity = directoryIdentity(dir)
+  const raw = readOptionalBoundedOwnerOnlyRegularFile(join(dir, 'primary-core.json'), MAX_CONFIG_BYTES)
+  sameDirectory(dir, identity)
+  if (!raw) return defaults
+  const config = JSON.parse(raw)
+  if (config?.version !== 1 || Object.keys(config).sort().join(',') !== 'active,desired,version'
+    || !isPrimaryCore(config.desired) || !isPrimaryCore(config.active)) throw new Error('主担当の設定が不正です')
+  return { desired: config.desired, active: config.active }
+}
+
+export function setProjectPrimaryCore(repoPathInput: string, core: PrimaryCore): void {
+  if (!isPrimaryCore(core)) throw new Error('主担当の設定が不正です')
+  const repoPath = realpathSync(repoPathInput)
+  withProjectConfigLock(repoPath, () => {
+    const before = projectPrimaryCore(repoPath)
+    // Keep the channel file compatible with the gateway still accepting input.
+    atomicWritePrivateFile(join(configDirectory(repoPath), 'primary-core.json'), JSON.stringify({ version: 1, ...before, desired: core }, null, 2) + '\n')
+  })
+}
+
+/** The caller completes runtime preflight before publishing this activation.
+ * Compare the selected value under the same lock to preserve concurrent set. */
+export function activateProjectPrimaryCore(repoPathInput: string, expected: PrimaryCore): void {
+  const repoPath = realpathSync(repoPathInput)
+  withProjectConfigLock(repoPath, () => {
+    const before = projectPrimaryCore(repoPath)
+    if (before.desired !== expected) throw new Error('起動中に主担当設定が変更されました。zerochan start を再実行してください')
+    atomicWritePrivateFile(join(configDirectory(repoPath), 'primary-core.json'), JSON.stringify({ version: 1, ...before, active: expected }, null, 2) + '\n')
+  })
+}
+
 function writeProjectChannelConfig(repoPath: string, slackChannels: string[], appId?: string): void {
   withProjectConfigLock(repoPath, () => {
   const identity = ensureLocalConfigDirectory(repoPath)
   const path = projectChannelConfigPath(repoPath)
   if (existsSync(path)) requireSafeExistingFile(path)
   const before = readProjectChannelConfig(repoPath)
+  assertProjectSlackAppAttached(repoPath)
   if (appId && before.slackAppId && before.slackAppId !== appId) throw new Error('プロジェクトと接続先Slackアプリが一致しません')
   const config: ProjectChannelConfig = {
+    ...before,
     version: CONFIG_VERSION,
     slackChannels: normalizeChannels(slackChannels),
     ...(before.slackAppId ? { slackAppId: before.slackAppId } : {}),
@@ -237,6 +301,7 @@ export function bindProjectSlackApp(repoPathInput: string, appIdInput: string, v
   withProjectConfigLock(repoPath, () => {
   const identity = ensureLocalConfigDirectory(repoPath)
   const before = readProjectChannelConfig(repoPath)
+  assertProjectSlackAppAttached(repoPath)
   if (before.slackAppId && before.slackAppId !== appId) {
     throw new Error('このプロジェクトは別のSlackアプリに接続済みです。接続先の変更には既存設定の移行が必要です')
   }
@@ -281,9 +346,14 @@ export function switchProjectSlackApp(
       recoverJournal(state, store)
     }
     withProjectConfigLock(repoPath, () => {
+      assertNoPendingAppUnset(repoPath)
       const saveConfig = (config: ProjectChannelConfig) => atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify(config, null, 2) + '\n')
       const saveJournal = (journal: AppSwitchJournal) => atomicWritePrivateFile(journalFile, JSON.stringify(journal) + '\n')
       const apply = (journal: AppSwitchJournal) => {
+        if (journal.direction === 'forward') {
+          const target = apps.find(app => app.appId === journal.targetAppId)!
+          assertReconnectGatewayCompatible(journal.before, target.appId, target.stateDir, journal.before.slackChannels.length > 0)
+        }
         // Check every destination before removing any route.
         for (const route of journal.routes) {
           const channels = journal.direction === 'rollback' ? route.channels
@@ -309,7 +379,7 @@ export function switchProjectSlackApp(
           }
           if (journal.direction === 'rollback' && route.explicitMode === false) store.restoreSlackChannelImplicitModeAfterRollback(route.appId)
         }
-        saveConfig(journal.direction === 'rollback' ? journal.before : { ...journal.before, slackAppId: journal.targetAppId })
+        saveConfig(journal.direction === 'rollback' ? journal.before : { ...journal.before, slackAppId: journal.targetAppId, ...(journal.before.slackAppId === null ? { slackAcceptAfter: Date.now() } : {}) })
         unlinkSync(journalFile)
       }
       const pending = readOptionalBoundedOwnerOnlyRegularFile(journalFile, MAX_JOURNAL_BYTES)
@@ -317,7 +387,7 @@ export function switchProjectSlackApp(
         const journal = JSON.parse(pending) as AppSwitchJournal
         if (journal.version !== 1 || !['forward', 'rollback'].includes(journal.direction)
           || !apps.some(app => app.appId === journal.targetAppId) || !Array.isArray(journal.routes)
-          || journal.before?.version !== 1 || (journal.before.slackAppId !== undefined && !apps.some(app => app.appId === journal.before.slackAppId))
+          || journal.before?.version !== 1 || (journal.before.slackAppId != null && !apps.some(app => app.appId === journal.before.slackAppId))
           || !journal.routes.some(route => route.appId === journal.targetAppId)
           || new Set(journal.routes.map(route => route.appId)).size !== journal.routes.length
           || journal.routes.some(route => !apps.some(app => app.appId === route.appId && app.stateDir === route.stateDir))) {
@@ -347,6 +417,7 @@ export function switchProjectSlackApp(
       if (before.slackAppId === targetAppId && routes.every(route => JSON.stringify(route.channels) === JSON.stringify(route.appId === targetAppId ? before.slackChannels : []))) return
       stores.get(apps.find(app => app.appId === targetAppId)!.stateDir)!
         .assertSlackChannelRoutesAvailable(targetAppId, repoPath, before.slackChannels)
+      assertReconnectGatewayCompatible(before, targetAppId, apps.find(app => app.appId === targetAppId)!.stateDir, before.slackChannels.length > 0)
       const journal: AppSwitchJournal = { version: 1, direction: 'forward', before, targetAppId, routes }
       saveJournal(journal)
       try { apply(journal) }
@@ -367,6 +438,123 @@ export function switchProjectSlackApp(
 
 function journalPath(stateDir: string): string {
   return join(stateDir, 'channel-route-transaction.json')
+}
+
+export function assertNoPendingAppUnset(repoPath: string): void {
+  if (existsSync(join(configDirectory(repoPath), 'slack-app-unset.json'))) {
+    throw new Error('Slackアプリの解除を復旧するため zerochan unset slack-app を再実行してください')
+  }
+}
+
+export function assertProjectSlackAppAttached(repoPath: string): void {
+  assertNoPendingAppUnset(repoPath)
+  if (readProjectChannelConfig(repoPath).slackAppId === null) throw new SlackProjectDisconnectedError()
+}
+
+/** Discover historical ownership without migrating or recovering unrelated apps. */
+function appHasProjectHistory(stateDir: string, repoPath: string): boolean {
+  const raw = readOptionalBoundedOwnerOnlyRegularFile(journalPath(stateDir), MAX_JOURNAL_BYTES)
+  if (raw !== null) {
+    // Discovery needs only ownership. Validate the whole operation only when
+    // recovering a related app; malformed foreign journals stay untouched.
+    try { if (JSON.parse(raw)?.repoPath === repoPath) return true } catch { /* Cannot be replayed as a valid route transaction. */ }
+  }
+  const path = resolveZeroJobDatabasePath(stateDir)
+  if (!existsSync(path)) return false
+  const db = new Database(path, { readonly: true })
+  try {
+    db.exec('PRAGMA busy_timeout=5000')
+    for (const table of ['slack_threads', 'slack_channel_routes']) {
+      if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue
+      if (db.query(`SELECT 1 FROM ${table} WHERE repo_path = ? LIMIT 1`).get(repoPath)) return true
+    }
+    return false
+  } finally { db.close() }
+}
+
+/** Forward-only recovery: block admission before deleting routes. No credentials,
+ * accepted jobs, thread history, service state or other projects are removed. */
+export function unsetProjectSlackApp(
+  repoPathInput: string,
+  registeredApps: Array<{ appId: string; stateDir: string }>,
+): void {
+  const repoPath = realpathSync(repoPathInput)
+  resolveProjectLayout(repoPath)
+  const apps = registeredApps.map(app => ({ appId: requireSlackAppId(app.appId), stateDir: realpathSync(app.stateDir) }))
+  const leases: Array<{ path: string; lease: ProcessLockLease }> = []
+  const stores = new Map<string, JobStore>()
+  const journalFile = join(configDirectory(repoPath), 'slack-app-unset.json')
+  const initial = readProjectChannelConfig(repoPath)
+  const pending = readOptionalBoundedOwnerOnlyRegularFile(journalFile, MAX_JOURNAL_BYTES)
+  if (pending === null && initial.slackAppId === null) return
+  const journal = pending === null ? null : JSON.parse(pending)
+  if (journal !== null && (journal.version !== 1 || journal.repoPath !== repoPath || !Array.isArray(journal.apps)
+    || new Set(journal.apps.map((app: { appId: string }) => app.appId)).size !== journal.apps.length
+    || journal.apps.some((app: { appId: string; stateDir: string }) => !apps.some(current => current.appId === app.appId && current.stateDir === app.stateDir)))) {
+    throw new Error('Slackアプリ解除の保存記録と登録情報が一致しません')
+  }
+  // The caller holds the registry lock against app switches. Current ownership,
+  // historical routes/threads, bootstrap gateways and interrupted transactions
+  // all remain in scope; other apps need no mutation lease or update preflight.
+  const owners = apps.filter(app => app.appId === initial.slackAppId
+    || readGatewayReadiness(join(app.stateDir, 'gateway-ready.json'))?.projectDir === repoPath
+    || appHasProjectHistory(app.stateDir, repoPath))
+  // Older journals listed every registered app. Retain their recovery scope
+  // without requiring unrelated runtimes to support this project's admission.
+  const targets = apps.filter(app => owners.includes(app)
+    || journal?.apps.some((saved: { appId: string }) => saved.appId === app.appId))
+  try {
+    for (const state of [...new Set(targets.map(app => app.stateDir))].sort()) {
+      const lease = acquireMutationLock(state)
+      leases.push({ path: mutationLockPath(state), lease })
+      assertUpdateIdle(state)
+    }
+    // Reject unsupported runtimes before JobStore can migrate a database or
+    // recover another project's journal in the same app.
+    for (const app of owners) {
+      const readiness = readGatewayReadiness(join(app.stateDir, 'gateway-ready.json'))
+      const root = runtimeRootForState(app.stateDir, dirname(import.meta.dir))
+      const gateway = inspectProcessLock(join(app.stateDir, 'plugin.lock'), /server\.ts(?:\s|$)/)
+      if (!existsSync(join(root, 'zerokun', 'slack-project-admission.ts'))
+        || gateway.status === 'unknown'
+        || (gateway.status === 'active' && (readiness?.pid !== gateway.pid || readiness.projectDisconnectVersion !== 1))) {
+        throw new Error(`Slackアプリ ${app.appId} の実行版が解除機能に未対応です。先にそのアプリを zerochan update で更新してください（設定は変更していません）`)
+      }
+    }
+    for (const state of [...new Set(targets.map(app => app.stateDir))].sort()) {
+      const store = new JobStore(resolveZeroJobDatabasePath(state))
+      stores.set(state, store)
+      recoverJournal(state, store)
+    }
+    withProjectConfigLock(repoPath, () => {
+      if (existsSync(join(configDirectory(repoPath), 'slack-app-switch.json'))) {
+        throw new Error('先に zerochan set slack-app で中断した切り替えを復旧してください')
+      }
+      const before = readProjectChannelConfig(repoPath)
+      if (before.slackAppId !== initial.slackAppId
+        || readOptionalBoundedOwnerOnlyRegularFile(journalFile, MAX_JOURNAL_BYTES) !== pending) {
+        throw new Error('Slackアプリの接続状態が変更されました。解除を再実行してください')
+      }
+      if (before.slackAppId && !apps.some(app => app.appId === before.slackAppId)) {
+        throw new Error('接続元のSlackアプリが未登録のため解除できません')
+      }
+      if (!apps.length && before.slackAppId === undefined) {
+        throw new Error('このPCに登録済みのSlackアプリがありません')
+      }
+      if (pending === null) atomicWritePrivateFile(journalFile, JSON.stringify({ version: 1, repoPath, apps: targets }) + '\n')
+      // The journal itself blocks new admission, including after a crash here.
+      atomicWritePrivateFile(projectChannelConfigPath(repoPath), JSON.stringify({
+        ...before,
+        version: CONFIG_VERSION, slackAppId: null, slackChannels: [],
+        ...(before.slackAcceptAfter === undefined ? {} : { slackAcceptAfter: before.slackAcceptAfter }),
+      } satisfies ProjectChannelConfig, null, 2) + '\n')
+      for (const app of targets) stores.get(app.stateDir)!.syncSlackChannelRoutes({ appId: app.appId, repoPath, channelIds: [] })
+      unlinkSync(journalFile)
+    })
+  } finally {
+    for (const store of stores.values()) store.close()
+    for (const entry of leases.reverse()) releaseProcessLock(entry.path, entry.lease)
+  }
 }
 
 function mutationLockPath(stateDir: string): string {
@@ -454,7 +642,10 @@ function recoverJournal(stateDir: string, store: JobStore): void {
   if (!journal) return
   const repoPath = realpathSync(journal.repoPath)
   if (repoPath !== journal.repoPath) throw new Error('channel route journal project moved')
-  const binding = readProjectChannelConfig(repoPath).slackAppId
+  assertProjectSlackAppAttached(repoPath)
+  const config = readProjectChannelConfig(repoPath)
+  const binding = config.slackAppId
+  assertReconnectGatewayCompatible(config, journal.appId, stateDir)
   if (binding && binding !== journal.appId) throw new Error('保存されたチャンネル設定とSlackアプリが一致しません')
   store.assertSlackChannelRoutesAvailable(journal.appId, repoPath, journal.afterChannels)
   if (journal.operation === 'sync') {
@@ -493,13 +684,16 @@ export function mutateProjectChannelConfig(input: {
 }): ProjectChannelConfig {
   const repoPath = realpathSync(input.repoPath)
   const stateDir = realpathSync(input.stateDir)
+  assertProjectSlackAppAttached(repoPath)
   const appId = requireSlackAppId(input.appId)
   const lease = acquireMutationLock(stateDir)
   const lockPath = mutationLockPath(stateDir)
   let store: JobStore | undefined
   try {
+    assertReconnectGatewayCompatible(readProjectChannelConfig(repoPath), appId, stateDir)
     store = new JobStore(resolveZeroJobDatabasePath(stateDir))
     assertUpdateIdle(stateDir)
+    assertProjectSlackAppAttached(repoPath)
     if (existsSync(join(configDirectory(repoPath), 'slack-app-switch.json'))) {
       throw new Error('Slackアプリの切り替えを復旧するため zerochan set slack-app を再実行してください')
     }
@@ -585,6 +779,7 @@ export function projectChannelStatus(input: {
 }): string {
   const repoPath = realpathSync(input.repoPath)
   const stateDir = realpathSync(input.stateDir)
+  assertProjectSlackAppAttached(repoPath)
   const appId = requireSlackAppId(input.appId)
   const lease = acquireMutationLock(stateDir)
   const lockPath = mutationLockPath(stateDir)

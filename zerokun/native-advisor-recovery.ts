@@ -3,7 +3,6 @@ import { randomBytes } from 'node:crypto'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { isFinalAppServerAgentMessage } from './codex-app-server-session.ts'
 import { nativeAdvisorMarker, nativeAdvisorResponseHasExactMarker } from './native-advisor-evidence.ts'
-import { containsCredentialMaterial } from './public-output-guard.ts'
 import { retryAdvisorConnection } from './advisor-connection-retry.ts'
 
 type RecordValue = Record<string, unknown>
@@ -45,7 +44,7 @@ export type NativeAdvisorRegistration = Omit<RetainedNativeAdvisor, 'threadId' |
   taskName: string
   prompt: string
   model: 'gpt-6-astra'
-  reasoningEffort: 'high' | 'medium'
+  reasoningEffort: 'high' | 'medium' | 'low'
 }
 const registrationPath = (contextPath: string, phase: string, round: number) => `${contextPath}.native-${phase}-${round}`
 
@@ -57,11 +56,11 @@ export function readNativeAdvisorRegistrations(contextPath: string, attemptNonce
       const value = JSON.parse(raw) as NativeAdvisorRegistration
       if (value.phase !== phase || value.round !== round
         || value.perspective !== (phase === 'review' ? 'risk' : 'solution')
-        || value.model !== 'gpt-6-astra' || value.reasoningEffort !== (phase === 'review' ? 'medium' : 'high')
+        || value.model !== 'gpt-6-astra'
+        || !(phase === 'review' ? ['low', 'medium'] : ['medium', 'high']).includes(value.reasoningEffort)
         || !/^zero_native_[a-f0-9]{32}$/.test(value.taskName)
         || value.agentPath !== `/root/${value.taskName}`
         || typeof value.prompt !== 'string' || value.prompt.length > 28_000
-        || containsCredentialMaterial(value.prompt)
         || value.marker !== nativeAdvisorMarker(attemptNonce, value.inputRevision, value.inputDigest, phase, round, value.perspective)
         || !value.prompt.endsWith(value.marker)) throw new Error('native request registration invalid')
       return [value]
@@ -87,7 +86,7 @@ export function registerNativeAdvisor(options: {
     .find(value => value.phase === options.phase && value.round === options.round)
   if (saved) return saved // Same slot survives changed input; never allocate a replacement identity.
   if (!options.request.trim() || options.request.length > 24_000
-    || options.request.includes('\0') || containsCredentialMaterial(options.request)) throw new Error('unsafe native request')
+    || options.request.includes('\0')) throw new Error('unsafe native request')
   const perspective = options.phase === 'review' ? 'risk' : 'solution'
   const marker = nativeAdvisorMarker(options.attemptNonce, options.inputRevision, options.inputDigest,
     options.phase, options.round, perspective)
@@ -95,7 +94,7 @@ export function registerNativeAdvisor(options: {
   const registration: NativeAdvisorRegistration = {
     taskName, agentPath: `/root/${taskName}`, marker, inputRevision: options.inputRevision,
     inputDigest: options.inputDigest, phase: options.phase, round: options.round, perspective,
-    model: 'gpt-6-astra', reasoningEffort: options.phase === 'review' ? 'medium' : 'high',
+    model: 'gpt-6-astra', reasoningEffort: options.phase === 'review' ? 'low' : 'medium',
     prompt: `${options.request}\nRead-only advisor: no writes, tests, network, credentials, external changes or delegation.\nEnd your complete answer with this exact marker on its own final line:\n${marker}`,
   }
   atomicWritePrivateFile(registrationPath(options.contextPath, options.phase, options.round), JSON.stringify(registration))
@@ -194,7 +193,6 @@ export async function readRetainedNativeAdvisors(options: Options): Promise<Reta
         const finals = records(turn.items).filter(isFinalAppServerAgentMessage)
         const text = finals.at(-1)?.text
         if (typeof text === 'string' && text.length <= 24_000 && !text.includes('\0')
-          && !containsCredentialMaterial(text)
           && nativeAdvisorResponseHasExactMarker(text.trimEnd(), binding.marker)) binding.response = text.trimEnd()
       }
       recovered.push(binding)

@@ -6,6 +6,9 @@ import {
 import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { FIXTURE_PROCESS_DIR, FIXTURE_STOPPING, recordFixtureProcess, recordedFixtureProcesses, reapFixtureHandles, stopRecordedFixtureProcesses } from './launcher-fixture-processes.ts'
+import { bindProjectSlackApp, readProjectChannelConfig, switchProjectSlackApp, unsetProjectSlackApp } from './project-channel-config.ts'
+import { registerSlackApp } from './slack-app-registry.ts'
+import { writeLastConnectedProject } from './project-selection.ts'
 import { observeProcessGeneration } from './process-generation.ts'
 
 const LAUNCHER = join(dirname(import.meta.dir), 'codex-channel.sh')
@@ -31,7 +34,7 @@ function fixture(): string {
   temporaryDirs.push(base)
   const state = join(base, 'state')
   const project = join(base, 'project')
-  mkdirSync(state)
+  mkdirSync(state, { mode: 0o700 })
   mkdirSync(join(state, FIXTURE_PROCESS_DIR), { mode: 0o700 })
   mkdirSync(project)
   const initialized = Bun.spawnSync(['git', 'init', '-q', project], {
@@ -90,7 +93,7 @@ function startRunner(state: string): Bun.Subprocess {
   }))
   writeFileSync(
     join(lockDir, 'runtime'),
-    `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}\n`,
+    `zerokun-codex-runner-v2:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}\n`,
   )
   return process
 }
@@ -198,12 +201,30 @@ async function runLauncher(
     "releaseProcessLock(starterLock, starter.lease)",
     '',
   ].join('\n'), { mode: 0o700 })
+  const fakeGateway = join(state, 'fixture-gateway.ts')
+  writeFileSync(fakeGateway, [
+    `import { takeGatewayStartupLease } from ${JSON.stringify(join(import.meta.dir, 'service-control-state.ts'))}`,
+    `import { inspectProcessLock } from ${JSON.stringify(join(import.meta.dir, 'process-lock.ts'))}`,
+    `import { writeGatewayReadiness } from ${JSON.stringify(join(import.meta.dir, 'readiness.ts'))}`,
+    `import { writeFileSync } from 'fs'`,
+    `const state = ${JSON.stringify(state)}`,
+    'const hasLease = Boolean(process.env.ZEROKUN_STARTUP_LEASE)',
+    'const release = takeGatewayStartupLease(state)',
+    "if (process.env.ZEROKUN_STARTUP_LEASE !== undefined) throw new Error('lease leaked')",
+    "if (hasLease && inspectProcessLock(state + '/restart.lock/pid').status !== 'active') throw new Error('startup gap')",
+    "writeGatewayReadiness(state + '/gateway-ready.json', 'manual', process.pid, process.cwd(), 'A0123456789')",
+    'release()',
+    "if (hasLease) writeFileSync(state + '/startup-lease-verified', 'ready-before-release')",
+  ].join('\n'))
   for (const command of ['bun', 'caffeinate']) {
     const path = join(fakeBin, command)
     writeFileSync(path, [
       '#!/bin/bash',
       '[ -z "${FAKE_BUN_LOG:-}" ] || printf "%s\\n" "$*" >> "$FAKE_BUN_LOG"',
       '[ -z "${FAKE_ENV_LOG:-}" ] || /usr/bin/env >> "$FAKE_ENV_LOG"',
+      'if [[ "$*" == *server.ts* ]]; then',
+      `  exec ${JSON.stringify(process.execPath)} --config=/dev/null --no-env-file ${JSON.stringify(fakeGateway)}`,
+      'fi',
       'if [[ "$*" == *slack-app-identity.ts* ]] && [ "${FAKE_IDENTITY_FAIL:-0}" = "1" ]; then',
       '  echo "Slack App token identity verification failed: different Slack Apps" >&2',
       '  exit 1',
@@ -230,6 +251,9 @@ async function runLauncher(
       '  exit 3',
       'fi',
       'if [[ "$*" == *runtime-release.ts* ]]; then',
+      '  if [ "${FAKE_REAL_RUNTIME:-0}" = "1" ]; then',
+      `    exec ${JSON.stringify(process.execPath)} "$@"`,
+      '  fi',
       // These launcher fixtures have no release pin; runtime selection stays
       // on the real launcher checkout. Pin dispatch has its own integration tests.
       `  printf '%s\\n' ${JSON.stringify(dirname(LAUNCHER))}`,
@@ -238,7 +262,7 @@ async function runLauncher(
       'if [[ "$*" == *project-selection.ts* || "$*" == *project-app-state.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
-      'if [[ "$*" == *project-channel-config.ts* ]]; then',
+      'if [[ "$*" == *project-channel-config.ts* || "$*" == *slack-app-unset.ts* ]]; then',
       `  exec ${JSON.stringify(process.execPath)} "$@"`,
       'fi',
       'if [[ "$*" == *readiness.ts* ]]; then',
@@ -311,7 +335,7 @@ async function runLauncher(
       HERDR_BIN_PATH: herdr,
       ZEROKUN_STATE_DIR: state,
       FAKE_RUNNER_STATE: state,
-      FAKE_RUNNER_RUNTIME: `zerokun-codex-runner-v1:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}`,
+      FAKE_RUNNER_RUNTIME: `zerokun-codex-runner-v2:A0123456789:fixture-token-fingerprint:${'0'.repeat(64)}`,
       ...env,
     },
     cwd: launch.cwd,
@@ -371,7 +395,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['update', '--skip-tests'],
     })
     expect(invalid.exitCode).toBe(2)
-    expect(invalid.output).toContain('zerochan update [--recover-only]')
+    expect(invalid.output).toContain('使い方: zerochan <command>')
+    expect(invalid.output).toContain('詳細: zerochan <command> --help')
     expect(existsSync(invalidLog)).toBe(false)
   })
 
@@ -414,7 +439,8 @@ describe('codex-channel.sh replacement guard', () => {
       invokedAs: 'zerochan', cwd: project, args: ['stop', '--unsafe'],
     })
     expect(invalidStop.exitCode).toBe(2)
-    expect(invalidStop.output).toContain('zerochan stop [--force]')
+    expect(invalidStop.output).toContain('使い方: zerochan <command>')
+    expect(invalidStop.output).toContain('詳細: zerochan <command> --help')
   })
 
   test('Herdr外のzerochan startは可視workspace作成helperへ委譲する', async () => {
@@ -478,6 +504,125 @@ describe('codex-channel.sh replacement guard', () => {
     expect(unset.output).toContain('Slackチャンネルの紐付けをすべて解除しました')
     expect(JSON.parse(readFileSync(join(project, '.zerochan', 'config.json'), 'utf8')))
       .toEqual({ version: 1, slackChannels: [] })
+  })
+
+  test('unset/rebind requires a compatible route runtime and keeps management current and service dispatch pinned', async () => {
+    const state = realpathSync(fixture())
+    const project = realpathSync(join(dirname(state), 'project'))
+    const appId = 'A0123456789'
+    const apps = [{ appId, stateDir: state }]
+    registerSlackApp(appId, state, state)
+    bindProjectSlackApp(project, appId)
+    unsetProjectSlackApp(project, apps)
+    expect(readProjectChannelConfig(project).slackAppId).toBeNull()
+
+    // A previously prepared but never started App still points to its old code.
+    const oldRoot = join(state, 'old-release')
+    mkdirSync(join(oldRoot, 'zerokun'), { recursive: true })
+    writeFileSync(join(oldRoot, 'zerokun/job-runner.ts'), '')
+    const reader = join(oldRoot, 'reader.ts')
+    writeFileSync(reader, `import { existsSync, readFileSync } from 'fs';
+      const config = process.cwd() + '/.zerochan/config.json';
+      if (existsSync(config) && !existsSync(${JSON.stringify(join(oldRoot, 'zerokun/slack-project-admission.ts'))})) {
+        const keys = Object.keys(JSON.parse(readFileSync(config, 'utf8'))).sort().join(',');
+        if (!['slackChannels,version', 'slackAppId,slackChannels,version'].includes(keys)) {
+          console.error('未対応のZeroちゃん設定形式です'); process.exit(74);
+        }
+      }
+      console.log('legacy-runtime:' + process.argv.slice(2).join(' ')); process.exit(73);`)
+    writeFileSync(join(oldRoot, 'codex-channel.sh'), `#!/bin/bash\nexec ${JSON.stringify(BUN)} --no-env-file ${JSON.stringify(reader)} "$@"\n`)
+    symlinkSync(join(oldRoot, 'zerokun/job-runner.ts'), join(state, 'job-runner.ts'))
+    switchProjectSlackApp(project, appId, apps)
+    const before = readProjectChannelConfig(project)
+    expect(before.slackAcceptAfter).toBeGreaterThan(0)
+    const env = { FAKE_REAL_RUNTIME: '1' }
+    const run = (args: string[]) => runLauncher(state, env, undefined, { invokedAs: 'zerochan', cwd: project, args })
+    for (const args of [['set', 'slack-channel', 'CNEW'], ['unset', 'slack-channel'], ['start']]) {
+      const blocked = await run(args)
+      expect(blocked.exitCode, blocked.output).toBe(1)
+      expect(blocked.output).toContain('zerochan update')
+      expect(blocked.output).not.toContain('legacy-runtime:')
+      expect(readProjectChannelConfig(project)).toEqual(before)
+    }
+    const status = await run(['status'])
+    expect(status.exitCode, status.output).toBe(0)
+    const journal = join(state, 'channel-route-transaction.json')
+    const pending = JSON.stringify({ version: 1, operation: 'set', appId, repoPath: project,
+      beforeChannels: [], afterChannels: ['CNEW'], createdAt: Date.now() })
+    writeFileSync(journal, pending, { mode: 0o600 })
+    const recovery = await run(['status'])
+    expect(recovery.exitCode, recovery.output).toBe(1)
+    expect(recovery.output).toContain('zerochan update')
+    expect(readFileSync(journal, 'utf8')).toBe(pending)
+    expect(readProjectChannelConfig(project)).toEqual(before)
+    rmSync(journal)
+    for (const args of [['stop'], ['stop', '--force']]) {
+      const stop = await run(args)
+      expect(stop.exitCode, stop.output).toBe(73)
+      expect(stop.output).toContain('legacy-runtime:' + args.join(' '))
+    }
+    // Restart chooses last-connected Q, but an old launcher first reads cwd P.
+    const other = join(dirname(state), 'other')
+    mkdirSync(other)
+    expect(Bun.spawnSync(['git', 'init', '-q', other]).exitCode).toBe(0)
+    writeLastConnectedProject(state, other)
+    const restart = await run(['--restart'])
+    expect(restart.exitCode, restart.output).toBe(73)
+    expect(restart.output).toContain('legacy-runtime:--restart')
+    writeLastConnectedProject(state, project)
+    expect((await run(['--restart'])).output).toContain('zerochan update')
+    expect(realpathSync(join(state, 'job-runner.ts'))).toBe(join(oldRoot, 'zerokun/job-runner.ts'))
+    expect(readProjectChannelConfig(project)).toEqual(before)
+
+    // Simulate the normal updater supplying an admission-capable runtime.
+    writeFileSync(join(oldRoot, 'zerokun/slack-project-admission.ts'), '')
+    const set = await run(['set', 'slack-channel', 'CNEW'])
+    expect(set.exitCode, set.output).toBe(0)
+    expect(readProjectChannelConfig(project)).toEqual({ ...before, slackChannels: ['CNEW'] })
+    expect((await run(['status'])).output).toContain('Slackチャンネル: CNEW')
+    const next = join(state, 'next-app'), unsupported = join(state, 'unsupported-runtime')
+    mkdirSync(next, { mode: 0o700 }); mkdirSync(unsupported)
+    writeFileSync(join(next, 'legacy-runtime.json'), JSON.stringify({ version: 1, path: unsupported }), { mode: 0o600 })
+    expect(() => switchProjectSlackApp(project, 'ANEXT', [...apps, { appId: 'ANEXT', stateDir: next }])).toThrow('zerochan update')
+    expect(readProjectChannelConfig(project)).toEqual({ ...before, slackChannels: ['CNEW'] })
+    expect(existsSync(join(project, '.zerochan/slack-app-switch.json'))).toBe(false)
+    const unset = await run(['unset', 'slack-channel'])
+    expect(unset.exitCode, unset.output).toBe(0)
+    expect(readProjectChannelConfig(project)).toEqual(before)
+    const compatible = await run(['start'])
+    expect(compatible.exitCode, compatible.output).toBe(73)
+    expect(compatible.output).toContain('legacy-runtime:start')
+  }, 20_000)
+
+  test('reconnected project does not publish routes to a live gateway without admission support', async () => {
+    const state = realpathSync(fixture())
+    const project = realpathSync(join(dirname(state), 'project'))
+    const appId = 'A0123456789'
+    const apps = [{ appId, stateDir: state }]
+    registerSlackApp(appId, state, state)
+    bindProjectSlackApp(project, appId)
+    unsetProjectSlackApp(project, apps)
+    switchProjectSlackApp(project, appId, apps)
+    const before = readProjectChannelConfig(project)
+    const gateway = startGateway(state)
+    const ready = {
+      runtime: 'codex', pid: gateway.pid, connectedAt: Date.now(), release: 'fixture',
+      projectDir: project, channelRoutingVersion: 1, slackAppId: appId,
+    }
+    writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify(ready), { mode: 0o600 })
+    const run = () => runLauncher(state, {}, undefined, {
+      invokedAs: 'zerochan', cwd: project, args: ['set', 'slack-channel', 'CNEW'],
+    })
+    const refused = await run()
+    expect(refused.exitCode, refused.output).toBe(1)
+    expect(refused.output).toContain('zerochan update')
+    expect(readProjectChannelConfig(project)).toEqual(before)
+    expect(existsSync(join(state, 'channel-route-transaction.json'))).toBe(false)
+    expect(() => process.kill(gateway.pid, 0)).not.toThrow()
+    writeFileSync(join(state, 'gateway-ready.json'), JSON.stringify({ ...ready, projectDisconnectVersion: 1 }))
+    const allowed = await run()
+    expect(allowed.exitCode, allowed.output).toBe(0)
+    expect(readProjectChannelConfig(project)).toEqual({ ...before, slackChannels: ['CNEW'] })
   })
 
   test('旧gateway稼働中はchannel設定を変更せずrestartを案内する', async () => {
@@ -617,6 +762,7 @@ describe('codex-channel.sh replacement guard', () => {
     expect(() => process.kill(gateway.pid, 0)).toThrow()
     expect(() => process.kill(runner.pid, 0)).not.toThrow()
     expect(existsSync(join(state, 'restart.lock', 'pid'))).toBe(false)
+    expect(readFileSync(join(state, 'startup-lease-verified'), 'utf8')).toBe('ready-before-release')
   })
 
   test('zerochan --restartはSIGTERMを無視するgatewayもexact generationで回収する', async () => {

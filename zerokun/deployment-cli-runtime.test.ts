@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs } from './deployment-cli-runtime.ts'
 import { buildCodexPermissionOverrides } from './codex-executor.ts'
@@ -49,7 +49,7 @@ test('書込みprimaryだけで接続し既存ファイルや別のリンクを�
     expect(() => lstatSync(join(f.scratch, '.railway'))).toThrow()
   }
   const settings = buildCodexPermissionOverrides(f.job, f.options).join('\n')
-  expect(settings).toContain(`"HOME"=${JSON.stringify(f.scratch)}`)
+  expect(settings).toContain(`"HOME"=${JSON.stringify(realpathSync(homedir()))}`)
   for (const config of f.configs) {
     expect(settings).toContain(`${JSON.stringify(config.directory)}="write"`)
     expect(readlinkSync(join(f.scratch, `.${config.name}`))).toBe(config.directory)
@@ -73,7 +73,8 @@ test.skipIf(process.platform !== 'darwin' || !Bun.which('codex'))(
     const f = fixture()
     const overrides = buildCodexPermissionOverrides(f.job, f.options)
     const setting = overrides.find(value => value.startsWith('shell_environment_policy.set='))!
-    const env = (Bun.TOML.parse(setting) as any).shell_environment_policy.set
+    // This test exercises the legacy scratch links using synthetic credentials only.
+    const env = { ...(Bun.TOML.parse(setting) as any).shell_environment_policy.set, HOME: f.scratch }
     const run = (overrides: string[], command: string) => Bun.spawnSync(['codex', 'sandbox',
       ...overrides.flatMap(value => ['-c', value]), '-P', 'zerokun_job', '-C', f.repo, '--',
       '/usr/bin/env', '-i', ...Object.entries(env).map(([key, value]) => `${key}=${value}`),
