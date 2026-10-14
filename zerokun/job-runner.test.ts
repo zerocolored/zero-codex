@@ -100,6 +100,7 @@ import {
   codexThreadIdFromEvent,
   executeCodexJob,
   extractCodexRateLimit,
+  describeCodexFailure,
   assertRequiredAdvisorPreparationRounds,
   assertRequiredAdvisorRounds,
   parseCodexResult,
@@ -321,6 +322,122 @@ function uiApprovalRepositorySnapshot(
 
 function makeStore(): JobStore {
   return new JobStore(join(fixtureDir(), 'jobs.sqlite3'))
+}
+
+test('delivered native retry notice suppresses the following terminal throttle notice across reopen', () => {
+  let store = makeStore()
+  const path = store.dbPath
+  store.enqueue(input())
+  const job = store.claimNext('notification-throttle')!
+  const snapshot = readAdvisorInputSnapshot(dirname(path), job.id)
+  const binding = { jobId: job.id, attempt: job.attempts, epoch: job.controlEpoch,
+    executorNonce: 'd'.repeat(32), threadId: 'thread-notice', requestId: 61 }
+  store.beginInitialTurnDispatch({ ...binding, inputRevision: snapshot.revision, inputDigest: snapshot.digest })
+  store.acknowledgeInitialTurnDispatch({ ...binding, workerId: job.workerId!, turnId: 'turn-notice' })
+  expect(store.stageAppServerRateLimitWaitNotification(job.id, job.attempts, binding.threadId, 'turn-notice')).toBe('staged')
+  const first = store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')
+  expect(first).toHaveLength(1)
+  store.markStatusNotificationDelivered(first[0]!.id)
+  store.close()
+  store = new JobStore(path)
+  const resumeAt = Date.now() + 30_000
+  store.finishAppServerTurn({ ...binding, turnId: 'turn-notice', retainInput: true,
+    rateLimitResumeAt: resumeAt, rateLimitReason: 'throttled', rateLimitRetryCount: 1, rateLimitSafeToReplay: false })
+  store.requeueAt(job.id, resumeAt, 'fixture429', binding.threadId, 'throttled')
+  expect(store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')).toHaveLength(0)
+  expect(store.get(job.id)?.notBefore).toBe(resumeAt)
+  expect(store.get(job.id)?.rateLimitRecovery?.reason).toBe('throttled')
+  store.close()
+})
+
+test('throttle notices share a durable 15 minute window across native, phased and terminal paths', () => {
+  let store = makeStore()
+  const path = store.dbPath
+  store.enqueue(input())
+  const job = store.claimNext('notice-window')!
+  const snapshot = readAdvisorInputSnapshot(dirname(path), job.id)
+  const binding = { jobId: job.id, attempt: job.attempts, epoch: job.controlEpoch,
+    executorNonce: 'e'.repeat(32), threadId: 'thread-window', requestId: 61 }
+  store.beginInitialTurnDispatch({ ...binding, inputRevision: snapshot.revision, inputDigest: snapshot.digest })
+  store.acknowledgeInitialTurnDispatch({ ...binding, workerId: job.workerId!, turnId: 'turn-window' })
+  const now = Date.now()
+  const payload = '💬 ⏸ 一時的にリクエストが制限されています。作業を保持し、20:00 に再試行します。'
+  expect(store.stageCommentaryNotification(job.id, job.attempts, '1'.repeat(64), payload, now)).toBe('staged')
+  // Pending commentary also suppresses the native retry status, across reopen.
+  store.close()
+  store = new JobStore(path)
+  expect(store.stageAppServerRateLimitWaitNotification(job.id, job.attempts, binding.threadId, 'turn-window', now + 100)).toBe('closed')
+  expect(store.stageCommentaryNotification(job.id, job.attempts, '4'.repeat(64), payload, now + 900_001)).toBe('duplicate')
+  expect(store.stageAppServerRateLimitWaitNotification(job.id, job.attempts, binding.threadId, 'turn-window', now + 900_001)).toBe('closed')
+  const db = new Database(path)
+  db.run('UPDATE commentary_notifications SET delivered_at = ? WHERE job_id = ?', [now, job.id])
+  expect(store.stageCommentaryNotification(job.id, job.attempts, '2'.repeat(64), payload, now + 899_999)).toBe('duplicate')
+  expect(store.stageCommentaryNotification(job.id, job.attempts, '3'.repeat(64), payload, now + 900_001)).toBe('staged')
+  const resumeAt = now + 30_000
+  store.finishAppServerTurn({ ...binding, turnId: 'turn-window', retainInput: true,
+    rateLimitResumeAt: resumeAt, rateLimitReason: 'throttled', rateLimitRetryCount: 1, rateLimitSafeToReplay: false })
+  store.requeueAt(job.id, resumeAt, 'fixture429', binding.threadId, 'throttled')
+  expect(store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')).toHaveLength(0)
+  expect(db.query<{ count: number }, []>('SELECT count(*) AS count FROM commentary_notifications').get()?.count).toBe(2)
+  db.close()
+  store.close()
+})
+
+for (const scenario of ['matching', 'provider-reset', 'quota', 'cancelled', 'wrong-turn', 'running'] as const) {
+  test(`legacy transport429 recovery ${scenario} preserves terminal authority`, () => {
+    let store = makeStore()
+    const path = store.dbPath
+    store.enqueue(input({ writeEnabled: true }))
+    const job = store.claimNext('legacy-throttle')!
+    const snapshot = readAdvisorInputSnapshot(dirname(path), job.id)
+    const binding = { jobId: job.id, attempt: job.attempts, epoch: job.controlEpoch,
+      executorNonce: 'a'.repeat(32), threadId: 'thread-legacy-throttle', requestId: 61 }
+    expect(store.beginInitialTurnDispatch({ ...binding, inputRevision: snapshot.revision, inputDigest: snapshot.digest })).toBe('dispatching')
+    store.acknowledgeInitialTurnDispatch({ ...binding, workerId: job.workerId!, turnId: 'turn-legacy-throttle' })
+    const oldResume = Date.now() + 3_660_000
+    store.finishAppServerTurn({ ...binding, turnId: 'turn-legacy-throttle', retainInput: true,
+      rateLimitResumeAt: oldResume, rateLimitReason: 'rate-limit', rateLimitSafeToReplay: false })
+    const failure = { error: {
+      message: 'exceeded retry limit, last status: 429 Too Many Requests',
+      codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+      ...(scenario === 'provider-reset' ? { retry_after: 3600 } : {}),
+      ...(scenario === 'quota' ? { code: 'usage_limit_reached' } : {}),
+    } }
+    store.requeueAt(job.id, oldResume, describeCodexFailure(1, JSON.stringify({ type: 'turn.failed', ...failure }), ''), binding.threadId)
+    store.close()
+    const db = new Database(path)
+    if (scenario === 'cancelled') db.run('UPDATE jobs SET cancel_requested_at = ? WHERE id = ?', [Date.now(), job.id])
+    if (scenario === 'running') db.run("UPDATE jobs SET status = 'running' WHERE id = ?", [job.id])
+    if (scenario === 'wrong-turn') db.run("UPDATE jobs SET rate_limit_terminal_json = json_set(rate_limit_terminal_json, '$.turnId', 'foreign-turn') WHERE id = ?", [job.id])
+    db.close()
+    const before = Date.now()
+    store = new JobStore(path)
+    expect(store.get(job.id)?.notBefore).toBe(oldResume)
+    if (scenario !== 'running') store.recoverInterrupted()
+    const recovered = store.get(job.id)!
+    if (scenario === 'matching') {
+      expect(recovered.notBefore! - before).toBeGreaterThanOrEqual(30_000)
+      expect(recovered.notBefore! - Date.now()).toBeLessThanOrEqual(30_000)
+      expect(recovered.rateLimitRecovery).toMatchObject({ version: 2, reason: 'throttled', safeToReplay: false,
+        turnId: 'turn-legacy-throttle', resumeAt: recovered.notBefore })
+      expect(recovered.transientRateLimitCount).toBe(1)
+      const notifications = store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')
+      expect(notifications).toHaveLength(1)
+      expect(notifications[0]!.payload).not.toContain('使用量上限')
+      store.close()
+      store = new JobStore(path)
+      expect(store.get(job.id)?.notBefore).toBe(recovered.notBefore)
+      expect(store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')).toHaveLength(1)
+      const continued = store.claimNext('recovered-worker', 20, recovered.notBefore! + 1)!
+      expect(buildCodexWorkerPrompt(continued, readAdvisorInputSnapshot(dirname(path), job.id), {
+        attemptNonce: 'b'.repeat(32), artifactDir: join(dirname(path), 'artifacts'), advisorEnabled: false,
+      })).toContain('Do not blindly replay')
+    } else {
+      expect(recovered.notBefore).toBe(oldResume)
+      expect(recovered.rateLimitRecovery?.version).toBe(1)
+    }
+    store.close()
+  })
 }
 
 test('再開には同じスレッドの実配送記録を渡し生成済み回答と区別する', () => {
@@ -9161,7 +9278,7 @@ describe('Codex JSONL contract', () => {
     expect(extractCodexRateLimit(failure, 1_000)).toEqual({
       rateLimited: true,
       resetsAtMs: 121_000,
-      reason: 'rate-limit',
+      reason: 'throttled',
     })
     const appServerFailure = JSON.stringify({
       method: 'turn/completed',

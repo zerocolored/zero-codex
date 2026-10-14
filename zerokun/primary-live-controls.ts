@@ -198,7 +198,7 @@ export function createPrimaryLiveControlHooks(store: JobStore, job: JobRecord): 
     },
     finishTurn: ({
       executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
-      rateLimitReason, rateLimitSafeToReplay,
+      rateLimitReason, rateLimitSafeToReplay, rateLimitRetryCount,
     }) => store.finishAppServerTurn({
       jobId: job.id,
       epoch: job.controlEpoch,
@@ -209,6 +209,7 @@ export function createPrimaryLiveControlHooks(store: JobStore, job: JobRecord): 
       rateLimitResumeAt,
       rateLimitReason,
       rateLimitSafeToReplay,
+      rateLimitRetryCount,
     }),
     recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
       store.recordAppServerRateLimit({

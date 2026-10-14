@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { legacyTransportThrottle, throttleRetryDelay, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitReason } from './codex-rate-limit.ts'
 import { isPrimaryCore, type PrimaryCore, type JobRuntime } from './primary-core.ts'
 import { migratePrimaryCoreRuntime } from './primary-core-migration.ts'
 import { projectPrimaryCore } from './project-channel-config.ts'
@@ -613,11 +614,12 @@ export interface JobRecord {
    * App Server turn.  A retry may use it only when every durable binding still
    * matches; `notBefore` by itself is never write-retry authority.
    */
+  transientRateLimitCount?: number
   rateLimitRecovery?: CodexRateLimitTerminalReceipt | null
 }
 
 export type CodexRateLimitTerminalReceipt = {
-  version: 1
+  version: 1 | 2
   jobId: string
   attempt: number
   controlEpoch: number
@@ -625,7 +627,7 @@ export type CodexRateLimitTerminalReceipt = {
   threadId: string
   turnId: string
   resumeAt: number
-  reason: 'rate-limit' | 'capacity'
+  reason: CodexRateLimitReason
   safeToReplay: boolean
   recordedAt: number
 }
@@ -702,6 +704,7 @@ type JobRow = {
   cancel_requested_at: number | null
   terminal_outcome: JobTerminalOutcome | null
   ui_approval_request_id: string | null
+  transient_rate_limit_count: number
   rate_limit_terminal_json: string | null
 }
 
@@ -2071,6 +2074,7 @@ function ensureJobSchemaMigrations(db: Database): void {
     ['ui_approval_request_id', 'TEXT'],
     ['task_goal_status', 'TEXT'],
     ['rate_limit_terminal_json', 'TEXT'],
+    ['transient_rate_limit_count', 'INTEGER NOT NULL DEFAULT 0'],
   ] as const) {
     const current = db.query<{ name: string }, []>('PRAGMA table_info(jobs)').all()
     if (current.some(column => column.name === name)) continue
@@ -2897,7 +2901,7 @@ function parseCodexRateLimitTerminalReceipt(
     'turnId', 'resumeAt', 'reason', 'safeToReplay', 'recordedAt',
   ].sort()
   if (JSON.stringify(Object.keys(receipt).sort()) !== JSON.stringify(exactKeys)
-    || receipt.version !== 1
+    || (receipt.version !== 1 && receipt.version !== 2)
     || typeof receipt.jobId !== 'string' || receipt.jobId.length === 0
     || receipt.jobId.length > 256
     || !Number.isSafeInteger(receipt.attempt) || Number(receipt.attempt) < 1
@@ -2909,13 +2913,14 @@ function parseCodexRateLimitTerminalReceipt(
     || typeof receipt.turnId !== 'string' || receipt.turnId.length === 0
     || receipt.turnId.length > 256
     || !Number.isSafeInteger(receipt.resumeAt) || Number(receipt.resumeAt) <= 0
-    || (receipt.reason !== 'rate-limit' && receipt.reason !== 'capacity')
+    || (receipt.reason !== 'rate-limit' && receipt.reason !== 'capacity'
+      && !(receipt.version === 2 && receipt.reason === 'throttled'))
     || typeof receipt.safeToReplay !== 'boolean'
     || !Number.isSafeInteger(receipt.recordedAt) || Number(receipt.recordedAt) <= 0) {
     return null
   }
   return {
-    version: 1,
+    version: receipt.version,
     jobId: receipt.jobId,
     attempt: Number(receipt.attempt),
     controlEpoch: Number(receipt.controlEpoch),
@@ -3033,6 +3038,7 @@ function mapRow(row: JobRow): JobRecord {
     terminalOutcome: row.terminal_outcome,
     taskGoalStatus: (row as typeof row & { task_goal_status?: string | null }).task_goal_status ?? null,
     uiApprovalRequestId: row.ui_approval_request_id,
+    transientRateLimitCount: row.transient_rate_limit_count ?? 0,
     rateLimitRecovery: parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json),
   }
 }
@@ -4458,6 +4464,39 @@ export class JobStore {
     this.resumeLegacyAuditSetupHistory()
   }
 
+  private recoverLegacyTransportThrottles(now = Date.now()): void {
+    const recover = this.db.transaction(() => {
+      const rows = this.db.query<JobRow, [number]>(
+        `SELECT * FROM jobs WHERE runtime = 'codex' AND status = 'queued'
+         AND not_before > ? AND rate_limit_terminal_json IS NOT NULL
+         AND cancel_requested_at IS NULL AND terminal_outcome IS NULL
+         AND executor_pid IS NULL AND executor_nonce IS NULL
+         AND active_thread_id IS NULL AND active_turn_id IS NULL
+         AND pending_session_id IS NULL AND pending_result IS NULL
+         AND ui_approval_request_id IS NULL`,
+      ).all(now)
+      for (const row of rows) {
+        const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
+        if (!receipt || receipt.version !== 1 || receipt.reason !== 'rate-limit'
+          || receipt.jobId !== row.id || receipt.attempt !== row.attempts
+          || receipt.controlEpoch !== row.control_epoch || receipt.threadId !== row.session_id
+          || receipt.resumeAt !== row.not_before || !this.hasObservedTurnSource(receipt)
+          || this.cloudHandoff(row.id) || !legacyTransportThrottle(row.last_error)) continue
+        const resumeAt = Math.min(receipt.resumeAt, now + throttleRetryDelay(row.transient_rate_limit_count))
+        const updated = serializeCodexRateLimitTerminalReceipt({ ...receipt, version: 2, reason: 'throttled', resumeAt })
+        this.db.run(`UPDATE jobs SET not_before = ?, rate_limit_terminal_json = ?,
+          transient_rate_limit_count = 1 WHERE id = ?`, [resumeAt, updated, row.id])
+        this.supersedeLifecycleNotifications(row.id, now)
+        this.stageStatusNotificationRow({
+          idempotencyKey: `throttled-recovered:${row.id}:${receipt.attempt}:${receipt.turnId}`,
+          jobId: row.id, chatId: row.chat_id, threadTs: row.thread_ts, kind: 'rate-limited',
+          payload: slackRateLimitMessage(resumeAt, 'throttled'), createdAt: now,
+        })
+      }
+    })
+    retrySqlite(() => recover.immediate())
+  }
+
   private migrateLegacyThreadAttachments(stateDir: string): void {
     if (this.db.query<{ present: number }, []>(
       "SELECT 1 AS present FROM migration_ledger WHERE name = 'thread-attachment-catalog-v1'",
@@ -4806,6 +4845,7 @@ export class JobStore {
          WHERE idempotency_key = ?`,
       ).get(idempotencyKey)
       if (existing) return existing.superseded_at === null ? 'duplicate' : 'closed'
+      if (this.hasRecentThrottleNotice(jobId, now)) return 'closed'
       this.stageStatusNotificationRow({
         idempotencyKey,
         jobId,
@@ -8534,8 +8574,9 @@ export class JobStore {
     turnId: string
     retainInput?: boolean
     rateLimitResumeAt?: number
-    rateLimitReason?: 'rate-limit' | 'capacity'
+    rateLimitReason?: CodexRateLimitReason
     rateLimitSafeToReplay?: boolean
+    rateLimitRetryCount?: number
   }): { closeInput: boolean; cancelled: boolean; pending: number; pendingInbound: number } {
     if (options.rateLimitResumeAt !== undefined
       && (!Number.isSafeInteger(options.rateLimitResumeAt)
@@ -8543,6 +8584,10 @@ export class JobStore {
       throw new Error('App Server rate-limit resume time is invalid')
     }
     const hasRateLimitTerminal = options.rateLimitResumeAt !== undefined
+    if (options.rateLimitRetryCount !== undefined
+      && (!Number.isSafeInteger(options.rateLimitRetryCount) || options.rateLimitRetryCount < 0)) {
+      throw new Error('Codex transient retry count is invalid')
+    }
     if (hasRateLimitTerminal !== (options.rateLimitReason !== undefined)
       || hasRateLimitTerminal !== (options.rateLimitSafeToReplay !== undefined)) {
       throw new Error('App Server rate-limit terminal binding is incomplete')
@@ -8699,7 +8744,7 @@ export class JobStore {
       const holdTerminalBinding = !hasRateLimitTerminal && !cancelled && pendingInbound > 0
       const terminalReceipt = hasRateLimitTerminal
         ? serializeCodexRateLimitTerminalReceipt({
-            version: 1,
+            version: options.rateLimitReason === 'throttled' ? 2 : 1,
             jobId: options.jobId,
             attempt: job.attempts,
             controlEpoch: Math.floor(options.epoch),
@@ -8735,6 +8780,7 @@ export class JobStore {
         `UPDATE jobs SET accepts_control = ?,
            active_turn_id = CASE WHEN ? THEN active_turn_id ELSE NULL END,
            not_before = ?, rate_limit_terminal_json = ?,
+           transient_rate_limit_count = ?,
            session_id = CASE WHEN ? IS NULL THEN session_id ELSE ? END
          WHERE id = ? AND control_epoch = ?`,
         [
@@ -8742,6 +8788,7 @@ export class JobStore {
           holdTerminalBinding ? 1 : 0,
           options.rateLimitResumeAt ?? null,
           terminalReceipt,
+          options.rateLimitReason === 'throttled' ? Math.min(4, Math.max(1, options.rateLimitRetryCount ?? 1)) : 0,
           options.rateLimitResumeAt ?? null,
           options.threadId,
           options.jobId,
@@ -11649,6 +11696,22 @@ export class JobStore {
     return retrySqlite(() => stage.immediate())
   }
 
+  private hasRecentThrottleNotice(jobId: string, now: number): boolean {
+    const cutoff = now - THROTTLE_NOTICE_INTERVAL_MS
+    // Both notification paths share durable delivery/pending evidence. Suppressed
+    // or superseded rows must not keep extending the public silence window.
+    return !!this.db.query<{ yes: number }, [string, string, number, string, number]>(
+      `SELECT 1 AS yes FROM status_notifications
+       WHERE job_id = ? AND kind = 'rate-limited'
+         AND (payload = ? OR payload LIKE '⏸ 一時的にリクエストが制限されています。%')
+         AND (delivered_at >= ? OR (delivered_at IS NULL AND superseded_at IS NULL))
+       UNION ALL SELECT 1 AS yes FROM commentary_notifications
+       WHERE job_id = ? AND payload LIKE '💬 ⏸ 一時的にリクエストが制限されています。%'
+         AND (delivered_at >= ? OR (delivered_at IS NULL AND suppressed_at IS NULL))
+       LIMIT 1`,
+    ).get(jobId, SLACK_RATE_LIMIT_WAIT_MESSAGE, cutoff, jobId, cutoff)
+  }
+
   stageCommentaryNotification(
     jobIdInput: string,
     attemptInput: number,
@@ -11689,11 +11752,13 @@ export class JobStore {
         'SELECT status, attempts FROM jobs WHERE id = ?',
       ).get(jobId)
       if (!job || job.status !== 'running' || job.attempts !== attempt) return 'closed'
+      const throttleNotice = payload.startsWith('💬 ⏸ 一時的にリクエストが制限されています。')
+      if (throttleNotice && this.hasRecentThrottleNotice(jobId, now)) return 'duplicate'
       const previous = this.db.query<{ payload: string }, [string, number]>(
         `SELECT payload FROM commentary_notifications
          WHERE job_id = ? AND attempt = ? ORDER BY seq DESC LIMIT 1`,
       ).get(jobId, attempt)
-      if (previous?.payload === payload) {
+      if (!throttleNotice && previous?.payload === payload) {
         // Persist the new source identity even when its public body is
         // suppressed. Otherwise an App Server replay after an intervening
         // message could resurrect this old commentary out of order.
@@ -13472,7 +13537,7 @@ export class JobStore {
     notBefore: number,
     reason: string,
     sessionId?: string,
-    transientReason: 'rate-limit' | 'capacity' | 'github' = 'rate-limit',
+    transientReason: CodexRateLimitReason | 'github' = 'rate-limit',
   ): void {
     const persistedSessionId = sessionId === undefined
       ? undefined
@@ -13546,7 +13611,8 @@ export class JobStore {
           'SELECT attempts, chat_id, thread_ts FROM jobs WHERE id = ?',
         ).get(id)
         if (!job) throw new Error(`rate-limited job disappeared: ${id}`)
-        this.stageStatusNotificationRow({
+        const recentThrottleNotice = nextTransientReason === 'throttled' && this.hasRecentThrottleNotice(id, Date.now())
+        if (!recentThrottleNotice) this.stageStatusNotificationRow({
           idempotencyKey: `rate-limited:${id}:${job.attempts}:${nextNotBefore}`,
           jobId: id,
           chatId: job.chat_id,
@@ -13610,6 +13676,9 @@ export class JobStore {
     failedWrites: number
     failedUncertain: number
   } {
+    // Only the runner's exclusive recovery path may shorten old waits. Opening
+    // the DB from a newer gateway/status process must not affect an older runner.
+    this.recoverLegacyTransportThrottles()
     let requeued = 0
     let failedWrites = 0
     let failedUncertain = 0
@@ -15460,12 +15529,14 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         continue
       }
       if (error instanceof CodexRateLimitError) {
-        const resumeAt = codexRateLimitResumeAt(error.resetsAtMs)
+        const resumeAt = codexRateLimitResumeAt(error.resetsAtMs, Date.now(), error.reason)
         await updateMonitor(
           job,
           error.reason === 'capacity'
             ? `モデルが一時的に混雑しています。${new Date(resumeAt).toISOString()} 以降に同じセッションで再開します`
-            : `利用上限のため ${new Date(resumeAt).toISOString()} まで待機します`,
+            : error.reason === 'throttled'
+              ? `一時的なリクエスト制限のため ${new Date(resumeAt).toISOString()} に再試行します`
+              : `利用上限のため ${new Date(resumeAt).toISOString()} まで待機します`,
         )
         await quiesceLifecycleBeforeStateChange()
         options.store.requeueAt(
@@ -16516,7 +16587,7 @@ export function slackMessageIsAfter(candidate: string, boundary: string): boolea
 
 export function slackRateLimitMessage(
   resumeAt: number,
-  reason: 'rate-limit' | 'capacity' | 'github' = 'rate-limit',
+  reason: CodexRateLimitReason | 'github' = 'rate-limit',
 ): string {
   const time = new Intl.DateTimeFormat('ja-JP', {
     hour: '2-digit',
@@ -16525,6 +16596,8 @@ export function slackRateLimitMessage(
   }).format(new Date(resumeAt))
   return reason === 'github'
     ? `⏸ GitHubとの接続を再確認しています。${time} に自動再開します。`
+    : reason === 'throttled'
+    ? `⏸ 一時的にリクエストが制限されています。作業を保持し、${time} に再試行します。`
     : reason === 'capacity'
     ? `⏸ 利用中のモデルが混雑しているため、一時停止しています。${time} に自動再開します。`
     : `⏸ 使用量上限のため、一時停止しています。${time} に自動再開します。`

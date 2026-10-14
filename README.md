@@ -134,7 +134,11 @@ JSON-RPC sessionで処理します。write jobも1つの`complete` turnで調査
 Zeroちゃんが後から別processで設計やreviewをやり直すことはありません。完了した同一Slack threadへの
 返信は保存済みCodex threadを`thread/resume`し、物理sessionを更新した場合もsanitized論理履歴を渡します。
 job本体に最長時間は設けません。`willRetry: true`のrate-limitはApp Serverの同一turn内retryを待ち、
-host側で同じpromptを再投入しません。起動前の
+host側で同じpromptを再投入しません。終端の429は使用量上限と区別し、解除時刻がなければ
+30秒→1分→2分→最大5分の間隔で同じタスクの続きを再試行します。指定された解除時刻は尊重し、
+明示された使用量上限だけをquota待機として扱います。再試行回数は再起動後も保持し、短い再試行ごとの
+通知は抑制します（継続中の経過通知は最短15分間隔）。既存の誤った61分待ちは、対応する終端記録と
+reset指定のないtransport 429診断を確認できる場合だけrunner起動時に短縮します。起動前の
 managed/MDMを含む実効permission検査には`app-server config/read`と`configRequirements/read`を使います。
 同じSlackスレッドの途中入力は現在turnへ安全に割り込み、単なる質問か作業更新かの意味判断もCodexへ
 委ねます。Zeroちゃんは配送順序、重複防止、取消、process回収だけを管理します。

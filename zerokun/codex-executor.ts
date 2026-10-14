@@ -1,3 +1,5 @@
+import { classifyCodexFailure, codexRateLimitResumeAt, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitInfo, type CodexRateLimitReason } from './codex-rate-limit.ts'
+export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-limit.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
 import { retainGoalForAdvisors, retainGoalForDelegation } from './codex-goal.ts'
 import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
@@ -6144,18 +6146,12 @@ export function parseCodexResult(stdout: string, finalMessage?: string): string 
   return fromEvents ? capResult(fromEvents) : '処理は完了しましたが、返答本文を取得できませんでした。'
 }
 
-export type CodexRateLimitInfo = {
-  rateLimited: boolean
-  resetsAtMs: number | null
-  reason: 'rate-limit' | 'capacity' | null
-}
-
 function codexFailureRecords(stdout: string): Array<Record<string, unknown>> {
   const projectFailure = (record: Record<string, unknown>): Record<string, unknown> => {
     const projected: Record<string, unknown> = {}
     for (const key of [
       'error', 'message', 'code', 'codexErrorInfo', 'additionalDetails',
-      'retry_after', 'resets_at', 'reset_at',
+      'retry_after', 'resets_at', 'reset_at', 'retryAfter', 'resetsAt', 'resetAt',
     ]) {
       if (record[key] !== undefined) projected[key] = record[key]
     }
@@ -6181,62 +6177,9 @@ function codexFailureRecords(stdout: string): Array<Record<string, unknown>> {
   })
 }
 
-function numericResetCandidates(value: unknown, depth = 0): number[] {
-  if (depth > 6 || !value || typeof value !== 'object') return []
-  if (Array.isArray(value)) {
-    return value.flatMap(item => numericResetCandidates(item, depth + 1))
-  }
-  const record = value as Record<string, unknown>
-  const direct = ['resets_at', 'reset_at', 'retry_after'].flatMap(key => {
-    const candidate = record[key]
-    return typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0
-      ? [candidate]
-      : []
-  })
-  return [
-    ...direct,
-    ...Object.values(record).flatMap(item => numericResetCandidates(item, depth + 1)),
-  ]
-}
-
-export function extractCodexRateLimit(stdout: string, now = Date.now()): CodexRateLimitInfo {
+export function extractCodexRateLimit(stdout: string, now = Date.now(), previousFailures = 0): CodexRateLimitInfo {
   const failures = codexFailureRecords(stdout)
-  let resetsAtMs: number | null = null
-  let rateLimited = false
-  let capacityLimited = false
-  for (const failure of failures) {
-    const serialized = JSON.stringify(failure)
-    if (/(?:rate.?limit|usage.?limit|quota|too many requests|\b429\b)/i.test(serialized)) {
-      rateLimited = true
-    }
-    if (/(?:selected model is at capacity|model[^\n]{0,80}\bat capacity\b|temporarily (?:overloaded|unavailable)|server (?:is )?overloaded)/i
-      .test(serialized)) {
-      rateLimited = true
-      capacityLimited = true
-    }
-    for (const value of numericResetCandidates(failure)) {
-      const candidate = value >= 1_000_000_000_000
-        ? Math.floor(value)
-        : value >= 1_000_000_000
-          ? Math.floor(value * 1000)
-          : now + Math.floor(value * 1000)
-      resetsAtMs = Math.max(resetsAtMs ?? 0, candidate)
-    }
-  }
-  return rateLimited
-    ? {
-        rateLimited: true,
-        resetsAtMs: resetsAtMs ?? now + (capacityLimited ? 60_000 : 60 * 60 * 1000),
-        reason: capacityLimited ? 'capacity' : 'rate-limit',
-      }
-    : { rateLimited: false, resetsAtMs: null, reason: null }
-}
-
-export function codexRateLimitResumeAt(resetsAtMs: number, now = Date.now()): number {
-  if (!Number.isFinite(resetsAtMs) || !Number.isFinite(now)) {
-    throw new Error('Codex rate-limit time is invalid')
-  }
-  return Math.max(Math.floor(now) + 100, Math.floor(resetsAtMs) + 60_000)
+  return classifyCodexFailure(failures.at(-1), now, previousFailures)
 }
 
 /**
@@ -6487,7 +6430,7 @@ export class CodexRateLimitError extends Error {
     message: string,
     readonly resetsAtMs: number,
     readonly sessionId?: string,
-    readonly reason: 'rate-limit' | 'capacity' = 'rate-limit',
+    readonly reason: CodexRateLimitReason = 'rate-limit',
     readonly safeToRetryAfterDelivery = false,
     readonly stage?: CodexExecutionStage,
     readonly phaseSequence?: number,
@@ -6656,8 +6599,9 @@ export interface CodexLiveControlHooks {
     turnId: string
     retainInput: boolean
     rateLimitResumeAt?: number
-    rateLimitReason?: 'rate-limit' | 'capacity'
+    rateLimitReason?: CodexRateLimitReason
     rateLimitSafeToReplay?: boolean
+    rateLimitRetryCount?: number
   }): { closeInput: boolean; cancelled: boolean; pending: number; pendingInbound: number }
   recordRateLimit(options: {
     executorNonce: string
@@ -7324,6 +7268,8 @@ export async function executeCodexJob(
     }
   }
 
+  let consecutiveThrottles = job.transientRateLimitCount ?? 0
+  let lastThrottleNoticeAt = 0
   let networkRecoveryPending = false
   const runAttempt = async (
     sessionId: string | null,
@@ -8158,6 +8104,7 @@ export async function executeCodexJob(
       let currentTurnId: string | null = null
       let activeInputRevision = advisorAttempt.inputSnapshot.revision
       let activeTurnTransientFailure: CodexRateLimitInfo | null = null
+      let terminalRateLimitInfo: CodexRateLimitInfo | null = null
       let pausedInterjection: JobInterjectionRecord | null = null
       let cancellationTerminalDeadline: number | null = null
       const rejectedSteerState: { current: {
@@ -8867,9 +8814,9 @@ export async function executeCodexJob(
             }
             const rateLimit = extractCodexRateLimit(JSON.stringify({
               method: 'error', params: appServerError,
-            }))
+            }), Date.now(), consecutiveThrottles)
             if (rateLimit.rateLimited) activeTurnTransientFailure = rateLimit
-            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason === 'rate-limit') {
               options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
               // The catch below stops and reaps this exact supervisor before
               // the typed exception is allowed to reach the cloud checkpoint.
@@ -8883,17 +8830,21 @@ export async function executeCodexJob(
                 executorNonce: advisorAttempt.attemptNonce,
                 threadId: currentThreadId,
                 turnId: currentTurnId,
-                resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
+                resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs, Date.now(), rateLimit.reason ?? 'rate-limit'),
               })
             }
             if (appServerError.willRetry && rateLimit.rateLimited
+              && (rateLimit.reason !== 'throttled' || Date.now() - lastThrottleNoticeAt >= THROTTLE_NOTICE_INTERVAL_MS)
               && rateLimitWaitReportedForTurnId !== currentTurnId) {
               try {
                 const staged = options.onRateLimitWait?.({
                   threadId: currentThreadId,
                   turnId: currentTurnId,
                 }) === true
-                if (staged) rateLimitWaitReportedForTurnId = currentTurnId
+                if (staged) {
+                  rateLimitWaitReportedForTurnId = currentTurnId
+                  if (rateLimit.reason === 'throttled') lastThrottleNoticeAt = Date.now()
+                }
               } catch (error) {
                 process.stderr.write(
                   `zerochan: rate-limit wait notification could not be staged: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -8995,15 +8946,18 @@ export async function executeCodexJob(
               ? extractCodexRateLimit(JSON.stringify({
                 method: 'turn/completed',
                 params: { threadId: currentThreadId, turn: terminal.turn },
-              }))
+              }), Date.now(), consecutiveThrottles)
               : { rateLimited: false, resetsAtMs: null, reason: null }
             const rateLimit = terminalRateLimit.rateLimited
               ? terminalRateLimit
               : terminal.turn.status === 'failed' && activeTurnTransientFailure?.rateLimited
                 ? activeTurnTransientFailure
                 : terminalRateLimit
+            terminalRateLimitInfo = rateLimit as CodexRateLimitInfo
+            if (rateLimit.reason === 'throttled') consecutiveThrottles = Math.min(4, consecutiveThrottles + 1)
+            else if (terminal.turn.status === 'completed') consecutiveThrottles = 0
             if (options.parkOnUsageLimit && terminal.turn.status === 'failed'
-              && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              && rateLimit.rateLimited && rateLimit.reason === 'rate-limit') {
               options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
               throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
                 rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
@@ -9153,9 +9107,10 @@ export async function executeCodexJob(
                 || (terminal.turn.status === 'failed' && isTransientCodexNetworkError(terminal.turn.error)),
               ...(rateLimit.rateLimited && rateLimit.resetsAtMs !== null
                 ? {
-                    rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
+                    rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs, Date.now(), rateLimit.reason ?? 'rate-limit'),
                     rateLimitReason: rateLimit.reason ?? 'rate-limit',
                     rateLimitSafeToReplay: transientFailureSafeToRetry,
+                    rateLimitRetryCount: consecutiveThrottles,
                   }
                 : {}),
             })
@@ -9600,6 +9555,7 @@ export async function executeCodexJob(
         interjectionAnswerRetry,
         inputChangedBeforeDispatch,
         finalTurn,
+        rateLimit: terminalRateLimitInfo,
         parentTurnIds,
         parentChildBaseline: parentChildBaseline ?? [],
         parentTurnBaseline: parentTurnBaseline ?? [],
@@ -9909,6 +9865,7 @@ export async function executeCodexJob(
     }
     return {
       exitCode, stdout, stderr, timedOut, finalMessage, observedSessionId,
+      rateLimit: extractCodexRateLimit(stdout, Date.now(), consecutiveThrottles),
       interruptedAtExit,
       protocolCompleted: protocolSequenceValid && finalSnapshot !== null,
       logicalCleanup,
@@ -9994,7 +9951,7 @@ export async function executeCodexJob(
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
     let pendingTerminalRateLimitRecovery: {
-      reason: 'rate-limit' | 'capacity'
+      reason: CodexRateLimitReason
       resetsAtMs: number
       stage: 'prepare' | 'implementation' | 'review'
       phaseSequence: number
@@ -10020,7 +9977,7 @@ export async function executeCodexJob(
     let continuationProbePending = continuationBundle !== undefined
 
     const waitForTransientModelRecovery = async (input: {
-      reason: 'rate-limit' | 'capacity'
+      reason: CodexRateLimitReason
       resetsAtMs: number
       stage: 'prepare' | 'implementation' | 'review' | 'interjection'
       phaseSequence: number
@@ -10032,7 +9989,7 @@ export async function executeCodexJob(
           input.resetsAtMs, sessionId ?? undefined, 'rate-limit', false, input.stage, input.phaseSequence)
       }
       const resumeAt = options.transientRetryDelayMsForTesting === undefined
-        ? codexRateLimitResumeAt(input.resetsAtMs)
+        ? codexRateLimitResumeAt(input.resetsAtMs, Date.now(), input.reason)
         : Date.now() + positiveInteger(options.transientRetryDelayMsForTesting, 1)
       const message = input.reason === 'capacity'
         ? input.partialImplementation
@@ -10047,10 +10004,17 @@ export async function executeCodexJob(
         // Operator-only monitor output is not part of task correctness.
       }
       try {
-        options.onCommentaryMessage?.({
-          sourceKey: `host-transient:${input.stage}:${input.phaseSequence}`,
-          text: message,
-        })
+        if (input.reason !== 'throttled' || Date.now() - lastThrottleNoticeAt >= THROTTLE_NOTICE_INTERVAL_MS) {
+          options.onCommentaryMessage?.({
+            sourceKey: createHash('sha256').update(JSON.stringify([
+              job.id, job.attempts, 'host-transient', input.stage, input.phaseSequence, resumeAt,
+            ])).digest('hex'),
+            text: input.reason === 'throttled'
+              ? `⏸ 一時的にリクエストが制限されています。作業を保持し、${new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(resumeAt))} に再試行します。`
+              : message,
+          })
+          if (input.reason === 'throttled') lastThrottleNoticeAt = Date.now()
+        }
       } catch {
         // This status is advisory. Losing it must not turn a recoverable model
         // congestion event into a terminal job failure.
@@ -10153,7 +10117,7 @@ export async function executeCodexJob(
           execution.stderr,
           execution.stdoutPath,
         )
-        const rateLimit = extractCodexRateLimit(execution.stdout)
+        const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
         if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
           recordPhaseIdentity(execution)
           throw new CodexRateLimitError(
@@ -10317,7 +10281,7 @@ export async function executeCodexJob(
           await execution.retireCompletedRegistration()
           throw new CodexInterruptedError('Codex job was interrupted')
         }
-        const rateLimit = extractCodexRateLimit(execution.stdout)
+        const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
         const failure = describeCodexFailure(
           execution.exitCode,
           execution.stdout,
@@ -11419,7 +11383,7 @@ export async function executeCodexJob(
         execution.stderr,
         execution.stdoutPath,
       )
-      const rateLimit = extractCodexRateLimit(execution.stdout)
+      const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
       if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
         throw new CodexRateLimitError(
           failure,
@@ -11724,7 +11688,7 @@ export async function executeCodexJob(
       throw new CodexInterruptedError('Codex job was interrupted')
     }
 
-    const rateLimit = extractCodexRateLimit(execution.stdout)
+    const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
     const failure = describeCodexFailure(
       execution.exitCode,
       execution.stdout,

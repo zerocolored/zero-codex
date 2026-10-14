@@ -585,6 +585,8 @@ for line in sys.stdin:
                 emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
             if mode == "goal-native-capacity":
                 failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None}
+                if os.environ.get("ZERO_GENERIC_429") == "1":
+                    failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
                 items = [{"type": "commandExecution", "id": "native-write", "command": "fixture-only", "status": "completed", "exitCode": 0}]
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
             else:
@@ -786,6 +788,8 @@ for line in sys.stdin:
                 with open(capacity_state, "w", encoding="utf-8") as stream:
                     stream.write(stage)
                 failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+                if os.environ.get("ZERO_GENERIC_429") == "1":
+                    failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
                 items = []
                 if stage == "implementation":
                     command = {"type": "commandExecution", "id": "capacity-partial-command", "command": "echo changed", "status": "completed", "exitCode": 0}
@@ -849,12 +853,14 @@ for line in sys.stdin:
                 emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [{"type": "commandExecution", "id": "already-done", "command": "echo completed", "status": "completed", "exitCode": 0}], "error": failure}}})
         elif mode in ("rate-error", "rate-terminal-only"):
-            failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
+            failure = {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
             if mode != "rate-terminal-only":
                 emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": failure}}})
         elif mode in ("capacity-error", "capacity-after-command", "capacity-error-generic-terminal", "capacity-started-command"):
             failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+            if os.environ.get("ZERO_GENERIC_429") == "1":
+                failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
             items = [] if mode == "capacity-error" else [{"type": "commandExecution", "id": "capacity-command", "command": "echo changed", "status": "completed", "exitCode": 0}]
             if mode in ("capacity-error-generic-terminal", "capacity-started-command"):
                 items = []
@@ -864,8 +870,8 @@ for line in sys.stdin:
             terminal_failure = {"message": "turn failed", "codexErrorInfo": None, "additionalDetails": None} if mode in ("capacity-error-generic-terminal", "capacity-started-command") else failure
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": terminal_failure}}})
         elif mode in ("rate-retrying", "rate-retrying-two-turn"):
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
             answer = "内部retry後に完了" if mode == "rate-retrying" else "内部retry後に完了-" + str(turn_count)
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": answer}], "error": None}}})
         elif mode == "error-steer":
@@ -1412,7 +1418,7 @@ function fixture(
     ),
     finishTurn: ({
       executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
-      rateLimitReason, rateLimitSafeToReplay,
+      rateLimitReason, rateLimitSafeToReplay, rateLimitRetryCount,
     }) => store.finishAppServerTurn({
       jobId: job.id,
       epoch: job.controlEpoch,
@@ -1423,6 +1429,7 @@ function fixture(
       rateLimitResumeAt,
       rateLimitReason,
       rateLimitSafeToReplay,
+      rateLimitRetryCount,
     }),
     recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
       store.recordAppServerRateLimit({
@@ -7551,6 +7558,97 @@ describe('production App Server executor', () => {
     ])
     value.store.close()
   })
+
+  test('native generic429 willRetry remains the same turn and never triggers cloud quota', async () => {
+    const value = fixture('rate-retrying')
+    let waits = 0
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-retrying', ZERO_GENERIC_429: '1' },
+        parkOnUsageLimit: true, liveControls: value.hooks,
+        onCloudQuotaDetected: () => { throw new Error('generic429 is not quota') },
+        onRateLimitWait: () => { waits += 1; return true },
+      })
+      expect(result.result).toBe('内部retry後に完了')
+      expect(waits).toBe(1)
+      expect(value.store.get(value.job.id)?.rateLimitRecovery).toBeNull()
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('incident transport 429 retains partial work, durable backoff and avoids cloud quota/notice loops', async () => {
+    const value = fixture('capacity-after-command', true)
+    let quotaCalls = 0
+    try {
+      for (const [index, delay] of [30_000, 60_000, 120_000, 300_000, 300_000].entries()) {
+        const before = Date.now()
+        let caught: unknown
+        try {
+          await executeCodexJob(value.job, {
+            codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+            skipEffectiveConfigCheck: true,
+            extraEnvironment: { ZERO_FIXTURE_MODE: 'capacity-after-command', ZERO_GENERIC_429: '1' },
+            parkOnUsageLimit: true, onCloudQuotaDetected: () => { quotaCalls += 1 },
+            liveControls: value.hooks,
+          })
+        } catch (error) { caught = error }
+        expect(caught).toBeInstanceOf(CodexRateLimitError)
+        const error = caught as CodexRateLimitError
+        expect(error.reason).toBe('throttled')
+        expect(error.safeToRetryAfterDelivery).toBe(false)
+        expect(error.resetsAtMs - before).toBeGreaterThanOrEqual(delay)
+        expect(error.resetsAtMs - Date.now()).toBeLessThanOrEqual(delay)
+        value.store.requeueAt(value.job.id, error.resetsAtMs, error.message, error.sessionId, error.reason)
+        const queued = value.store.get(value.job.id)!
+        expect(queued.rateLimitRecovery).toMatchObject({ version: 2, reason: 'throttled', safeToReplay: false, resumeAt: error.resetsAtMs })
+        expect(queued.transientRateLimitCount).toBe(Math.min(4, index + 1))
+        // Reopening the database must not lose the backoff or reinterpret the v2 receipt.
+        const reopened = new JobStore(value.store.dbPath)
+        expect(reopened.get(value.job.id)?.rateLimitRecovery).toEqual(queued.rateLimitRecovery)
+        expect(reopened.get(value.job.id)?.transientRateLimitCount).toBe(Math.min(4, index + 1))
+        reopened.close()
+        const notices = value.store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')
+        expect(notices).toHaveLength(index === 0 ? 1 : 0)
+        for (const notice of notices) {
+          expect(notice.payload).toContain('一時的にリクエストが制限')
+          expect(notice.payload).not.toContain('使用量上限')
+          value.store.markStatusNotificationDelivered(notice.id)
+        }
+        if (index < 4) Object.assign(value.job, value.store.claimNext('throttle-retry-worker', 20, queued.notBefore! + 1)!)
+      }
+      expect(quotaCalls).toBe(0)
+    } finally { value.store.close() }
+  }, 60_000)
+
+  test('phased incident 429 continues review without repeating implementation or parking cloud quota', async () => {
+    const value = fixture('phased-capacity-review-once', true)
+    const phaseLog = join(value.root, 'throttle-phase.log')
+    const commentary: string[] = []
+    const staged: string[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, phaseGateForTesting: {}, transientRetryDelayMsForTesting: 1,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'phased-capacity-review-once', ZERO_GENERIC_429: '1',
+          ZERO_PHASE_LOG: phaseLog, ZERO_CAPACITY_FIXTURE_STATE: join(value.root, 'throttle-state') },
+        parkOnUsageLimit: true, onCloudQuotaDetected: () => { throw new Error('generic429 must not park quota') },
+        onCommentaryMessage: event => {
+          commentary.push(event.text)
+          if (event.text.includes('一時的にリクエストが制限')) {
+            staged.push(value.store.stageCommentaryNotification(value.job.id, value.job.attempts,
+              event.sourceKey, `💬 ${event.text}`))
+          }
+        }, liveControls: value.hooks,
+      })
+      expect(result.result).toBe('公開できます')
+      expect(readFileSync(phaseLog, 'utf8').trim().split('\n').map(line => line.split('\t')[0]))
+        .toEqual(['prepare', 'implementation', 'review', 'review'])
+      expect(commentary.filter(text => text.includes('一時的にリクエストが制限'))).toHaveLength(1)
+      expect(staged).toEqual(['staged'])
+      expect(value.store.get(value.job.id)?.transientRateLimitCount).toBe(0)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('model capacity terminalは副作用のないfull turnだけ同じsessionで再開可能にする', async () => {
     for (const [mode, safe] of [
