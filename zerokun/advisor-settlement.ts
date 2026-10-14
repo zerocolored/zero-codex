@@ -35,6 +35,45 @@ export function watchAdvisorStopRequest(lockPath: string, pollMs = 500): {
   return { signal: controller.signal, close: () => clearInterval(timer) }
 }
 
+/** Each round gets its own fixed budget; re-observation never extends it. */
+export class AdvisorRoundDeadlines {
+  private readonly deadlines = new Map<string, number>()
+  constructor(private readonly durationMs = ADVISOR_SETTLEMENT_TIMEOUT_MS) {}
+  forRound(key: string, now = Date.now()): number {
+    const deadline = this.deadlines.get(key) ?? now + this.durationMs
+    this.deadlines.set(key, deadline)
+    return deadline
+  }
+}
+
+type AdvisorIdentity = {
+  stateDir: string; jobId: string; attemptNonce: string; processNonce: string; contextDigest: string
+}
+
+/** An exact live claim is enough to keep collecting; journal response claims are not. */
+export function readActiveAdvisorRound(options: AdvisorIdentity): {
+  key: string; phase: string; round: number; inputRevision: number
+} | null {
+  try {
+    const raw = readOptionalBoundedOwnerOnlyRegularFile(join(options.stateDir, 'advisor-journal',
+      options.jobId.replace(/[^A-Za-z0-9._-]/g, '_'), options.attemptNonce, 'active-round.lock'), 64 * 1024)
+    if (!raw) return null
+    const lock = JSON.parse(raw)
+    if (lock.version !== 2 || lock.jobId !== options.jobId || lock.attemptNonce !== options.attemptNonce
+      || lock.processNonce !== options.processNonce || lock.contextDigest !== options.contextDigest
+      || !Number.isSafeInteger(lock.inputRevision) || lock.inputRevision < 1
+      || !/^[0-9a-f]{64}$/.test(lock.inputDigest)
+      || !['investigation', 'design', 'review'].includes(lock.phase) || ![1, 2, 3].includes(lock.round)
+      || !Number.isSafeInteger(lock.brokerProcessId) || lock.brokerProcessId <= 1) return null
+    const identity = readProcessIdentity(lock.brokerProcessId)
+    if (!identity || observeProcessGeneration(identity).status !== 'alive') return null
+    // The broker writes an immutable claim. A retry has a new claim, while
+    // rereading the same claim must retain its original deadline.
+    return { key: `${lock.phase}:${lock.round}:${createHash('sha256').update(raw).digest('hex')}`,
+      phase: lock.phase, round: lock.round, inputRevision: lock.inputRevision }
+  } catch { return null }
+}
+
 /** A successful parent turn must not reap a still-working reviewer. This is
  * lifecycle draining, not a response quorum: a terminal unavailable outcome
  * settles immediately, and cancellation/infrastructure failure never blocks. */

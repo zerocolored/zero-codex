@@ -17,10 +17,28 @@ export const MODEL_SELECTION_MESSAGES = {
   unavailable: 'モデル指定の判定を完了できなかったため、この入力の実行を止めています。依頼とこれまでの作業を保持しているので、同じスレッドで再開を依頼してください。',
 } as const
 export class TaskModelSelectionError extends Error {
-  constructor(readonly reason: keyof typeof MODEL_SELECTION_MESSAGES) {
-    super(`ZERO_MODEL_SELECTION:${reason}`)
+  constructor(readonly reason: keyof typeof MODEL_SELECTION_MESSAGES, readonly diagnostic?:
+    'timeout' | 'process-failed' | 'invalid-output' | 'input-too-large' | 'runner-failed') {
+    super(`ZERO_MODEL_SELECTION:${reason}${diagnostic ? ` [classifier:${diagnostic}]` : ''}`)
     this.name = 'TaskModelSelectionError'
   }
+}
+/** Whole-message control requests have no model operand. Do not infer absence
+ * from a model-name allowlist: arbitrary new families still need classification. */
+export function ordinaryModelContinuation(input: string): ModelDecision | null {
+  const text = input.normalize('NFKC').trim().replace(/[.!！。?？]+$/u, '').trim().toLowerCase()
+  if (/^(?:please\s+)?(?:keep\s+going|continue|resume|go\s+on|proceed)(?:,?\s+please)?$/u.test(text)
+    || /^(?:(?:そのまま|引き続き|作業を)\s*)?(?:続けて|進めて|再開して|続行して|継続して)(?:ください|下さい|お願いします)?$/u.test(text)) {
+    return { decision: 'none', model: null, evidence: '', continuation: true }
+  }
+  return null
+}
+type StoredModelDecision = Omit<ModelDecision, 'decision'> & { decision: ModelDecision['decision'] | 'unavailable'; pending?: keyof typeof MODEL_SELECTION_MESSAGES; retryTask?: string; retryPrevious?: {task:string;model:string|null} | null }
+function pendingDecision(raw: string): keyof typeof MODEL_SELECTION_MESSAGES {
+  const stored = JSON.parse(raw) as StoredModelDecision
+  if (stored.pending) return stored.pending
+  const decision = stored.decision
+  return decision === 'unsupported' || decision === 'unavailable' ? decision : 'ambiguous'
 }
 export function parseModelCatalog(value: Record<string, unknown>): TaskModel[] {
   if (!Array.isArray(value.data)) throw new TaskModelSelectionError('unavailable')
@@ -60,8 +78,11 @@ export function requireAvailableTaskModel(model: string, models: TaskModel[]): s
 }
 export async function classifyTaskModel(input: string, models: TaskModel[], previous: { task: string; model: string | null } | null,
   signal?: AbortSignal, run = runIsolatedCodexJson): Promise<ModelDecision> {
+  signal?.throwIfAborted()
+  const ordinary = ordinaryModelContinuation(input)
+  if (ordinary) return ordinary
   if (Buffer.byteLength(input) > 48000) {
-    throw new TaskModelSelectionError('unavailable') // Never truncate away a late model directive.
+    throw new TaskModelSelectionError('unavailable', 'input-too-large') // Never truncate away a late model directive.
   }
   const context = previous ? { ...previous, task: previous.task.length > 8000
     ? previous.task.slice(0,4000) + '\n[context excerpt omitted]\n' + previous.task.slice(-4000) : previous.task } : null
@@ -98,18 +119,23 @@ Previous task and model (context only): ${JSON.stringify(context)}
 Latest author message: ${JSON.stringify(input)}
 Return only schema JSON.`
   let value: any
-  try { value = JSON.parse(await run(prompt, schema, { model: ZEROCHAN_PRIMARY_CODEX_MODEL, reasoningEffort: 'medium', independent: true, signal })) }
+  let raw: string
+  try { raw = await run(prompt, schema, { model: ZEROCHAN_PRIMARY_CODEX_MODEL, reasoningEffort: 'medium', independent: true, signal }) }
   catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === 'CodexCleanupPendingError')) throw error
-    throw new TaskModelSelectionError('unavailable')
+    const message = error instanceof Error ? error.message : ''
+    throw new TaskModelSelectionError('unavailable', message === 'thread intent classifier timed out' ? 'timeout'
+      : /^thread intent classifier exited -?\d+$/.test(message) ? 'process-failed' : 'runner-failed')
   }
+  signal?.throwIfAborted()
+  try { value = JSON.parse(raw) } catch { throw new TaskModelSelectionError('unavailable', 'invalid-output') }
   if (!value || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'continuation,decision,evidence,model'
     || !['none','select','retain','ambiguous','unsupported'].includes(value.decision)
     || typeof value.continuation !== 'boolean' || typeof value.evidence !== 'string' || value.evidence.length > 400
     || (value.decision === 'select' ? typeof value.model !== 'string' || !value.evidence || !input.includes(value.evidence)
       : value.model !== null)
     || (value.decision === 'retain' && (!value.evidence || !input.includes(value.evidence)))
-    || (value.decision === 'none' && value.evidence !== '')) throw new TaskModelSelectionError('unavailable')
+    || (value.decision === 'none' && value.evidence !== '')) throw new TaskModelSelectionError('unavailable', 'invalid-output')
   if (value.decision === 'select') requireAvailableTaskModel(value.model, models)
   return value
 }
@@ -128,7 +154,9 @@ export class TaskModelSelections {
   constructor(private db: Database) {}
   latest(jobId: string): string | null {
     return this.db.query<{selected_model:string|null},[string]>(
-      'SELECT selected_model FROM task_model_selections WHERE job_id=? ORDER BY rowid DESC LIMIT 1').get(jobId)?.selected_model ?? null
+      `SELECT selected_model FROM task_model_selections WHERE job_id=?
+        AND (selected_model IS NOT NULL OR json_extract(decision_json,'$.decision')<>'none')
+        ORDER BY rowid DESC LIMIT 1`).get(jobId)?.selected_model ?? null
   }
   seedHandoff(jobId: string, task: string, model: string): void {
     if (!/^[A-Za-z0-9._-]{1,80}$/.test(model)) throw new TaskModelSelectionError('unsupported')
@@ -139,21 +167,36 @@ export class TaskModelSelections {
     if (saved.input_digest!==digest || saved.selected_model!==model) throw new TaskModelSelectionError('unavailable')
   }
   async resolve(jobId: string, requests: ModelRequest[], models: TaskModel[], signal?: AbortSignal,
-    classify = classifyTaskModel): Promise<string> {
+    classify = classifyTaskModel, recovering = new Set<string>()): Promise<string> {
+    signal?.throwIfAborted()
     const job = this.db.query<any, [string]>('SELECT * FROM jobs WHERE id=?').get(jobId)
     if (!job) throw new TaskModelSelectionError('unavailable')
-    const prior = this.db.query<any, any[]>(`SELECT p.task, s.selected_model FROM jobs p
-      JOIN task_model_selections s ON s.job_id=p.id
+    // Include pre-fix failed classifications which have no selection row. A
+    // later continuation must not jump over an unclassified model directive.
+    let prior: {id:string;revision:number;task:string;selected_model:string|null;decision_json:string} | null = null
+    const history = this.db.prepare<any, any[]>(`SELECT p.id, p.task, s.revision, s.selected_model, s.decision_json,
+      a.request_text FROM jobs p LEFT JOIN task_model_selections s ON s.job_id=p.id
+      LEFT JOIN task_model_sources a ON a.job_id=p.id
       WHERE p.chat_id=? AND p.thread_ts=? AND p.repo_path=? AND p.write_enabled=? AND p.workflow=?
-      AND p.seq<? ORDER BY p.seq DESC, s.rowid DESC LIMIT 1`).get(
-      job.chat_id, job.thread_ts, job.repo_path, job.write_enabled, job.workflow, job.seq)
+      AND p.seq<? AND (s.job_id IS NOT NULL OR instr(p.last_error, 'ZERO_MODEL_SELECTION:unavailable')>0)
+      AND (s.job_id IS NULL OR s.selected_model IS NOT NULL OR json_extract(s.decision_json,'$.decision')<>'none')
+      ORDER BY p.seq DESC,s.rowid DESC`)
+    try { for (const row of history.iterate(
+      job.chat_id, job.thread_ts, job.repo_path, job.write_enabled, job.workflow, job.seq)) {
+      const task = row.request_text ?? row.task
+      if (!row.decision_json && ordinaryModelContinuation(task)) continue
+      prior = {id:row.id,revision:row.revision ?? 1,task,selected_model:row.selected_model,decision_json:row.decision_json
+        ?? JSON.stringify({decision:'unavailable'})}
+      break
+    } } finally { history.finalize() }
     const latest = this.db.query<any,[string]>(
-      'SELECT * FROM task_model_selections WHERE job_id=? ORDER BY rowid DESC LIMIT 1').get(jobId)
+      `SELECT rowid, * FROM task_model_selections WHERE job_id=?
+        AND (selected_model IS NOT NULL OR json_extract(decision_json,'$.decision')<>'none') ORDER BY rowid DESC LIMIT 1`).get(jobId)
     let selected: string = latest?.selected_model ?? ZEROCHAN_PRIMARY_CODEX_MODEL
     let previous: {task:string;model:string|null} | null = latest
       ? {task:job.task,model:latest.selected_model} : prior ? {task:prior.task,model:prior.selected_model} : null
-    let unresolved: 'ambiguous' | 'unsupported' | null = latest && latest.selected_model === null
-      ? JSON.parse(latest.decision_json).decision === 'unsupported' ? 'unsupported' : 'ambiguous' : null
+    let unresolved: keyof typeof MODEL_SELECTION_MESSAGES | null = latest && latest.selected_model === null
+      ? pendingDecision(latest.decision_json) : null
     // Failed selections do not erase the last usable primary. An explicit
     // correction may restore it; ordinary continuation must remain blocked.
     let lastValid = latest?.selected_model ?? this.db.query<{selected_model:string},any[]>(`SELECT s.selected_model FROM jobs p
@@ -163,30 +206,86 @@ export class TaskModelSelections {
       ?? ZEROCHAN_PRIMARY_CODEX_MODEL
     const authored = this.db.query<{request_text:string},[string]>(
       'SELECT request_text FROM task_model_sources WHERE job_id=?').get(jobId)?.request_text
+    const hasFreshRequest = requests.some(request => !this.db.query(
+      'SELECT 1 FROM task_model_selections WHERE job_id=? AND revision=?').get(jobId,request.revision))
     for (const original of requests) {
       const request = original.revision === 1 && authored !== undefined ? {...original,task:authored} : original
       const digest = createHash('sha256').update(request.task).digest('hex')
       const cached = this.db.query<any, [string, number]>(
-        'SELECT * FROM task_model_selections WHERE job_id=? AND revision=?').get(jobId, request.revision)
+        'SELECT rowid, * FROM task_model_selections WHERE job_id=? AND revision=?').get(jobId, request.revision)
+      const cachedDecision = cached ? JSON.parse(cached.decision_json) as StoredModelDecision : null
       if (cached) {
         if (cached.input_digest !== digest) throw new TaskModelSelectionError('unavailable')
-        continue // A replay of an older revision must not undo a later interjection's choice.
+        if (cachedDecision?.pending && latest?.selected_model && cached.rowid < latest.rowid) continue
+        if (!(cachedDecision?.decision === 'none' && cachedDecision.pending)
+          && (cachedDecision?.decision !== 'unavailable' || cached.rowid < latest.rowid || hasFreshRequest)) continue // A replay of an older revision must not undo a later interjection's choice.
       }
-      const decision = await classify(request.task, models, previous, signal)
+      signal?.throwIfAborted()
+      let retryHasPrevious = false
+      if (cached) {
+        const before = this.db.query<any,[string,number]>(
+          `SELECT * FROM task_model_selections WHERE job_id=? AND rowid<?
+            AND (selected_model IS NOT NULL OR json_extract(decision_json,'$.decision')<>'none') ORDER BY rowid DESC LIMIT 1`).get(jobId,cached.rowid)
+        retryHasPrevious = before !== null
+        previous = before ? {task:job.task,model:before.selected_model} : prior ? {task:prior.task,model:prior.selected_model} : null
+        unresolved = before?.selected_model === null ? pendingDecision(before.decision_json) : null
+      }
+      const save = (decision: StoredModelDecision, durableModel: string | null) => {
+        const json = JSON.stringify(decision)
+        this.db.run(`INSERT INTO task_model_selections VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(job_id,revision) DO UPDATE SET decision_json=excluded.decision_json,selected_model=excluded.selected_model
+          WHERE task_model_selections.input_digest=excluded.input_digest AND task_model_selections.decision_json=?`,
+          [jobId, request.revision, digest, json, durableModel, cached?.decision_json ?? null])
+        const saved = this.db.query<any, [string, number]>(
+          'SELECT rowid, * FROM task_model_selections WHERE job_id=? AND revision=?').get(jobId, request.revision)
+        if (saved.input_digest !== digest || saved.decision_json !== json
+          || saved.selected_model !== durableModel) throw new TaskModelSelectionError('unavailable')
+      }
+      let decision: ModelDecision
+      try {
+        decision = cachedDecision?.decision === 'none' ? {decision:'none',model:null,evidence:'',continuation:cachedDecision.continuation}
+          : ordinaryModelContinuation(request.task) ?? await classify(request.task, models,
+            cachedDecision && 'retryPrevious' in cachedDecision ? cachedDecision.retryPrevious! : previous, signal)
+        signal?.throwIfAborted()
+      } catch (error) {
+        if (!signal?.aborted && error instanceof TaskModelSelectionError) {
+          // Retry this revision on replay, but keep it pending for future jobs.
+          save({decision:error.reason,model:null,evidence:'',continuation:true,retryTask:request.task,retryPrevious:cachedDecision && 'retryPrevious' in cachedDecision ? cachedDecision.retryPrevious : previous}, null)
+        }
+        throw error
+      }
       selected = decision.decision === 'retain' ? lastValid : decision.decision === 'select' ? decision.model!
         : (request.revision !== 1 || decision.continuation) && previous?.model ? previous.model : ZEROCHAN_PRIMARY_CODEX_MODEL
-      if (!latest && request.revision === 1 && decision.continuation && prior && prior.selected_model === null) unresolved = 'ambiguous'
+      if (!latest && request.revision === 1 && decision.continuation && prior && prior.selected_model === null) unresolved = pendingDecision(prior.decision_json)
+      // A successful retry resolves an infrastructure failure; actual pending
+      // choices from preceding requests remain until explicitly resolved.
+      if (cached && !retryHasPrevious && !unresolved && decision.continuation && prior?.selected_model === null) unresolved = pendingDecision(prior.decision_json)
       unresolved = decision.decision === 'ambiguous' || decision.decision === 'unsupported' ? decision.decision
         : decision.decision === 'select' || decision.decision === 'retain' ? null : unresolved
       const durableModel = unresolved ? null : selected
       if (durableModel) lastValid = durableModel
-      this.db.run(`INSERT OR IGNORE INTO task_model_selections VALUES (?, ?, ?, ?, ?)`,
-        [jobId, request.revision, digest, JSON.stringify(decision), durableModel])
-      const saved = this.db.query<any, [string, number]>(
-        'SELECT * FROM task_model_selections WHERE job_id=? AND revision=?').get(jobId, request.revision)
-      if (saved.input_digest !== digest || saved.decision_json !== JSON.stringify(decision)
-        || saved.selected_model !== durableModel) throw new TaskModelSelectionError('unavailable')
+      save(unresolved ? {...decision,pending:unresolved} : decision, durableModel)
       previous = {task:request.task,model:durableModel}
+    }
+    if (unresolved === 'unavailable') {
+      // Pending ordinary continuations are references, not new model choices.
+      // Retry the original failed input, then recompute those references. This
+      // preserves an explicit switch without making a transient outage sticky.
+      const failed = this.db.query<any,[string]>(`SELECT * FROM task_model_selections WHERE job_id=?
+        AND (selected_model IS NOT NULL OR json_extract(decision_json,'$.decision')<>'none')
+        ORDER BY rowid DESC LIMIT 1`).get(jobId)
+      const source = failed?.selected_model === null && pendingDecision(failed.decision_json) === 'unavailable'
+        ? {id:jobId,revision:failed.revision,task:(JSON.parse(failed.decision_json) as StoredModelDecision).retryTask
+          ?? requests.find(r=>r.revision===failed.revision)?.task ?? job.task}
+        : prior?.selected_model === null && pendingDecision(prior.decision_json) === 'unavailable'
+          ? {id:prior.id,revision:prior.revision,task:(JSON.parse(prior.decision_json) as StoredModelDecision).retryTask ?? prior.task} : null
+      if (source) {
+        const key = `${source.id}:${source.revision}`
+        if (recovering.has(key)) throw new TaskModelSelectionError('unavailable')
+        recovering.add(key)
+        await this.resolve(source.id,[{revision:source.revision,task:source.task}],models,signal,classify,recovering)
+        return this.resolve(jobId,requests,models,signal,classify,recovering)
+      }
     }
     if (unresolved) throw new TaskModelSelectionError(unresolved)
     return requireAvailableTaskModel(selected, models)

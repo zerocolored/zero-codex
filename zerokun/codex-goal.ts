@@ -41,3 +41,12 @@ export async function retainGoalForDelegation(session: GoalSession, threadId: st
   await session.request('thread/goal/set', { threadId, objective, status: 'active' }, { timeoutMs: 15_000 })
   return { objective, status: 'active' }
 }
+
+/** Reuse the existing round and native goal; real approval and quota waits stay put. */
+export async function retainGoalForAdvisors(session: GoalSession, threadId: string, taskId: string,
+  goal: NativeGoal | null, round: {phase: string; round: number; inputRevision: number}): Promise<NativeGoal | null> {
+  if (goal?.status !== 'complete') return goal
+  const objective = taskGoalObjective(taskId) + ` The existing ${round.phase} advisor round ${round.round} for input revision ${round.inputRevision} is still running. Use advisor_round_poll to collect that same round; while pending=true, keep polling within its existing deadline, then incorporate the available answers before your final report. Do not launch another round or replace unavailable reviewers. A terminal unavailable slot does not block the task. Preserve existing user approvals and any unresolved approval wait. Do not request approval again for an already approved direction.`
+  await session.request('thread/goal/set', { threadId, objective, status: 'active' }, { timeoutMs: 15_000 })
+  return { objective, status: 'active' }
+}
