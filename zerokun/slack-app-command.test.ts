@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { runSlackAppCommand } from './slack-app-command.ts'
@@ -8,6 +8,7 @@ import { readProjectChannelConfig, mutateProjectChannelConfig } from './project-
 import { registerSlackApp } from './slack-app-registry.ts'
 import { prepareManagedStateRoot } from './managed-path.ts'
 import { JobStore } from './job-runner.ts'
+import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -19,6 +20,28 @@ function fixture() {
   expect(Bun.spawnSync(['/usr/bin/git', 'init', '-q', project]).exitCode).toBe(0)
   return { home, outside, project }
 }
+test('registered App selection succeeds while another App is waiting to update', async () => {
+  const { home, project } = fixture()
+  const busy = prepareManagedStateRoot(join(home, 'busy'))
+  const selected = prepareManagedStateRoot(join(home, 'selected'))
+  registerSlackApp('AFOUR', busy, home)
+  registerSlackApp('ANINE', selected, home)
+  writeFileSync(join(busy, 'update-transaction.json'), '{}', { mode: 0o600 })
+  const lockPath = join(busy, 'channel-route.lock')
+  const lock = tryAcquireProcessLock(lockPath)
+  if (!lock.acquired) throw Error('test lock failed')
+  const output: string[] = []
+  try {
+    await runSlackAppCommand(project, {
+      home, input: async () => 'ANINE', output: text => output.push(text),
+      installWatchdog: () => {}, verify: async () => { throw Error('existing credentials must not be requested') },
+    })
+    expect(readProjectChannelConfig(project).slackAppId).toBe('ANINE')
+    expect(output.join('')).toContain('Slackアプリ接続先: ANINE')
+    expect(existsSync(join(busy, 'jobs.sqlite3'))).toBe(false)
+    expect(readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid))
+  } finally { expect(releaseProcessLock(lockPath, lock.lease)).toBe(true) }
+})
 test('register once outside a project, then select without asking for credentials again', async () => {
   const { home, outside, project } = fixture()
   const bot = 'xoxb-synthetic-only-12345'

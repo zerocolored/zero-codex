@@ -23,6 +23,7 @@ import {
   switchProjectSlackApp,
 } from './project-channel-config.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
+import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 
 const APP_ID = 'A0123456789'
 const temporaryDirectories: string[] = []
@@ -88,6 +89,58 @@ describe('project-local Slack channel routes', () => {
     old.close(); next.close()
     expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
   })
+  test('selecting an App ignores an unrelated updating App, including old thread history', () => {
+    const f = switchFixture()
+    const unrelated = join(f.root, 'unrelated'); mkdirSync(unrelated, { mode: 0o700 })
+    const store = new JobStore(join(unrelated, 'jobs.sqlite3'))
+    store.resolveOrAdoptSlackThreadRoute({ appId: 'AFOREIGN', chatId: 'CHISTORY', threadTs: '1800000000.000100', defaultRepoPath: f.projectA, adoptedFromTs: '1800000000.000100' })
+    store.close()
+    const databaseBefore = readFileSync(join(unrelated, 'jobs.sqlite3'))
+    writeFileSync(join(unrelated, 'update-transaction.json'), '{}', { mode: 0o600 })
+    writeFileSync(join(unrelated, 'channel-route-transaction.json'), '{foreign-incomplete', { mode: 0o600 })
+    const lockPath = join(unrelated, 'channel-route.lock')
+    const lock = tryAcquireProcessLock(lockPath)
+    expect(lock.acquired).toBe(true)
+    if (!lock.acquired) throw Error('test lock failed')
+    try {
+      switchProjectSlackApp(f.projectA, 'ANEW', [...f.apps, { appId: 'AFOREIGN', stateDir: unrelated }])
+      expect(readProjectChannelConfig(f.projectA).slackAppId).toBe('ANEW')
+      expect(readFileSync(join(unrelated, 'jobs.sqlite3'))).toEqual(databaseBefore)
+      expect(readFileSync(join(unrelated, 'channel-route-transaction.json'), 'utf8')).toBe('{foreign-incomplete')
+      expect(readFileSync(join(unrelated, 'update-transaction.json'), 'utf8')).toBe('{}')
+      expect(readFileSync(lockPath, 'utf8').trim()).toBe(String(process.pid))
+    } finally { expect(releaseProcessLock(lockPath, lock.lease)).toBe(true) }
+  })
+  test('unrelated registered states are not initialized or changed to explicit routing', () => {
+    const f = switchFixture()
+    const unrelated = join(f.root, 'empty'); mkdirSync(unrelated, { mode: 0o700 })
+    switchProjectSlackApp(f.projectA, 'ANEW', [...f.apps, { appId: 'AEMPTY', stateDir: unrelated }])
+    expect(existsSync(join(unrelated, 'jobs.sqlite3'))).toBe(false)
+    expect(existsSync(join(unrelated, 'channel-route.lock.guard'))).toBe(false)
+  })
+  for (const owner of ['source', 'target', 'legacy'] as const) {
+    test(`an updating ${owner} App still blocks selection without changing routes`, () => {
+      const f = switchFixture()
+      const legacy = join(f.root, 'legacy'); mkdirSync(legacy, { mode: 0o700 })
+      const store = new JobStore(join(legacy, 'jobs.sqlite3'))
+      store.syncSlackChannelRoutes({ appId: 'ALEGACY', repoPath: f.projectA, channelIds: ['CLEGACY'] }); store.close()
+      const state = owner === 'source' ? f.state : owner === 'target' ? f.next : legacy
+      writeFileSync(join(state, 'update-transaction.json'), '{}', { mode: 0o600 })
+      const before = readProjectChannelConfig(f.projectA)
+      expect(() => switchProjectSlackApp(f.projectA, 'ANEW', [...f.apps, { appId: 'ALEGACY', stateDir: legacy }])).toThrow('更新中')
+      expect(readProjectChannelConfig(f.projectA)).toEqual(before)
+      expect(existsSync(join(f.projectA, '.zerochan/slack-app-switch.json'))).toBe(false)
+    })
+  }
+  test('legacy project routes are removed even without an explicit source binding', () => {
+    const f = switchFixture()
+    writeFileSync(projectChannelConfigPath(f.projectA), JSON.stringify({ version: 1, slackChannels: ['CSWITCH'] }), { mode: 0o600 })
+    switchProjectSlackApp(f.projectA, 'ANEW', f.apps)
+    const old = new JobStore(join(f.state, 'jobs.sqlite3')), next = new JobStore(join(f.next, 'jobs.sqlite3'))
+    expect(old.resolveSlackChannelRoute(APP_ID, 'CSWITCH')).toBeNull()
+    expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBe(f.projectA)
+    old.close(); next.close()
+  })
   test('two processes selecting different Apps serialize without losing channels', async () => {
     const f = switchFixture()
     const children = [APP_ID, 'ANEW'].map(id => Bun.spawn([process.execPath, '-e',
@@ -101,6 +154,35 @@ describe('project-local Slack channel routes', () => {
       expect(store.resolveSlackChannelRoute(app.appId, 'CSWITCH')).toBe(config.slackAppId === app.appId ? f.projectA : null)
       store.close()
     }
+  })
+  test('concurrent selection of two new Apps re-discovers the winning source', async () => {
+    const f = switchFixture()
+    const third = join(f.root, 'third'); mkdirSync(third, { mode: 0o700 })
+    const apps = [...f.apps, { appId: 'ATHIRD', stateDir: third }]
+    const children = ['ANEW', 'ATHIRD'].map(id => Bun.spawn([process.execPath, '-e',
+      `import {switchProjectSlackApp} from ${JSON.stringify(import.meta.dir + '/project-channel-config.ts')}; switchProjectSlackApp(${JSON.stringify(f.projectA)},${JSON.stringify(id)},${JSON.stringify(apps)});`,
+    ], { stdout: 'pipe', stderr: 'pipe' }))
+    for (const child of children) expect(await child.exited, await new Response(child.stderr).text()).toBe(0)
+    const config = readProjectChannelConfig(f.projectA)
+    for (const app of apps) {
+      const store = new JobStore(join(app.stateDir, 'jobs.sqlite3'))
+      expect(store.resolveSlackChannelRoute(app.appId, 'CSWITCH')).toBe(config.slackAppId === app.appId ? f.projectA : null)
+      store.close()
+    }
+  })
+  test('legacy pending route journal is recovered even before its DB route exists', () => {
+    const f = switchFixture()
+    writeFileSync(projectChannelConfigPath(f.projectA), JSON.stringify({ version: 1, slackChannels: ['CSWITCH'] }), { mode: 0o600 })
+    const legacy = join(f.root, 'legacy'); mkdirSync(legacy, { mode: 0o700 })
+    writeFileSync(join(legacy, 'channel-route-transaction.json'), JSON.stringify({
+      version: 1, operation: 'sync', appId: 'ALEGACY', repoPath: f.projectA,
+      beforeChannels: [], afterChannels: ['CSWITCH'], createdAt: Date.now(),
+    }), { mode: 0o600 })
+    switchProjectSlackApp(f.projectA, 'ANEW', [...f.apps, { appId: 'ALEGACY', stateDir: legacy }])
+    const store = new JobStore(join(legacy, 'jobs.sqlite3'))
+    expect(store.resolveSlackChannelRoute('ALEGACY', 'CSWITCH')).toBeNull(); store.close()
+    expect(existsSync(join(legacy, 'channel-route-transaction.json'))).toBe(false)
+    expect(readProjectChannelConfig(f.projectA).slackAppId).toBe('ANEW')
   })
   test('process exit after destination commit leaves a recoverable durable journal', () => {
     const f = switchFixture()
@@ -192,6 +274,27 @@ describe('project-local Slack channel routes', () => {
       const next = new JobStore(join(f.next, 'jobs.sqlite3'))
       expect(next.resolveSlackChannelRoute('ANEW', 'CSWITCH')).toBe(f.projectA); next.close()
       expect(existsSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'))).toBe(false)
+    })
+  }
+  for (const direction of ['forward', 'rollback'] as const) {
+    test(`old all-App ${direction} journal retains empty participants while selecting a different target`, () => {
+      const f = switchFixture()
+      const empty = join(f.root, 'empty'); mkdirSync(empty, { mode: 0o700 })
+      const third = join(f.root, 'third'); mkdirSync(third, { mode: 0o700 })
+      const apps = [...f.apps, { appId: 'AEMPTY', stateDir: empty }, { appId: 'ATHIRD', stateDir: third }]
+      const before = readProjectChannelConfig(f.projectA)
+      writeFileSync(join(f.projectA, '.zerochan', 'slack-app-switch.json'), JSON.stringify({
+        version: 1, direction, before, targetAppId: 'ANEW',
+        routes: [{ ...f.apps[0], channels: ['CSWITCH'] }, { ...f.apps[1], channels: [] }, { appId: 'AEMPTY', stateDir: realpathSync(empty), channels: [], explicitMode: false }],
+      }), { mode: 0o600 })
+      switchProjectSlackApp(f.projectA, 'ATHIRD', apps)
+      expect(readProjectChannelConfig(f.projectA).slackAppId).toBe('ATHIRD')
+      expect(existsSync(join(f.projectA, '.zerochan/slack-app-switch.json'))).toBe(false)
+      for (const app of apps) {
+        const store = new JobStore(join(app.stateDir, 'jobs.sqlite3'))
+        expect(store.resolveSlackChannelRoute(app.appId, 'CSWITCH')).toBe(app.appId === 'ATHIRD' ? f.projectA : null)
+        store.close()
+      }
     })
   }
   test('App binding survives channel writes and rejects accidental cross-App routes', () => {
