@@ -10906,7 +10906,7 @@ console.log(JSON.stringify({ type: 'turn.completed' }))
     writeFileSync(unknown, 'unsafe', { mode: 0o600 })
     expect(() => assertRequiredAdvisorRounds(
       job, state, contextDigest, attemptNonce, advisorInput, repositoryDigest, repositoryDigest,
-    )).toThrow('unsafe attempt entry')
+    )).not.toThrow()
     rmSync(unknown)
 
     const activeLock = join(attemptRoot, 'active-round.lock')

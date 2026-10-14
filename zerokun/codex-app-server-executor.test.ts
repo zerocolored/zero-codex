@@ -354,7 +354,7 @@ def observe_emission(value):
             persisted_items.setdefault(observed_turn_id, []).append(observed_item)
     elif method == "turn/completed":
         if goal_status == "active":
-            goal_status = os.environ.get("ZERO_PROPOSAL_GOAL", "blocked") if mode in ("goal-blocked", "goal-proposal") else "complete"
+            goal_status = os.environ.get("ZERO_PROPOSAL_GOAL", "blocked") if mode in ("goal-blocked", "goal-proposal") or os.environ.get("ZERO_ADVISOR_WAIT_ONLY") == "1" else "complete"
         observed_turn = params.get("turn", {})
         observed_turn_id = observed_turn.get("id")
         terminal_items = observed_turn.get("items", [])
@@ -415,6 +415,13 @@ for line in sys.stdin:
     elif method == "thread/goal/set":
         goal_status = value.get("params", {}).get("status", "active")
         emit({"id": request_id, "result": {"goal": {"objective": "fixture task", "status": goal_status}}})
+        if os.environ.get("ZERO_ADVISOR_NATIVE_RETAIN") == "1" and "advisor_round_poll" in value.get("params", {}).get("objective", ""):
+            with open(os.environ["ZERO_ADVISOR_RETAINED_MARKER"], "w", encoding="utf-8") as stream:
+                stream.write("retained")
+            time.sleep(0.15)
+            emit({"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "advisor-native-next", "status": "inProgress", "itemsView": "full", "items": []}}})
+            time.sleep(1.0)
+            emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "advisor-native-next", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "取得したレビューを反映しました"}], "error": None}}})
     elif method in ("thread/start", "thread/resume"):
         params = value.get("params", {})
         if method == "thread/resume" and (os.environ.get("ZERO_FORCE_OVERSIZED_RESUME") == "1" or (os.environ.get("ZERO_LARGE_RESUME_HISTORY") == "1" and params.get("excludeTurns") is not True)):
@@ -3178,10 +3185,13 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 30_000)
 
-  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel'] as const)('未完了advisorへ終端要求を送りcleanup後に回答・追加質問・取消を処理する: %s', async scenario => {
-    const interjection = !['none', 'cancel'].includes(scenario)
-    const mode = scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
+  test.each(['none', 'late', 'interjection-answer', 'interjection-update', 'cancel', 'native-review', 'approval'] as const)('稼働中advisorを停止せず取得後に回答・追加質問・取消を処理する: %s', async scenario => {
+    const interjection = !['none', 'cancel', 'native-review', 'approval'].includes(scenario)
+    const mode = scenario === 'approval' ? 'goal-blocked' : scenario === 'native-review' ? 'normal'
+      : scenario === 'none' || scenario === 'late' || scenario === 'cancel' ? 'interjection-late-answer' : scenario
     const value = fixture(mode, true)
+    const rpcLog = join(value.root, 'advisor-continuation-rpc.jsonl')
+    const retainedMarker = join(value.root, 'advisor-retained.marker')
     const acknowledge = value.hooks.acknowledgeInitialDispatch
     const finish = value.hooks.finishTurn
     let claimCreated = false
@@ -3190,7 +3200,7 @@ describe('production App Server executor', () => {
     let inputOpenAtRelease = false
     let finishedAfterRelease = false
     let inputTimer: ReturnType<typeof setTimeout> | undefined
-    let stagedInterjection = mode !== 'interjection-late-answer'
+    let stagedInterjection = interjection && mode !== 'interjection-late-answer'
     let releaseTimer: ReturnType<typeof setTimeout> | undefined
     value.hooks.acknowledgeInitialDispatch = args => {
       acknowledge!(args)
@@ -3220,7 +3230,9 @@ describe('production App Server executor', () => {
       const earliestRelease = Date.now() + 750
       releaseTimer = setInterval(() => {
         if (Date.now() < earliestRelease) return
-        if (scenario !== 'cancel' && !existsSync(`${lock}.stop`)) return
+        if (scenario === 'native-review' && !existsSync(retainedMarker)
+          && Date.now() < earliestRelease + 10_000) return
+        expect(existsSync(`${lock}.stop`)).toBe(false)
         clearInterval(releaseTimer)
         inputOpenAtRelease = value.store.liveControlTarget(value.job.chatId, value.job.threadTs) !== null
         if (scenario === 'cancel') {
@@ -3235,14 +3247,14 @@ describe('production App Server executor', () => {
       }, 50)
     }
     value.hooks.finishTurn = args => {
-      if (!finishObserved) finishedAfterRelease = released
-      finishObserved = true
+      if (!args.retainInput && !finishObserved) finishedAfterRelease = released
+      if (!args.retainInput) finishObserved = true
       return finish!(args)
     }
     try {
       const execution = executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
-        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_FIXTURE_MODE: mode, ZERO_INTERJECTION_FIXTURE_STATE: join(value.root, 'settlement-interjection.state') },
+        skipEffectiveConfigCheck: true, extraEnvironment: { ZERO_RPC_LOG: rpcLog, ZERO_ADVISOR_RETAINED_MARKER: retainedMarker, ZERO_FIXTURE_MODE: mode, ZERO_ADVISOR_NATIVE_RETAIN: scenario === 'native-review' ? '1' : '0', ZERO_ADVISOR_WAIT_ONLY: scenario === 'native-review' ? '0' : '1', ZERO_INTERJECTION_FIXTURE_STATE: join(value.root, 'settlement-interjection.state') },
         liveControls: value.hooks,
       })
       if (scenario === 'cancel') {
@@ -3256,10 +3268,18 @@ describe('production App Server executor', () => {
       }
       const result = await execution
       expect(result.result).toBe(scenario === 'interjection-update' ? '追加条件を反映して完了しました'
-        : scenario === 'interjection-answer' ? '元の作業を完了しました' : '通常完了')
+        : scenario === 'interjection-answer' ? '元の作業を完了しました'
+        : scenario === 'approval' ? '判断を待っています'
+        : scenario === 'native-review' ? '取得したレビューを反映しました' : '通常完了')
       expect(finishedAfterRelease).toBe(true)
       expect(inputOpenAtRelease).toBe(true)
       expect(stagedInterjection).toBe(interjection)
+      if (scenario === 'native-review') {
+        expect(existsSync(retainedMarker)).toBe(true)
+        const calls = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      }
+      if (scenario === 'approval') expect(result.taskGoalStatus).toBe('blocked')
     } finally {
       if (releaseTimer) clearTimeout(releaseTimer)
       if (inputTimer) clearTimeout(inputTimer)
@@ -5803,6 +5823,26 @@ describe('production App Server executor', () => {
     const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
     expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra'])
     expect(value.store.listJobControls(value.job.id)[0]?.status).toBe('ready')
+    value.store.close()
+  },30_000)
+
+  test('ordinary continuation reaches Astra thread and turn while the classifier is unavailable',async()=>{
+    const value=fixture('normal'),rpcLog=join(value.root,'model-local-continuation.jsonl')
+    value.store.db.run('INSERT OR REPLACE INTO task_model_sources VALUES (?,?)',[value.job.id,'keep going'])
+    let classifications=0
+    const result=await executeCodexJob(value.job,{
+      codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+      skipEffectiveConfigCheck:true,liveControls:value.hooks,
+      selectModel:(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,async()=>{
+        classifications++;throw Error('classifier deliberately unavailable')
+      }),
+      extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+    })
+    expect(result.result).toBe('通常完了');expect(classifications).toBe(0)
+    const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    expect(rpc.filter(row=>row.method==='thread/start').map(row=>row.model)).toEqual(['gpt-6-astra'])
+    expect(rpc.filter(row=>row.method==='turn/start').map(row=>row.model)).toEqual(['gpt-6-astra'])
+    expect(value.store.taskModels().latest(value.job.id)).toBe('gpt-6-astra')
     value.store.close()
   },30_000)
 

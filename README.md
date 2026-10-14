@@ -647,7 +647,8 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
   `config/read`が返す実際のeffective configそのものをuser/project/managed/MDM layer込みで照合し、
   プロセスの既定model=`gpt-6-astra`、reasoning effort=`medium`をrelease側から設定します。
   タスク本文での明示モデル指定は独立LLMで判定し、言い間違いと旧版名も意図した系列の最新版へ解決し、取得したモデル一覧と照合・保存した値をthread/turnへ渡します。
-  引用や比較だけでは変更せず、曖昧・非対応・判定失敗では別モデルへ自動フォールバックしません。
+  `keep going`や「続けて」だけの継続入力は独立LLMを起動せず、保存済みモデル（未指定ならAstra）を引き継ぎます。追加の指定を含む入力は全文を判定します。
+  引用や比較だけでは変更せず、曖昧・非対応・判定失敗では別モデルへ自動フォールバックしません。未解決の指定は保持し、判定が一時的に失敗した場合は次の継続時に元の入力を再判定します。診断には入力や生のエラーを含めず固定の失敗種別を残します。
   thread開始・再開時にも実効値を照合し、
   endpoint/provider差替え、legacy sandbox、named permissionの変更を拒否します。安全規則は
   `developerInstructions`、未信頼のSlack本文はJSON-RPC inputへ分離し、子環境はallowlistです。
@@ -671,6 +672,9 @@ DMはgatewayを起動したprojectを使います。一度採用したSlack thre
 - Zeroちゃんはadvisorの必須性や指摘の重大度、publication planを独自に裁定しません。
   `zerokun_advisors`はprimary Codexが選んだ初期設計・最終reviewの外部枠を安全に起動し、各round 3枠の
   実測状態を返すtransportに限定します。利用不能なadvisorだけを理由にSlack jobを失敗させません。
+  親turnの終了だけで実行中のadvisorを停止せず、既存の取得期限内で同じroundを回収します。
+  親が早期完了した場合は同じnative goalで回答を取り込みます。承認待ち・取消・利用上限は維持します。
+  GPTの取得数はApp Serverの実回答で検証し、停止receiptなどの補助fileを回答証拠と混同しません。
   Slackの完全一致`中止`では現在turnを明示的に止めます。
 - App Serverの`turn/completed`と、fullな`agentMessage`を含むturn履歴が同じthread/turn IDで揃った
   時点を論理完了として封印します。その後、同じsupervisor世代だけを停止し、

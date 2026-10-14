@@ -1,5 +1,5 @@
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
-import { retainGoalForDelegation } from './codex-goal.ts'
+import { retainGoalForAdvisors, retainGoalForDelegation } from './codex-goal.ts'
 import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
@@ -10,7 +10,7 @@ import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-
 import { browserUploadConfirmation, computerUseAppApproval, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
-import { ADVISOR_SETTLEMENT_TIMEOUT_MS, waitForAdvisorSettlement } from './advisor-settlement.ts'
+import { AdvisorRoundDeadlines, readActiveAdvisorRound, waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
 import { startProcessPolling, startSupervisorWatch } from './supervisor-watch.ts'
 import { installedGoChromeEntrypoint } from './installed-browser.ts'
@@ -2225,7 +2225,7 @@ function acceptedAdvisorJournalStatuses(
   }
 }
 
-function collectNativeAdvisorJournalEvidence(options: {
+export function collectNativeAdvisorJournalEvidence(options: {
   stateDir: string
   journalRoot: string
   jobId: string
@@ -2276,7 +2276,10 @@ function collectNativeAdvisorJournalEvidence(options: {
       continue
     }
     const revisionMatch = /^revision-([1-9][0-9]*)-([0-9a-f]{16})$/.exec(revisionEntry.name)
-    if (!revisionMatch || !revisionEntry.isDirectory() || revisionEntry.isSymbolicLink()) {
+    // Select revision directories. Stop receipts and runtime sidecars are not
+    // review evidence, and their presence must not erase acquired answers.
+    if (!revisionMatch) continue
+    if (!revisionEntry.isDirectory() || revisionEntry.isSymbolicLink()) {
       throw new Error(`advisor journal contains an unsafe attempt entry: ${revisionEntry.name}`)
     }
     const inputRevision = Number(revisionMatch[1])
@@ -7645,15 +7648,17 @@ export async function executeCodexJob(
         throw new CodexCleanupPendingError('Codex supervisorが終了前のため登録を消去できません')
       }
     }
-    let advisorSettlementDeadline: number | undefined
-    let stopExternalAdvisors = false
+    const advisorDeadlines = new AdvisorRoundDeadlines()
+    const resumedAdvisorRounds = new Set<string>()
     const drainExternalAdvisors = async (): Promise<void> => {
       if (stage !== 'complete') return
-      advisorSettlementDeadline ??= Date.now() + ADVISOR_SETTLEMENT_TIMEOUT_MS
+      const round = readActiveAdvisorRound({ stateDir: managedStateDir, jobId: job.id,
+        attemptNonce: advisorAttempt.attemptNonce, processNonce: advisorAttempt.processNonce,
+        contextDigest: advisorAttempt.contextDigest })
+      const deadline = round ? advisorDeadlines.forRound(round.key) : undefined
       await bestEffortAdvisorVerification('before-executor-retirement', async () => {
         const settlement = await waitForAdvisorSettlement({
-          requestStop: stopExternalAdvisors,
-          timeoutMs: Math.max(0, advisorSettlementDeadline! - Date.now()),
+          timeoutMs: deadline === undefined ? undefined : Math.max(0, deadline - Date.now()),
           stateDir: managedStateDir, jobId: job.id,
           attemptNonce: advisorAttempt.attemptNonce,
           processNonce: advisorAttempt.processNonce,
@@ -9081,6 +9086,18 @@ export async function executeCodexJob(
               let goal = await readTaskGoal(session, currentThreadId)
               goal = await retainGoalForDelegation(session, currentThreadId, job.id, goal,
                 pendingClaudeDelegation(managedStateDir, job.id))
+              const pendingRound = readActiveAdvisorRound({
+                stateDir: managedStateDir, jobId: job.id,
+                attemptNonce: advisorAttempt.attemptNonce,
+                processNonce: advisorAttempt.processNonce,
+                contextDigest: advisorAttempt.contextDigest,
+              })
+              if (pendingRound && Date.now() < advisorDeadlines.forRound(pendingRound.key) && goal?.status === 'complete'
+                && !resumedAdvisorRounds.has(pendingRound.key)) {
+                resumedAdvisorRounds.add(pendingRound.key)
+                goal = await bestEffortAdvisorVerification('native-advisor-goal-retention',
+                  () => retainGoalForAdvisors(session, currentThreadId!, job.id, goal, pendingRound)) ?? goal
+              }
               let nativeTurn = session.takeNativeTurnStart(currentThreadId, parentTurnIds)
               if (goal?.status === 'active' || nativeTurn) {
                 controls.finishTurn({
@@ -9091,6 +9108,10 @@ export async function executeCodexJob(
                   nativeTurn ??= session.takeNativeTurnStart(currentThreadId, parentTurnIds)
                   if (nativeTurn) break
                   goal = await readTaskGoal(session, currentThreadId)
+                  // A fast native turn can start and finish during goal/get.
+                  // Consume its queued start before interpreting complete as a gap.
+                  nativeTurn ??= session.takeNativeTurnStart(currentThreadId, parentTurnIds)
+                  if (nativeTurn) break
                   if (!goal || goal.status !== 'active') break
                   await Bun.sleep(APP_SERVER_CONTROL_POLL_MS)
                 }
@@ -9111,9 +9132,8 @@ export async function executeCodexJob(
             }
             // Keep accepted input open until owned advisor cleanup settles.
             if (terminal.turn.status === 'completed') {
-              // The answer is complete. Settle unfinished external slots through
-              // their owned cleanup instead of holding replies and follow-ups forever.
-              stopExternalAdvisors = true
+              // A completed parent turn does not cancel working reviewers.
+              // Preserve the existing acquisition budget and cancellation path.
               await drainExternalAdvisors()
             }
             let barrier = controls.finishTurn({
