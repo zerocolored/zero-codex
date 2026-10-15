@@ -1,3 +1,5 @@
+import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
+import { classifyTaskModel } from './task-model-selection.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
@@ -405,6 +407,11 @@ for line in sys.stdin:
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method == "model/list":
         catalog_calls += 1
+        if os.environ.get("ZERO_CATALOG_CLOSE") == "1" and catalog_calls > 1:
+            break
+        if os.environ.get("ZERO_CATALOG_TRANSIENT") == "1" and catalog_calls == 1:
+            emit({"id": request_id, "error": {"code": -32603, "message": "503 upstream unavailable"}})
+            continue
         catalog_models = ["gpt-6-astra", "gpt-6-sol"]
         if os.environ.get("ZERO_NEW_CATALOG") == "1" and catalog_calls > 1:
             catalog_models.append("gpt-6.1-sol")
@@ -3019,6 +3026,100 @@ describe('production App Server executor', () => {
     expect(rpc.filter(row=>row.method==='turn/start').every(row=>row.model==='gpt-6-sol' && row.effort==='medium')).toBe(true)
     value.store.close()
   }, 30_000)
+
+  test.each([false,true])('model check runtime recovery executes the unchanged input once (write=%s)',async write=>{
+    const value=fixture('normal',write,'この処理を直して');const rpcLog=join(value.root,'model-retry.jsonl');let calls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        selectModel:async(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,async()=>{
+          calls++;if(calls<3)throw new ModelSelectionRuntimeError(calls===1?'transport':'invalid-output');
+          return {decision:'none',model:null,evidence:'',continuation:false};
+        }),
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      });
+      expect(result.result).toBe('通常完了');expect(calls).toBe(3);
+      const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(1);
+      expect(rpc.filter(row=>row.method==='thread/start')).toHaveLength(1);
+      expect(value.store.taskModels().latest(value.job.id)).toBe('gpt-6-astra');
+    } finally {value.store.close();}
+  },30000);
+
+  test('catalog transport failure retries before any primary dispatch',async()=>{
+    const value=fixture('normal',true);let calls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        selectModel:async()=>{calls++;return 'gpt-6-sol'},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_CATALOG_TRANSIENT:'1'},
+      });expect(result.result).toBe('通常完了');expect(calls).toBe(1);
+    } finally {value.store.close();}
+  },30000);
+
+  test.each(['invalid-output','unclassified'] as const)('model check repeated %s exhausts instead of requeueing forever',async reason=>{
+    const value=fixture('normal',true);let calls=0;
+    try {
+      let observed:unknown;
+      try {await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>true,selectModel:async()=>{calls++;throw new ModelSelectionRuntimeError(reason)},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal'},
+      });}catch(error){observed=error;}
+      expect(observed).toBeInstanceOf(ModelSelectionRuntimeError);
+      expect(observed).toMatchObject({reason,retryable:false,exhausted:true});expect(calls).toBe(3);
+    } finally {value.store.close();}
+  },30000);
+
+  test('model check outage releases a safely deferrable executor after three tries',async()=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'defer-model.jsonl');let calls=0;
+    try {
+      await expect(executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>true,selectModel:async()=>{calls++;throw new ModelSelectionRuntimeError('transport')},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      })).rejects.toBeInstanceOf(ModelSelectionRuntimeError);
+      expect(calls).toBe(3);expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('');
+    } finally {value.store.close();}
+  },30000);
+
+  test('the incident acknowledgement dispatches without a model classifier process',async()=>{
+    const value=fixture('normal',true,'よい');let classifierCalls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,
+        selectModel:(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,
+          (text,models,previous,abort)=>classifyTaskModel(text,models,previous,abort,async()=>{classifierCalls++;throw Error('offline')})),
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal'},
+      });
+      expect(result.result).toBe('通常完了');expect(classifierCalls).toBe(0);
+    } finally {value.store.close();}
+  },30000);
+
+  test.each(['cancel','abort','permanent'] as const)('model check recovery respects %s before primary dispatch',async kind=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'model-abort.jsonl');let calls=0,cancelled=false;
+    const controller=new AbortController();const hooks={...value.hooks,cancellationRequested:()=>cancelled};
+    try {
+      const execution=executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:hooks,signal:controller.signal,transientRetryDelayMsForTesting:50,
+        selectModel:async()=>{
+          calls++;if(kind==='cancel')cancelled=true;else if(kind==='abort')controller.abort();
+          throw new ModelSelectionRuntimeError(kind==='permanent'?'authentication':'transport');
+        },
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      });
+      if(kind==='cancel')await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError);
+      else if(kind==='abort')await expect(execution).rejects.toBeInstanceOf(CodexInterruptedError);
+      else await expect(execution).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:authentication');
+      expect(calls).toBe(1);expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('');
+    } finally {value.store.close();}
+  },30000);
 
   test('unavailable semantic selection cannot dispatch a primary thread or fall back', async () => {
     const value=fixture('normal',true), rpcLog=join(value.root,'unavailable-model.jsonl')
@@ -6042,6 +6143,24 @@ describe('production App Server executor', () => {
     expect(result).toEqual({ sessionId: 'thread-app-server-1', result: '通常完了' })
     value.store.close()
   })
+
+  test('model check leaves a dead active session instead of retrying it forever',async()=>{
+    const value=fixture('defer'),rpcLog=join(value.root,'dead-model-catalog.jsonl');let calls=0;
+    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
+    try {
+      await expect(executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,signal:controller.signal,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>value.store.initialTurnDispatchIsSafeToRetry(value.job.id),
+        selectModel:async()=>{calls++;return 'gpt-6-astra'},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_CATALOG_CLOSE:'1',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      })).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:runtime');
+      expect(calls).toBe(1);
+      const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(1);
+      expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0);
+    } finally {clearTimeout(timer);value.store.close();}
+  },15000);
 
   test('model change interrupts the old turn and dispatches the input once under Sol', async () => {
     const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')

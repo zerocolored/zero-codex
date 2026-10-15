@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { classifyTaskModel, parseModelCatalog, loadTaskModelCatalog, TaskModelSelections, TASK_MODEL_SCHEMA, TaskModelSelectionError, type ModelDecision } from './task-model-selection.ts'
+import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
 import { CodexUsageTracker } from './task-usage.ts'
 const models = [{id:'gpt-6-astra',medium:true},{id:'gpt-6-sol',medium:true}]
 const none = {decision:'none',model:null,evidence:'',continuation:false} as ModelDecision
@@ -18,10 +19,10 @@ describe('task model selection',()=>{
   expect(result.model).toBe('gpt-6-sol');expect(prompt).toContain('Quoted text');expect(prompt).toContain('Latest author message: "Solで修正して"')
  })
  test.each(['{}','not json',JSON.stringify({...sol,evidence:'not present'}),JSON.stringify({...none,extra:true}),JSON.stringify({...none,model:'gpt-6-sol'})])('rejects invalid classifier output %s',async(raw)=>{
-  await expect(classifyTaskModel('Solで修正して',models,null,undefined,async()=>raw)).rejects.toThrow('ZERO_MODEL_SELECTION:unavailable')
+  await expect(classifyTaskModel('Solで修正して',models,null,undefined,async()=>raw)).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:invalid-output')
  })
  test('no silent default on classifier timeout or unavailable requested model',async()=>{
-  await expect(classifyTaskModel('Solで',models,null,undefined,async()=>{throw Error('timeout')})).rejects.toThrow('unavailable')
+  await expect(classifyTaskModel('Solで',models,null,undefined,async()=>{throw Error('thread intent classifier timed out')})).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:transport')
   await expect(classifyTaskModel('Solで',models.slice(0,1),null,undefined,async()=>JSON.stringify(sol))).rejects.toThrow('unsupported')
  })
  test('bounded input is rejected instead of dropping a model instruction at the end',async()=>{
@@ -133,11 +134,11 @@ describe('current model catalog',()=>{
  })
  test('rejects incomplete, looping and excessively paginated catalogs',async()=>{
   await expect(loadTaskModelCatalog(async cursor=>{if(cursor)throw Error('offline');return {data:[entry('old')],nextCursor:'next'}})).rejects.toThrow('offline')
-  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:'same'}))).rejects.toThrow('unavailable')
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:'same'}))).rejects.toThrow('configuration')
   let count=0
-  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:String(++count)}))).rejects.toThrow('unavailable')
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:String(++count)}))).rejects.toThrow('configuration')
   expect(count).toBe(20)
-  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:123}))).rejects.toThrow('unavailable')
+  await expect(loadTaskModelCatalog(async()=>({data:[],nextCursor:123}))).rejects.toThrow('configuration')
  })
  test('cancellation prevents classification with a partially fetched catalog',async()=>{
   const controller=new AbortController()
@@ -169,7 +170,7 @@ describe('delegation roles and primary correction',()=>{
  })
  test('correction is grounded and restores default only when no valid choice exists',async()=>{
   const text='主担当は変えない'
-  await expect(classifyTaskModel(text,models,null,undefined,async()=>JSON.stringify({...none,decision:'retain'}))).rejects.toThrow('unavailable')
+  await expect(classifyTaskModel(text,models,null,undefined,async()=>JSON.stringify({...none,decision:'retain'}))).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:invalid-output')
   expect((await classifyTaskModel(text,models,null,undefined,async()=>JSON.stringify({...none,decision:'retain',evidence:text}))).decision).toBe('retain')
   const f=store();f.add('one',1,'Opusに依頼')
   await expect(f.selections.resolve('one',[{revision:1,task:'Opusに依頼'}],models,undefined,async()=>({...none,decision:'unsupported'}))).rejects.toThrow('unsupported')
@@ -181,7 +182,7 @@ describe('delegation roles and primary correction',()=>{
 
 describe('ordinary continuation availability',()=>{
  const offline=async()=>{throw new TaskModelSelectionError('unavailable','timeout')}
- test.each(['keep going',' KEEP   GOING! ','Please continue.','resume, please','go on','続けて','そのまま続けてください。','作業を再開してください','引き続き進めてお願いします','継続してください'])('whole control request %s never starts classifier',async task=>{
+ test.each(['keep going',' KEEP   GOING! ','Please continue.','resume, please','go on','続けて','そのまま続けてください。','作業を再開してください','引き続き進めてお願いします','継続してください','よい','良い。','はい','YES!','ＯＫ','それでいいです','つづけて'])('whole control request %s never starts classifier',async task=>{
   expect(await classifyTaskModel(task,models,null,undefined,async()=>{throw Error('must not launch')})).toEqual({...none,continuation:true})
   const f=store();f.add('one',1,'Solで');await f.selections.resolve('one',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
   f.add('two',2,task)
@@ -189,8 +190,8 @@ describe('ordinary continuation availability',()=>{
   expect(await f.selections.resolve('two',[{revision:1,task},{revision:2,task:'続けて'}],models,undefined,offline)).toBe('gpt-6-sol')
   expect(await f.selections.resolve('two',[{revision:1,task}],models,undefined,offline)).toBe('gpt-6-sol');f.db.close()
  })
- test.each(['keep going, but use Sol','続けて。主担当をSolに変更','continue with NewFamily','「続けて」','keep going\nSolで','再開して。ただしOpusに依頼'])('mixed input %s still requires semantic classification',async text=>{
-  await expect(classifyTaskModel(text,models,null,undefined,async()=>{throw Error('thread intent classifier timed out')})).rejects.toThrow('[classifier:timeout]')
+ test.each(['keep going, but use Sol','続けて。主担当をSolに変更','continue with NewFamily','「続けて」','keep going\nSolで','再開して。ただしOpusに依頼','はい、Solで','よいモデルに変えて','OK\nNewFamilyで'])('mixed input %s still requires semantic classification',async text=>{
+  await expect(classifyTaskModel(text,models,null,undefined,async()=>{throw Error('thread intent classifier timed out')})).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:transport')
  })
  test('fresh continuation defaults to Astra; catalog withdrawal and abort still block',async()=>{
   const f=store();f.add('one',1,'keep going')
@@ -309,9 +310,9 @@ describe('ordinary continuation availability',()=>{
    expect(text).toBe('Sol');expect(previous?.task).toBe(question.task);expect(previous?.model).toBeNull();return sol
   })).toBe('gpt-6-sol');f.db.close()
  })
- test('legacy rowless catalog/classifier failure re-evaluates its original instruction',async()=>{
+ test.each(['ZERO_MODEL_SELECTION:unavailable','ZERO_INPUT_CHECK_RUNTIME:transport','ZERO_STORAGE_FULL'])('legacy rowless catalog/classifier failure re-evaluates its original instruction (%s)',async failure=>{
   const f=store();f.add('one',1,'Solで')
-  f.db.run('UPDATE jobs SET last_error=? WHERE id=?',['ZERO_MODEL_SELECTION:unavailable','one'])
+  f.db.run('UPDATE jobs SET last_error=? WHERE id=?',[failure,'one'])
   f.add('two',2,'keep going')
   expect(await f.selections.resolve('two',[{revision:1,task:'keep going'}],models,undefined,async text=>{
    expect(text).toBe('Solで');return sol
@@ -323,8 +324,8 @@ describe('ordinary continuation availability',()=>{
   f.db.run('INSERT INTO task_model_sources VALUES (?,?)',['two','keep going'])
   expect(await f.selections.resolve('two',[{revision:1,task:'hydrated history: Solで'}],models,undefined,offline)).toBe('gpt-6-astra');f.db.close()
  })
- test.each([['thread intent classifier timed out','timeout'],['thread intent classifier exited 1','process-failed'],['sensitive arbitrary exception','runner-failed']])('failure diagnostics are bounded: %s',async(message,diagnostic)=>{
-  await expect(classifyTaskModel('Solで',models,null,undefined,async()=>{throw Error(message)})).rejects.toThrow('ZERO_MODEL_SELECTION:unavailable [classifier:'+diagnostic+']')
+ test.each([['thread intent classifier timed out','transport'],['thread intent classifier exited 1','unclassified'],['sensitive arbitrary exception','runtime']])('failure diagnostics are bounded: %s',async(message,diagnostic)=>{
+  await expect(classifyTaskModel('Solで',models,null,undefined,async()=>{throw Error(message)})).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:'+diagnostic)
  })
  test('cleanup errors and cancellation never create a pending model change',async()=>{
   const f=store();f.add('one',1,'Solで')
@@ -333,3 +334,32 @@ describe('ordinary continuation availability',()=>{
   expect(f.db.query('SELECT * FROM task_model_selections').all()).toEqual([]);f.db.close()
  })
 })
+
+
+describe('model selection infrastructure recovery',()=>{
+ test('runtime failure retains recovery metadata without creating an ambiguous choice',async()=>{
+  const f=store();f.add('one',1,'Solで');const requests=[{revision:1,task:'Solで'}];
+  await expect(f.selections.resolve('one',requests,models,undefined,async()=>{throw new ModelSelectionRuntimeError('transport')})).rejects.toBeInstanceOf(ModelSelectionRuntimeError);
+  expect(f.db.query<{decision_json:string},[]>('SELECT decision_json FROM task_model_selections').all().map(r=>JSON.parse(r.decision_json))).toEqual([expect.objectContaining({decision:'unavailable',runtimeReason:'transport',retryTask:'Solで'})]);
+  expect(await f.selections.resolve('one',requests,models,undefined,async()=>sol)).toBe('gpt-6-sol');f.db.close();
+ });
+ test('the incident legacy unavailable acknowledgement recovers with the previous model, without a classifier',async()=>{
+  const f=store();f.add('one',1,'Solで');await f.selections.resolve('one',[{revision:1,task:'Solで'}],models,undefined,async()=>sol);
+  f.add('two',2,'よい');
+  const digest=new Bun.CryptoHasher('sha256').update('よい').digest('hex');
+  f.db.run('INSERT INTO task_model_selections VALUES (?,?,?,?,?)',['two',1,digest,JSON.stringify({decision:'unavailable',model:null,evidence:'',continuation:true,retryTask:'よい',retryPrevious:{task:'Solで',model:'gpt-6-sol'}}),null]);
+  f.add('three',3,'続けて');
+  expect(await f.selections.resolve('three',[{revision:1,task:'続けて'}],models,undefined,async()=>{throw Error('must not launch')})).toBe('gpt-6-sol');f.db.close();
+ });
+ test.each(['ambiguous','unsupported'] as const)('an acknowledgement cannot resolve a real %s model choice',async reason=>{
+  const f=store();f.add('one',1,'NewFamilyで');await expect(f.selections.resolve('one',[{revision:1,task:'NewFamilyで'}],models,undefined,async()=>({...none,decision:reason}))).rejects.toThrow(reason);
+  f.add('two',2,'よい');await expect(f.selections.resolve('two',[{revision:1,task:'よい'}],models,undefined,async()=>{throw Error('must not launch')})).rejects.toThrow(reason);f.db.close();
+ });
+});
+
+test('permanent runtime failure cannot lose an explicit switch on the next continuation',async()=>{
+ const f=store();f.add('one',1,'Solで');
+ await expect(f.selections.resolve('one',[{revision:1,task:'Solで'}],models,undefined,async()=>{throw new ModelSelectionRuntimeError('authentication')})).rejects.toThrow('authentication');
+ f.add('two',2,'よい');let checked='';
+ expect(await f.selections.resolve('two',[{revision:1,task:'よい'}],models,undefined,async text=>{checked=text;return sol})).toBe('gpt-6-sol');expect(checked).toBe('Solで');f.db.close();
+});

@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
 import { runIsolatedCodexJson } from './slack-thread-intent.ts'
 import { ZEROCHAN_PRIMARY_CODEX_MODEL } from './codex-runtime-selection.ts'
+import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
 
 export type TaskModel = { id: string; medium: boolean; displayName?: string; description?: string; upgrade?: string }
 export type ModelRequest = { revision: number; task: string }
@@ -14,7 +15,7 @@ export type ModelDecision = {
 export const MODEL_SELECTION_MESSAGES = {
   ambiguous: '使用するモデルを一つ指定してください（例:「GPT-6 Solで続けて」）。元の依頼はこのスレッドに保持しています。',
   unsupported: '指定されたモデル、またはそのmedium設定を利用できません。別のモデルを指定してください。元の依頼は保持しており、別モデルでの自動実行はしていません。',
-  unavailable: 'モデル指定の判定を完了できなかったため、この入力の実行を止めています。依頼とこれまでの作業を保持しているので、同じスレッドで再開を依頼してください。',
+  unavailable: '入力の確認処理を完了できませんでした。依頼とこれまでの作業は保持しています。同じスレッドで再開を依頼してください。',
 } as const
 export class TaskModelSelectionError extends Error {
   constructor(readonly reason: keyof typeof MODEL_SELECTION_MESSAGES, readonly diagnostic?:
@@ -23,17 +24,18 @@ export class TaskModelSelectionError extends Error {
     this.name = 'TaskModelSelectionError'
   }
 }
-/** Whole-message control requests have no model operand. Do not infer absence
+/** Whole-message acknowledgements/control requests have no model operand. Do not infer absence
  * from a model-name allowlist: arbitrary new families still need classification. */
 export function ordinaryModelContinuation(input: string): ModelDecision | null {
   const text = input.normalize('NFKC').trim().replace(/[.!！。?？]+$/u, '').trim().toLowerCase()
   if (/^(?:please\s+)?(?:keep\s+going|continue|resume|go\s+on|proceed)(?:,?\s+please)?$/u.test(text)
-    || /^(?:(?:そのまま|引き続き|作業を)\s*)?(?:続けて|進めて|再開して|続行して|継続して)(?:ください|下さい|お願いします)?$/u.test(text)) {
+    || /^(?:(?:そのまま|引き続き|作業を)\s*)?(?:続けて|つづけて|進めて|すすめて|再開して|続行して|継続して)(?:ください|下さい|お願いします)?$/u.test(text)
+    || /^(?:yes|yep|yeah|ok(?:ay)?|sure|approved|はい|うん|(?:よい|良い|いい)(?:です|よ)?|了解(?:です|しました)?|承知しました|それで(?:よい|良い|いい|大丈夫)(?:です)?)$/u.test(text)) {
     return { decision: 'none', model: null, evidence: '', continuation: true }
   }
   return null
 }
-type StoredModelDecision = Omit<ModelDecision, 'decision'> & { decision: ModelDecision['decision'] | 'unavailable'; pending?: keyof typeof MODEL_SELECTION_MESSAGES; retryTask?: string; retryPrevious?: {task:string;model:string|null} | null }
+type StoredModelDecision = Omit<ModelDecision, 'decision'> & { decision: ModelDecision['decision'] | 'unavailable'; pending?: keyof typeof MODEL_SELECTION_MESSAGES; runtimeReason?: string; retryTask?: string; retryPrevious?: {task:string;model:string|null} | null }
 function pendingDecision(raw: string): keyof typeof MODEL_SELECTION_MESSAGES {
   const stored = JSON.parse(raw) as StoredModelDecision
   if (stored.pending) return stored.pending
@@ -41,10 +43,10 @@ function pendingDecision(raw: string): keyof typeof MODEL_SELECTION_MESSAGES {
   return decision === 'unsupported' || decision === 'unavailable' ? decision : 'ambiguous'
 }
 export function parseModelCatalog(value: Record<string, unknown>): TaskModel[] {
-  if (!Array.isArray(value.data)) throw new TaskModelSelectionError('unavailable')
+  if (!Array.isArray(value.data)) throw new ModelSelectionRuntimeError('configuration')
   return value.data.map((item: any) => {
     if (!item || typeof item.model !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(item.model)
-      || !Array.isArray(item.supportedReasoningEfforts)) throw new TaskModelSelectionError('unavailable')
+      || !Array.isArray(item.supportedReasoningEfforts)) throw new ModelSelectionRuntimeError('configuration')
     const model: TaskModel = { id: item.model, medium: item.supportedReasoningEfforts.some((e: any) => e?.reasoningEffort === 'medium') }
     // Catalog metadata helps the LLM identify families and recency without relying on training memory.
     for (const key of ['displayName', 'description', 'upgrade'] as const) {
@@ -66,11 +68,11 @@ export async function loadTaskModelCatalog(readPage: (cursor: string | null) => 
     models.push(...parseModelCatalog(page))
     const next = page.nextCursor
     if (next === null || next === undefined || next === '') return models
-    if (typeof next !== 'string' || seen.has(next)) throw new TaskModelSelectionError('unavailable')
+    if (typeof next !== 'string' || seen.has(next)) throw new ModelSelectionRuntimeError('configuration')
     seen.add(next)
     cursor = next
   }
-  throw new TaskModelSelectionError('unavailable')
+  throw new ModelSelectionRuntimeError('configuration')
 }
 export function requireAvailableTaskModel(model: string, models: TaskModel[]): string {
   if (!models.some(m => m.id === model && m.medium)) throw new TaskModelSelectionError('unsupported')
@@ -120,22 +122,24 @@ Latest author message: ${JSON.stringify(input)}
 Return only schema JSON.`
   let value: any
   let raw: string
-  try { raw = await run(prompt, schema, { model: ZEROCHAN_PRIMARY_CODEX_MODEL, reasoningEffort: 'medium', independent: true, signal }) }
+  try { raw = await run(prompt, schema, { model: ZEROCHAN_PRIMARY_CODEX_MODEL, reasoningEffort: 'medium', independent: true, purpose: 'model-selection', signal }) }
   catch (error) {
     if (signal?.aborted || (error instanceof Error && error.name === 'CodexCleanupPendingError')) throw error
+    if (error instanceof ModelSelectionRuntimeError) throw error
     const message = error instanceof Error ? error.message : ''
-    throw new TaskModelSelectionError('unavailable', message === 'thread intent classifier timed out' ? 'timeout'
-      : /^thread intent classifier exited -?\d+$/.test(message) ? 'process-failed' : 'runner-failed')
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOSPC') throw new ModelSelectionRuntimeError('disk-full')
+    throw new ModelSelectionRuntimeError(['thread intent classifier timed out','isolated Codex is stopping'].includes(message) ? 'transport'
+      : /^thread intent classifier exited -?\d+$/.test(message) ? 'unclassified' : 'runtime')
   }
   signal?.throwIfAborted()
-  try { value = JSON.parse(raw) } catch { throw new TaskModelSelectionError('unavailable', 'invalid-output') }
+  try { value = JSON.parse(raw) } catch { throw new ModelSelectionRuntimeError('invalid-output') }
   if (!value || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'continuation,decision,evidence,model'
     || !['none','select','retain','ambiguous','unsupported'].includes(value.decision)
     || typeof value.continuation !== 'boolean' || typeof value.evidence !== 'string' || value.evidence.length > 400
     || (value.decision === 'select' ? typeof value.model !== 'string' || !value.evidence || !input.includes(value.evidence)
       : value.model !== null)
     || (value.decision === 'retain' && (!value.evidence || !input.includes(value.evidence)))
-    || (value.decision === 'none' && value.evidence !== '')) throw new TaskModelSelectionError('unavailable', 'invalid-output')
+    || (value.decision === 'none' && value.evidence !== '')) throw new ModelSelectionRuntimeError('invalid-output')
   if (value.decision === 'select') requireAvailableTaskModel(value.model, models)
   return value
 }
@@ -178,7 +182,8 @@ export class TaskModelSelections {
       a.request_text FROM jobs p LEFT JOIN task_model_selections s ON s.job_id=p.id
       LEFT JOIN task_model_sources a ON a.job_id=p.id
       WHERE p.chat_id=? AND p.thread_ts=? AND p.repo_path=? AND p.write_enabled=? AND p.workflow=?
-      AND p.seq<? AND (s.job_id IS NOT NULL OR instr(p.last_error, 'ZERO_MODEL_SELECTION:unavailable')>0)
+      AND p.seq<? AND (s.job_id IS NOT NULL OR instr(p.last_error, 'ZERO_MODEL_SELECTION:unavailable')>0
+        OR instr(p.last_error, 'ZERO_INPUT_CHECK_RUNTIME:')>0 OR instr(p.last_error, 'ZERO_STORAGE_FULL')>0)
       AND (s.job_id IS NULL OR s.selected_model IS NOT NULL OR json_extract(s.decision_json,'$.decision')<>'none')
       ORDER BY p.seq DESC,s.rowid DESC`)
     try { for (const row of history.iterate(
@@ -248,9 +253,13 @@ export class TaskModelSelections {
             cachedDecision && 'retryPrevious' in cachedDecision ? cachedDecision.retryPrevious! : previous, signal)
         signal?.throwIfAborted()
       } catch (error) {
-        if (!signal?.aborted && error instanceof TaskModelSelectionError) {
+        if (!signal?.aborted && (error instanceof TaskModelSelectionError || error instanceof ModelSelectionRuntimeError)) {
           // Retry this revision on replay, but keep it pending for future jobs.
-          save({decision:error.reason,model:null,evidence:'',continuation:true,retryTask:request.task,retryPrevious:cachedDecision && 'retryPrevious' in cachedDecision ? cachedDecision.retryPrevious : previous}, null)
+          // Infrastructure records retain the original directive for recovery;
+          // they are not an ambiguous/unsupported user choice or a terminal outcome.
+          save({decision:error instanceof ModelSelectionRuntimeError ? 'unavailable' : error.reason,
+            ...(error instanceof ModelSelectionRuntimeError ? {runtimeReason:error.reason} : {}),
+            model:null,evidence:'',continuation:true,retryTask:request.task,retryPrevious:cachedDecision && 'retryPrevious' in cachedDecision ? cachedDecision.retryPrevious : previous}, null)
         }
         throw error
       }
