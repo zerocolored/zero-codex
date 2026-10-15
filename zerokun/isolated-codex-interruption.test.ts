@@ -50,7 +50,7 @@ for (const mode of ['single', 'fork-abort', 'fork-parent-exit', 'supervised-abor
       const controller = new AbortController();
       let pid = 0, exits = 0, errorName = '', gone = false;
       try {
-        await runIsolatedCodexJson('synthetic audit input', {}, { independent: true, signal: controller.signal,
+        await runIsolatedCodexJson('synthetic audit input', {}, { independent: true, purpose: 'security-audit', signal: controller.signal,
           ${mode.startsWith('supervised') ? `supervision: { jobId: 'audit-fixture', stateDir: ${JSON.stringify(stateDir)} },` : ''}
           onProcessId(value) { pid = value; ${mode === 'fork-parent-exit' ? '' : mode === 'single' ? 'setTimeout(() => controller.abort(), 100);' : `
             const deadline = Date.now() + 5000;
