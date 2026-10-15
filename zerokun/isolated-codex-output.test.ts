@@ -17,8 +17,11 @@ test.skipIf(process.platform !== 'darwin')('回答統合だけ大きいJSON出�
         #include <stdio.h>
         #include <string.h>
         int main(int argc,char **argv) {
-          int n = getchar() == 'L' ? 70000 : 12000;
+          int c = getchar(); int n = c == 'L' ? 70000 : 12000;
           while (getchar() != EOF) {}
+          if(c == 'F') { fputs(${JSON.stringify(JSON.stringify({type:'error',message:'429 too many requests private-diagnostic-value'})+'\n')},stdout); fputs("user authentication quota sample text",stderr); return 1; }
+          if(c == 'A') { fputs(${JSON.stringify(JSON.stringify({type:'error',message:'401 unauthorized private-diagnostic-value'})+'\n')},stdout); fputs("user authentication quota sample text",stderr); return 1; }
+          if(c == 'D') { fputs(${JSON.stringify(JSON.stringify({type:'error',message:'ENOSPC private-diagnostic-value'})+'\n')},stdout); fputs("user authentication quota sample text",stderr); return 1; }
           for(int i=1;i+1<argc;i++) if(!strcmp(argv[i], "--output-last-message")) {
             FILE *f=fopen(argv[i+1],"w"); if(!f) return 3;
             fputs("{\\\"answer\\\":\\\"",f);
@@ -46,15 +49,27 @@ test.skipIf(process.platform !== 'darwin')('回答統合だけ大きいJSON出�
         } catch {results.push({accepted:false,exits});}
         try {process.kill(pid,0); throw Error('owned process survived');} catch(e) {if(e.code!=='ESRCH') throw e;}
       }
-      console.log(JSON.stringify(results));
+      const failures=[];
+      for(const prompt of ['F','A','D']) {
+        let pid=0,exits=0;
+        try {await runIsolatedCodexJson(prompt,{}, {purpose:'model-selection',onProcessId:p=>pid=p,onProcessExit:()=>exits++});throw Error('must fail');}
+        catch(e) {failures.push({reason:e.reason,retryable:e.retryable,exits,leaked:JSON.stringify(e).includes('private-diagnostic-value')});}
+        try {process.kill(pid,0); throw Error('owned process survived');} catch(e) {if(e.code!=='ESRCH') throw e;}
+      }
+      console.log(JSON.stringify({results,failures}));
     `, { mode: 0o600 })
     const child = Bun.spawn([process.execPath, '--no-env-file', harness], { cwd: root,
       env: { HOME: root, PATH: '/usr/bin:/bin', TMPDIR: tmpdir() }, stdout: 'pipe', stderr: 'pipe' })
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
     expect(stderr).toBe('')
     expect(code).toBe(0)
-    expect(JSON.parse(stdout)).toEqual([
+    expect(JSON.parse(stdout).results).toEqual([
       {accepted:false,exits:1}, {accepted:true,length:12000,exits:1}, {accepted:false,exits:1},
+    ])
+    expect(JSON.parse(stdout).failures).toEqual([
+      {reason:'throttled',retryable:true,exits:1,leaked:false},
+      {reason:'authentication',retryable:false,exits:1,leaked:false},
+      {reason:'disk-full',retryable:false,exits:1,leaked:false},
     ])
   } finally { rmSync(root, {recursive:true,force:true}) }
 }, 15000)

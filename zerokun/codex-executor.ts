@@ -4,6 +4,7 @@ export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-li
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
 import { retainGoalForAdvisors, retainGoalForDelegation } from './codex-goal.ts'
 import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
+import { ModelSelectionRuntimeError, modelSelectionRetryDelay, modelSelectionProcessFailure } from './model-selection-runtime.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
@@ -6711,6 +6712,7 @@ export async function executeCodexJob(
     browserAccessForTesting?: boolean
     /** Host selector persists semantic decisions; raw CLI/environment overrides remain forbidden. */
     selectModel?(requests: ModelRequest[], models: TaskModel[], signal?: AbortSignal): Promise<string>
+    canDeferModelSelection?(): boolean
     /** Fixture-only model override. */
     model?: string
     /** Fixture-only reasoning override. Production always uses the release constant. */
@@ -8072,13 +8074,64 @@ export async function executeCodexJob(
         const abort = () => controller.abort()
         options.signal?.addEventListener('abort', abort, { once: true })
         if (options.signal?.aborted) abort()
-        const poll = setInterval(() => { if (controls.cancellationRequested()) abort() }, APP_SERVER_CONTROL_POLL_MS)
+        const poll = setInterval(() => {
+          try { if (controls.cancellationRequested()) abort() }
+          catch (error) { controller.abort(error) }
+        }, APP_SERVER_CONTROL_POLL_MS)
         try {
-          const modelCatalog = await loadTaskModelCatalog(async cursor =>
-            (await session.request('model/list', { cursor, limit: 100, includeHidden: false }, { timeoutMs: 15_000 })).result, controller.signal)
-          const selected = await options.selectModel(requests, modelCatalog, controller.signal)
-          if (controls.cancellationRequested()) throw new CodexUserCancelledError()
-          return requireAvailableTaskModel(selected, modelCatalog)
+          let retry = 0
+          for (;;) {
+            controller.signal.throwIfAborted()
+            try {
+              const modelCatalog = await loadTaskModelCatalog(async cursor => {
+                try { return (await session.request('model/list', { cursor, limit: 100, includeHidden: false }, { timeoutMs: 15_000 })).result }
+                catch (error) {
+                  if (error instanceof AppServerAmbiguousRequestError && error.method === 'model/list') {
+                    throw new ModelSelectionRuntimeError('transport') // Read-only RPC, no task delivery.
+                  }
+                  if (error instanceof AppServerProtocolError
+                    && error.message === 'Codex model/list cannot be sent after stream close') {
+                    // A dead session cannot recover in place. Only an unsent
+                    // job may defer and open a fresh process; active work must
+                    // leave this loop for normal cleanup, never spin forever.
+                    throw new ModelSelectionRuntimeError(options.canDeferModelSelection?.() ? 'transport' : 'runtime')
+                  }
+                  if (error instanceof AppServerProtocolError && error.method === 'model/list' && error.rpcError) {
+                    const failure = modelSelectionProcessFailure(1, JSON.stringify(error.rpcError))
+                    if (failure.reason !== 'unclassified') throw failure
+                    throw new ModelSelectionRuntimeError(error.rpcError.code === -32603 ? 'transport' : 'configuration')
+                  }
+                  throw error
+                }
+              }, controller.signal)
+              const selected = await options.selectModel(requests, modelCatalog, controller.signal)
+              controller.signal.throwIfAborted()
+              if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+              return requireAvailableTaskModel(selected, modelCatalog)
+            } catch (error) {
+              controller.signal.throwIfAborted()
+              if (!(error instanceof ModelSelectionRuntimeError) || !error.retryable) throw error
+              if (retry >= 2 && ['invalid-output', 'unclassified'].includes(error.reason)) {
+                // Persistent malformed output / unknown failures are not proof
+                // of a transient outage. Keep the input, but don't queue forever.
+                throw new ModelSelectionRuntimeError(error.reason, error.exitCode, true)
+              }
+              // The host may release the serial worker only before any task or
+              // control delivery. Active work keeps its existing thread instead.
+              if ((retry >= 2 || error.reason === 'quota') && options.canDeferModelSelection?.()) throw error
+              // This call has not dispatched the input. Retry only the input
+              // check, never the task or a primary turn; never choose a fallback model.
+              const delay = options.transientRetryDelayMsForTesting ?? modelSelectionRetryDelay(retry)
+              retry += 1
+              try { options.onMonitorMessage?.(`入力の確認処理を再試行します（${error.reason}）。依頼内容は保持しています。`) } catch {}
+              const until = Date.now() + delay
+              while (Date.now() < until) {
+                controller.signal.throwIfAborted()
+                if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+                await Bun.sleep(Math.min(100, until - Date.now()))
+              }
+            }
+          }
         } catch (error) {
           if (controls.cancellationRequested()) throw new CodexUserCancelledError()
           throw error
@@ -9632,6 +9685,10 @@ export async function executeCodexJob(
         }
       }
       if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
+        await retireCompletedRegistration()
+        throw protocolError
+      }
+      if (protocolError instanceof ModelSelectionRuntimeError && !userCancelled && !interruptedAtExit) {
         await retireCompletedRegistration()
         throw protocolError
       }

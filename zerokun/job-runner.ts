@@ -10,6 +10,7 @@ import { createPrimaryLiveControlHooks } from './primary-live-controls.ts'
 import { pinClaudeJobModel } from './claude-model-binding.ts'
 import { initializeAudit, AuditSetupRequiredError, AUDIT_ANSWER_VERSION, type AuditSetupReply } from './security-audit-setup.ts'
 import { TaskModelSelections, TASK_MODEL_SCHEMA, MODEL_SELECTION_MESSAGES } from './task-model-selection.ts'
+import { ModelSelectionRuntimeError, publicModelSelectionRuntimeFailure } from './model-selection-runtime.ts'
 import { assertSlackProjectAdmission } from './slack-project-admission.ts'
 import { executeSecurityAudit, copyAuditReportForFollowup, auditHasReadinessOnlyResult } from './security-audit.ts'
 import { createSecurityAuditProgress, deliverAuditMilestone } from './security-audit-progress.ts'
@@ -14057,6 +14058,7 @@ export interface RunQueuedJobsOptions {
   githubPublicationRetryMsForTesting?: number
   /** Fixture-only delay for a transient retained-attachment host I/O retry. */
   retainedAttachmentRetryMsForTesting?: number
+  modelSelectionRetryMsForTesting?: number
   signal?: AbortSignal
   onLog?: (message: string) => void
 }
@@ -14161,6 +14163,8 @@ export class UiApprovalParkingRaceError extends Error {
 
 export function publicJobFailureSummary(error: string): string {
   if (isStorageFailure(error)) return STORAGE_FAILURE_MESSAGE
+  const inputCheckFailure = publicModelSelectionRuntimeFailure(error)
+  if (inputCheckFailure) return inputCheckFailure
   if (error === MONITOR_LOSS_RECOVERY_MESSAGE) return MONITOR_LOSS_RECOVERY_MESSAGE
   for (const [reason, message] of Object.entries(MODEL_SELECTION_MESSAGES)) {
     if (error.includes(`ZERO_MODEL_SELECTION:${reason}`)) return message
@@ -15457,6 +15461,17 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
           'github',
         )
         log(`${workerId} deferred publication preflight ${job.id}: ${message}`)
+        continue
+      }
+      if (error instanceof ModelSelectionRuntimeError && error.retryable && !options.signal?.aborted
+        && options.store.initialTurnDispatchIsSafeToRetry(job.id)
+        && !options.store.controlMayHaveBeenDelivered(job.id)
+        && !options.store.writePhaseMayHaveBeenDelivered(job.id)) {
+        await updateMonitor(job, '入力の確認処理が一時的に利用できません。依頼を保持して自動再試行します')
+        await quiesceLifecycleBeforeStateChange()
+        options.store.requeue(job.id, error.message,
+          Date.now() + positiveInteger(options.modelSelectionRetryMsForTesting, error.reason === 'quota' ? 300_000 : 60_000))
+        log(`${workerId} deferred input check ${job.id}: ${error.reason}`)
         continue
       }
       if (error instanceof CodexInterruptedError || options.signal?.aborted) {
@@ -18842,6 +18857,8 @@ async function runCli(): Promise<void> {
             logDir: join(dir, 'job-logs'),
             threadHistory: store.threadHistorySnapshot(job.id, job.attempts),
             selectModel: (requests, models, signal) => store.taskModels().resolve(job.id, requests, models, signal),
+            canDeferModelSelection: () => store.initialTurnDispatchIsSafeToRetry(job.id)
+              && !store.controlMayHaveBeenDelivered(job.id) && !store.writePhaseMayHaveBeenDelivered(job.id),
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
