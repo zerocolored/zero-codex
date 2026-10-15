@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE, STORAGE_FAILURE_MESSAGE } from './storage-failure.ts'
 import { legacyTransportThrottle, throttleRetryDelay, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitReason } from './codex-rate-limit.ts'
 import { isPrimaryCore, type PrimaryCore, type JobRuntime } from './primary-core.ts'
 import { migratePrimaryCoreRuntime } from './primary-core-migration.ts'
@@ -11241,7 +11242,14 @@ export class JobStore {
     retrySqlite(() => cancel.immediate())
   }
 
-  failAfterMonitorLoss(id: string, error: string): boolean {
+  rememberStorageFailure(id: string): void {
+    this.db.run("UPDATE jobs SET last_error=? WHERE id=? AND status='running'", [STORAGE_FAILURE, id])
+  }
+
+  failAfterMonitorLoss(id: string, error: string, recoveryStateDir?: string): boolean {
+    const job = this.get(id)
+    error = job?.lastError === STORAGE_FAILURE ? STORAGE_FAILURE
+      : retainedStorageFailure(recoveryStateDir, job) ?? error
     const fail = this.db.transaction(() => {
       const finishedAt = Date.now()
       const updated = this.db.run(
@@ -13671,7 +13679,7 @@ export class JobStore {
     return { preparedReset, promoted, blocked }
   }
 
-  recoverInterrupted(_advisorStateDir?: string): {
+  recoverInterrupted(recoveryStateDir?: string): {
     requeued: number
     failedWrites: number
     failedUncertain: number
@@ -13739,7 +13747,8 @@ export class JobStore {
         }
         this.fail(
           job.id,
-          'write-enabled job was interrupted after execution began; its external effects are uncertain. Review the repository and external services, then resend only if needed.',
+          (job.lastError === STORAGE_FAILURE ? STORAGE_FAILURE : retainedStorageFailure(recoveryStateDir, job))
+            ?? 'write-enabled job was interrupted after execution began; its external effects are uncertain. Review the repository and external services, then resend only if needed.',
         )
         failedWrites += 1
       } else if (job.notBefore !== null) {
@@ -13755,9 +13764,10 @@ export class JobStore {
         || this.controlMayHaveBeenDelivered(job.id)) {
         this.fail(
           job.id,
-          'read-only job was interrupted after an App Server or live control request '
-          + 'may have been delivered; '
-          + 'it will not be resent automatically. Send a new request if needed.',
+          (job.lastError === STORAGE_FAILURE ? STORAGE_FAILURE : retainedStorageFailure(recoveryStateDir, job))
+            ?? ('read-only job was interrupted after an App Server or live control request '
+              + 'may have been delivered; '
+              + 'it will not be resent automatically. Send a new request if needed.'),
         )
         failedUncertain += 1
       } else {
@@ -14150,6 +14160,8 @@ export class UiApprovalParkingRaceError extends Error {
 }
 
 export function publicJobFailureSummary(error: string): string {
+  if (isStorageFailure(error)) return STORAGE_FAILURE_MESSAGE
+  if (error === MONITOR_LOSS_RECOVERY_MESSAGE) return MONITOR_LOSS_RECOVERY_MESSAGE
   for (const [reason, message] of Object.entries(MODEL_SELECTION_MESSAGES)) {
     if (error.includes(`ZERO_MODEL_SELECTION:${reason}`)) return message
   }
@@ -15240,7 +15252,15 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
       stats.completed += 1
       scheduleNotificationFlush()
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const storageCause = isStorageFailure(error) ? STORAGE_FAILURE
+        : retainedStorageFailure(options.advisorStateDir ?? dirname(options.store.dbPath), options.store.get(job.id))
+      if (storageCause) {
+        // A full disk may also prevent SQLite writes. Keep cleanup semantics;
+        // recovery can still classify the supervisor's existing stderr later.
+        try { options.store.rememberStorageFailure(job.id) }
+        catch { log('storage failure cause could not be saved; preserving executor diagnostics') }
+      }
+      const message = storageCause ?? (error instanceof Error ? error.message : String(error))
       if (error instanceof CodexPublicationConflictRecoveryError) {
         await updateMonitor(
           job,
@@ -15550,12 +15570,12 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         scheduleNotificationFlush()
         continue
       }
-      const failure = job.writeEnabled
+      const failure = storageCause ?? (job.writeEnabled
         && options.store.writePhaseMayHaveBeenDelivered(job.id, job.attempts)
         ? 'write-enabled work may already have changed the repository or external services '
           + 'before the Codex workflow failed. Review those effects, then resend only if '
           + `needed. Underlying failure: ${message}`
-        : message
+        : message)
       await updateMonitor(job, '失敗として確定します')
       await quiesceMonitorBeforeTerminal()
       options.store.fail(job.id, failure)
@@ -18266,7 +18286,7 @@ async function runCli(): Promise<void> {
           return 'unarmed'
         }
         if ((status === 'queued' || status === 'running')
-          && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
+          && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE, dir)) {
           log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
           return 'terminalized'
         }
@@ -18461,7 +18481,7 @@ async function runCli(): Promise<void> {
         return 'unarmed'
       }
       if ((status === 'queued' || status === 'running')
-        && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE)) {
+        && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE, dir)) {
         log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
         return 'terminalized'
       }

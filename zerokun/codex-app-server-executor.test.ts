@@ -1,3 +1,4 @@
+import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
@@ -313,6 +314,10 @@ import time
 
 catalog_calls = 0
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
+if os.environ.get("ZERO_FIXTURE_STORAGE_FULL_STDERR") == "1":
+    sys.stderr.write("x" * (21 * 1024 * 1024) + "\\n")
+    sys.stderr.write(json.dumps({"type":"zero-app-server-error", "message":"ZERO_STORAGE_FULL"}) + "\\n")
+    sys.stderr.flush()
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
@@ -7154,6 +7159,29 @@ describe('production App Server executor', () => {
       expect(value.store.claimNext('restarted-serial-worker')?.id).toBe(next.id)
       expect(value.store.recoverInterrupted().requeued).toBe(1)
       expect(value.store.get(value.job.id)?.status).toBe('failed')
+    } finally { value.store.close() }
+  }, 15_000)
+
+  test('storage cause survives stderr prefix saturation through the real executor relay', async () => {
+    const value = fixture('normal')
+    let failure: unknown
+    try {
+      await executeCodexJob(value.job, {
+        codexBinForTesting:value.executable, logDir:value.logDir, stateDir:value.state,
+        skipEffectiveConfigCheck:true,
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal', ZERO_FIXTURE_STORAGE_FULL_STDERR:'1',
+          ZEROKUN_SUPERVISOR_TEST_FORCE_RETAIN_AFTER_CHILD_EXIT:'1'},
+        supervisorCleanupGraceMs:50, liveControls:value.hooks,
+      })
+    } catch (error) { failure = error }
+    try {
+      expect(failure).toBeInstanceOf(CodexCleanupPendingError)
+      expect(isStorageFailure(failure)).toBe(true)
+      const stderr = readFileSync(join(value.logDir, `${value.job.id}.new.stderr.log`), 'utf8')
+      expect(stderr.length).toBeGreaterThan(20 * 1024 * 1024)
+      expect(stderr.length).toBeLessThan(20 * 1024 * 1024 + 1024)
+      expect(stderr.slice(-1024)).toContain(STORAGE_FAILURE)
+      expect(retainedStorageFailure(value.state, value.job)).toBe(STORAGE_FAILURE)
     } finally { value.store.close() }
   }, 15_000)
 
