@@ -370,7 +370,7 @@ export async function runSlackThreadIntentClassifier(
 /** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
 export async function runIsolatedCodexJson(prompt: string, schema: object,
   options: { timeoutMs?: number; model?: string; reasoningEffort?: 'medium'; independent?: boolean; signal?: AbortSignal;
-    purpose?: 'security-audit';
+    purpose?: 'security-audit' | 'answer-consolidation';
     onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void;
     supervision?: { jobId: string; stateDir: string } } = {}): Promise<string> {
   if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
@@ -457,8 +457,8 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     })
     spawned.stdin.write(prompt)
     spawned.stdin.end()
-    // Source reviews can return many findings; the routing classifier's 4 KiB /
-    // 110 second limits are intentionally unchanged for every other caller.
+    // Source reviews have a longer budget. Delivery editing keeps the normal
+    // deadline but has a separate output cap below; routing limits stay intact.
     const timeoutMs = options.purpose === 'security-audit'
       ? 10 * 60_000
       : slackThreadIntentClassifierTimeoutMs(options.timeoutMs)
@@ -483,7 +483,8 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       throw new Error(`thread intent classifier exited ${outcome}`)
     }
     await diagnostic
-    return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000 : MAX_CLASSIFIER_OUTPUT_BYTES)
+    return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000
+      : options.purpose === 'answer-consolidation' ? 64 * 1024 : MAX_CLASSIFIER_OUTPUT_BYTES)
   } finally {
     if (timer) clearTimeout(timer)
     if (onAbort) options.signal?.removeEventListener('abort', onAbort)

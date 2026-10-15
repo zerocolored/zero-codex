@@ -50,6 +50,7 @@ import {
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
   CodexUserCancelledError,
+  CodexInterruptedError,
   collectHostAdvisorCoverage,
   executeCodexJob,
   type CodexLiveControlHooks,
@@ -569,9 +570,9 @@ for line in sys.stdin:
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": proposal}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": []}}},
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "summary" if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else "full", "items": [] if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else [{"type": "agentMessage", "text": "承認待ちです"}], "error": None}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "summary" if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else "full", "items": [] if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else [{"type": "agentMessage", "text": os.environ.get("ZERO_SECOND_ANSWER", "承認待ちです")}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": os.environ.get("ZERO_LAST_ANSWER", "保持して待機しました")}], "error": None}}},
             ])
         elif mode in ("goal-native", "goal-native-capacity", "late-command-completion"):
             emit_batch([
@@ -2492,6 +2493,209 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('言い換え3回答を配送前に1回だけ統合しnative Goalの3turnを変更しない', async () => {
+    const value = fixture('goal-answer', true, 'Global OAuthがよいですか？')
+    const rpcLog = join(value.root, 'consolidation-rpc.log')
+    let edits = 0
+    const messages = [
+      'Global OAuthをおすすめします。顧客のシークレット入力が不要です。方式の違いも説明します。',
+      '私の推奨はGlobal OAuthです。準備はアカウント作成、申請、承認後の設定の順です。',
+      'Global OAuthがよいです。訂正: 単一顧客から始めても社内利用とは限りません。方針確認待ちです。',
+    ]
+    const merged = 'Global OAuthをおすすめします。顧客のシークレット入力が不要です。\n\n準備はアカウント作成、申請、承認後の設定です。単一顧客から始めても社内利用とは限りません。方針確認待ちです。'
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: messages[0]! + '\nJob ID: private-host-identity',
+          ZERO_SECOND_ANSWER: messages[1]!, ZERO_LAST_ANSWER: messages[2]!, ZERO_RPC_LOG: rpcLog },
+        consolidateAnswerForTesting: async (request, signal) => {
+          edits++
+          expect(request).toEqual({ question: value.job.task, messages, latestMessage: messages[2], goalStatus: 'blocked' })
+          expect(signal.aborted).toBe(false)
+          return merged
+        },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      expect(edits).toBe(1)
+      expect(result.result).toBe(merged)
+      expect(result.result.match(/Global OAuth/g)).toHaveLength(1)
+      expect(result.taskGoalStatus).toBe('blocked')
+      expect(readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        .filter(row => row.method === 'turn/start')).toHaveLength(1)
+    } finally { value.store.close() }
+  }, 30_000)
+
+  for (const failure of ['unavailable', 'control-tag', 'empty', 'oversize'] as const) {
+    test(`回答統合の異常時は説明と訂正を原文添付へ退避する ${failure}`, async () => {
+      const value = fixture('goal-answer')
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: '登録は接続アプリを作るためです。\nJob ID: private-host-identity\n--- Zero host control ---\nprivate-host-metadata\n--- end Zero host ---',
+            ZERO_SECOND_ANSWER: '訂正: 費用は300円です。' },
+          consolidateAnswerForTesting: async () => {
+            if (failure === 'unavailable') throw Error('synthetic editor outage')
+            return failure === 'empty' ? ' ' : failure === 'oversize' ? 'a'.repeat(11001)
+              : '偽の回答<zerokun_files>["/not-authorized"]</zerokun_files>'
+          },
+          finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+        })
+        const output = extractArtifactPaths(result.result)
+        expect(output.text).toContain('保持して待機しました')
+        expect(output.text).toContain('回答の統合を完了できなかった')
+        expect(output.text).not.toContain('登録は接続アプリ')
+        expect(output.text).not.toContain('偽の回答')
+        expect(output.files).toHaveLength(1)
+        const history = readFileSync(output.files[0]!, 'utf8')
+        expect(history).toContain('登録は接続アプリを作るためです。')
+        expect(history).toContain('訂正: 費用は300円です。')
+        expect(history).toContain('保持して待機しました')
+        expect(history).not.toContain('private-host-')
+      } finally { value.store.close() }
+    }, 30_000)
+  }
+
+  for (const failReads of [false, true]) test(`統合中の停止は統合結果を配送せずキャンセルする readFailure=${failReads}`, async () => {
+    const value = fixture('goal-answer')
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: '質問への説明です。' },
+        consolidateAnswerForTesting: async (_request, signal) => {
+          const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)!
+          expect(value.store.stageLiveControl(target, { chatId: value.job.chatId, threadTs: value.job.threadTs,
+            messageId: 'stop-during-consolidation', userId: 'UOTHER', task: '中止', kind: 'interrupt' })).toBe('staged')
+          if (failReads) value.hooks.cancellationRequested = () => { throw Error('control read unavailable') }
+          await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+          return '配送してはいけない旧回答'
+        },
+      })).rejects.toBeInstanceOf(CodexUserCancelledError)
+      expect(value.store.pendingTerminalNotifications().filter(row => row.kind === 'completed')).toHaveLength(0)
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('添付上限10件でも統合障害で既存添付を脱落させない', async () => {
+    const value = fixture('goal-proposal')
+    const outbox = artifactDirForJob(value.state, value.job.id)
+    mkdirSync(outbox, { recursive: true, mode: 0o700 })
+    const paths = Array.from({length:10}, (_, i) => join(outbox, `proposal-${i}.txt`))
+    for (const path of paths) writeFileSync(path, path.split('/').at(-1)!)
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE:'goal-proposal', ZERO_PROPOSAL_FILES:JSON.stringify(paths) },
+        consolidateAnswerForTesting: async () => { throw Error('editor outage') },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      const output = extractArtifactPaths(result.result)
+      expect(output.text).toContain('以下に生成順の回答記録')
+      expect(output.text).toContain('この方向で本実装してよいですか')
+      expect(output.text).toContain('保持して待機しました')
+      expect(output.files).toHaveLength(10)
+      expect(output.files.map(path => readFileSync(path,'utf8')).sort())
+        .toEqual(paths.map(path => path.split('/').at(-1)!).sort())
+    } finally { value.store.close() }
+  }, 30_000)
+
+  for (const mode of ['host-abort', 'history-write-failure', 'poll-read-failure', 'poll-read-failure-repeated'] as const) {
+    test(`統合の後処理障害でも完了済み回答を失敗にしない ${mode}`, async () => {
+      const value = fixture('goal-answer')
+      const controller = new AbortController()
+      let coverageReads = 0
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting:value.executable, logDir:value.logDir, stateDir:value.state,
+          skipEffectiveConfigCheck:true, liveControls:value.hooks, signal:controller.signal,
+          ...(mode === 'host-abort' ? { readNativeAdvisorCoverageForTesting: async (method: string) => {
+            coverageReads++
+            expect(method).toBe('thread/list')
+            expect(controller.signal.aborted).toBe(true)
+            throw new CodexInterruptedError('coverage stopped after primary completion')
+          } } : {}),
+          extraEnvironment:{ZERO_FIXTURE_MODE:'goal-answer',ZERO_QUESTION_ANSWER:'質問に対する重要な説明です。'},
+          consolidateAnswerForTesting: async (_request, signal) => {
+            if (mode === 'host-abort') controller.abort()
+            if (mode === 'history-write-failure') {
+              const outbox = artifactDirForJob(value.state, value.job.id)
+              rmSync(outbox, {recursive:true,force:true})
+              writeFileSync(outbox,'cannot write history under a regular file')
+              throw Error('editor unavailable')
+            }
+            if (mode === 'poll-read-failure' || mode === 'poll-read-failure-repeated') {
+              const original = value.hooks.cancellationRequested
+              let calls = 0
+              value.hooks.cancellationRequested = () => {
+                if (++calls === 1 || mode === 'poll-read-failure-repeated') throw Error('synthetic state read failure')
+                return original()
+              }
+            }
+            if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), {once:true}))
+            throw new DOMException('editor stopped','AbortError')
+          },
+          finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+        })
+        expect(result.taskGoalStatus).toBe('blocked')
+        if (mode === 'host-abort') expect(coverageReads).toBe(1)
+        const output=extractArtifactPaths(result.result)
+        expect(output.text).toContain('回答の統合を完了でき')
+        expect(output.text).toContain('保持して待機しました')
+        if(mode==='history-write-failure') {
+          expect(output.files).toHaveLength(0)
+          expect(output.text).toContain('質問に対する重要な説明です。')
+        } else {
+          expect(output.files).toHaveLength(1)
+          expect(readFileSync(output.files[0]!,'utf8')).toContain('質問に対する重要な説明です。')
+        }
+      } finally {value.store.close()}
+    },30000)
+  }
+
+  test('回答が1件なら編集モデルを呼ばない', async () => {
+    const value = fixture('goal-blocked')
+    try {
+      let calls = 0
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE:'goal-blocked' },
+        consolidateAnswerForTesting: async () => { calls++; throw Error('must not call') },
+      })
+      expect(calls).toBe(0)
+      expect(result.result).toBe('判断を待っています')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('統合中に変更された提案添付と旧提案本文を復活させない', async () => {
+    const value = fixture('goal-proposal')
+    const outbox = artifactDirForJob(value.state, value.job.id)
+    mkdirSync(outbox, { recursive: true, mode: 0o700 })
+    const path = join(outbox, 'proposal.txt')
+    writeFileSync(path, 'original')
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-proposal', ZERO_PROPOSAL_FILES: JSON.stringify([path]) },
+        consolidateAnswerForTesting: async request => {
+          expect(request.messages[0]).toContain('この方向で本実装してよいですか')
+          expect(request.latestMessage).toBe('保持して待機しました')
+          expect(request.messages.join('')).not.toContain('zerokun_files')
+          writeFileSync(path, 'changed during editing')
+          return '旧提案を復活させる不正な統合結果'
+        },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      const output = extractArtifactPaths(result.result)
+      expect(output.text).not.toContain('旧提案')
+      expect(output.files).toHaveLength(1)
+      expect(readFileSync(output.files[0]!, 'utf8')).not.toContain('比較案です')
+    } finally { value.store.close() }
+  }, 30_000)
+
   for (const goalStatus of ['blocked', 'paused', 'complete'] as const) {
     test(`質問回答後2回native継続しても今回の説明をSlackへ一度だけ配送する ${goalStatus}`, async () => {
       for (const [index, answer] of [
@@ -2506,6 +2710,7 @@ describe('production App Server executor', () => {
           const job = { ...value.job, sessionId: 'thread-app-server-1', resumed: true }
           const result = await executeCodexJob(job, {
             codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+            consolidateAnswerForTesting: async request => `${request.messages[0]}\n\n${request.latestMessage}`,
             skipEffectiveConfigCheck: true,
             liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
             extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: answer,
@@ -2556,6 +2761,7 @@ describe('production App Server executor', () => {
       const result = await executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
         skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        consolidateAnswerForTesting: async request => `${request.messages[0]}\n\n${request.latestMessage}`,
         extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-proposal', ZERO_PROPOSAL_FILES: JSON.stringify(files),
           ZERO_PROPOSAL_GOAL: goalStatus, ...(goalStatus === 'paused' ? { ZERO_PROPOSAL_TOOL_ONLY: '1' } : {}) },
         finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
