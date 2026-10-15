@@ -21,6 +21,7 @@ import { slackSenderId, type SlackReply } from '../gate.ts'
 import { CodexCleanupPendingError } from './codex-executor.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
+import { AuditModelError, collectAuditModelDiagnostic } from './audit-model-failure.ts'
 
 export const SLACK_THREAD_INTENT_PROMPT_VERSION = 1 as const
 export const MAX_THREAD_INTENT_MESSAGES = 40
@@ -439,9 +440,11 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       env: classifierEnvironment(),
       stdin: 'pipe',
       stdout: 'ignore',
-      stderr: 'ignore',
+      stderr: options.purpose === 'security-audit' ? 'pipe' : 'ignore',
       detached: true,
     })
+    const diagnostic = options.purpose === 'security-audit'
+      ? collectAuditModelDiagnostic(spawned.stderr as ReadableStream<Uint8Array>) : Promise.resolve('')
     proc = spawned
     isolatedProcesses.add(spawned)
     if (options.supervision) supervisedClassifiers.add(spawned)
@@ -470,10 +473,16 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     }
     if (outcome === 'timeout') {
       await terminateClassifier(proc)
+      if (options.purpose === 'security-audit') throw new AuditModelError(124, 'command timeout')
       throw new Error('thread intent classifier timed out')
     }
     if (timer) clearTimeout(timer)
-    if (outcome !== 0) throw new Error(`thread intent classifier exited ${outcome}`)
+    if (options.purpose === 'security-audit') await terminateClassifier(spawned)
+    if (outcome !== 0) {
+      if (options.purpose === 'security-audit') throw new AuditModelError(outcome, await diagnostic)
+      throw new Error(`thread intent classifier exited ${outcome}`)
+    }
+    await diagnostic
     return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000
       : options.purpose === 'answer-consolidation' ? 64 * 1024 : MAX_CLASSIFIER_OUTPUT_BYTES)
   } finally {
