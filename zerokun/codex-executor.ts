@@ -45,6 +45,7 @@ import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
 import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { ContinuedAnswer } from './continued-answer.ts'
+import { attachAnswer, consolidateAnswer, validateConsolidatedAnswer, type AnswerConsolidator } from './answer-consolidation.ts'
 import { homedir, tmpdir } from 'os'
 import { registeredSlackAppStatePaths } from './slack-app-registry.ts'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
@@ -1672,9 +1673,10 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'History alone does not approve a new or materially changed proposal. Treat past assistant',
   'claims as provisional and re-check the current state before relying on them.',
   'Answer the latest user question directly even when the underlying task is blocked.',
-  'A question does not itself clear that blocker or grant approval. If the native goal',
-  'continues after an answer, preserve the explanation and any corrections in the final',
-  'response; do not replace them with only a repeated waiting-status message.',
+  'A question does not itself clear that blocker or grant approval. For a blocked or paused',
+  'goal the host retains this input revision\'s answers and consolidates them for one Slack reply.',
+  'Native continuation should add only new information, explicit corrections and the current',
+  'waiting condition, not repeat earlier explanations. A completed task report must stand alone.',
   '',
   'If you create an artifact the Slack user must receive, end the response with exactly one',
   '<zerokun_files> JSON array of absolute local paths </zerokun_files>. Do not include state,',
@@ -4453,7 +4455,7 @@ export function buildCodexWorkerPrompt(
   }
   control.push(
     'Slack delivery occurs after the logical task suspends or finishes, not after every physical final answer.',
-    'When waiting for user approval, restate the complete proposal/question and zerokun_files declaration in the final answer.',
+    'State the complete proposal/question once; native continuation need not restate it within the same input revision.',
     'An earlier attachment-bearing answer in this same input revision is retained if the goal becomes blocked or paused.',
     'To replace attachments declare the new complete list; to withdraw an earlier proposal explicitly emit <zerokun_files>[]</zerokun_files>.',
     'Do not claim the user has seen a proposal just because you previously generated it in this conversation.',
@@ -6694,6 +6696,10 @@ export async function executeCodexJob(
   options: {
     /** Explicit fixture injection. Production callers must use the official standalone install. */
     codexBinForTesting?: string
+    /** Tool-free delivery editor injection for synthetic native-continuation tests. */
+    consolidateAnswerForTesting?: AnswerConsolidator
+    /** Exercise production post-completion coverage with a synthetic history reader. */
+    readNativeAdvisorCoverageForTesting?(method: 'thread/list' | 'thread/read', params: Record<string, unknown>): Promise<Record<string, unknown>>
     /** Let a synthetic App Server exercise the primary browser/CUA request path. */
     browserAccessForTesting?: boolean
     /** Host selector persists semantic decisions; raw CLI/environment overrides remain forbidden. */
@@ -6942,6 +6948,7 @@ export async function executeCodexJob(
   // not emulate that API unless an explicit history fixture is supplied.
   const nativeAdvisorHistoryEnabled = testCodexBin === undefined
     || options.nativeAdvisorHistoryFixtureForTesting !== undefined
+    || options.readNativeAdvisorCoverageForTesting !== undefined
   const advisorVerificationWarnings = new Set<string>()
   const reportAdvisorVerificationWarning = (stage: string, error: unknown): void => {
     const category = error instanceof Error ? error.name : 'unknown'
@@ -6961,10 +6968,15 @@ export async function executeCodexJob(
   const bestEffortAdvisorVerification = async <T>(
     stage: string,
     action: () => T | Promise<T>,
+    completedPrimary = false,
   ): Promise<T | undefined> => {
     try {
       return await action()
     } catch (error) {
+      if (completedPrimary && options.signal?.aborted && error instanceof CodexInterruptedError) {
+        reportAdvisorVerificationWarning(stage, error)
+        return undefined
+      }
       if (error instanceof CodexOwnedProcessStillLiveError
         || error instanceof EphemeralClaudeOwnedProcessStillLiveError
         || error instanceof CodexInterruptedError
@@ -9521,10 +9533,94 @@ export async function executeCodexJob(
       }
       if (protocolCompleted && protocolError == null && finalMessage && interjectionAnswerRetry === null) {
         if (!userCancelled && stage === 'complete') {
-          finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
-          finalMessage = continuedAnswer.resolve(finalMessage, activeInputRevision, taskGoalStatus)
+          const latestMessage = finalMessage
+          const selectArtifacts = () => continuedArtifactMessage.resolve(latestMessage, activeInputRevision, taskGoalStatus)
+          const selected = selectArtifacts()
+          const plan = continuedAnswer.plan(selected, activeInputRevision, taskGoalStatus)
+          finalMessage = continuedAnswer.resolve(selected, activeInputRevision, taskGoalStatus)
+          if (plan && plan.messages.length > 1) {
+            let input: AdvisorInputSnapshot | undefined
+            try { input = readAdvisorInputSnapshot(managedStateDir, job.id) } catch { /* Use the retained answers. */ }
+            const controller = new AbortController()
+            const abort = () => controller.abort()
+            const cancelled = (): boolean | undefined => {
+              try { return controls.cancellationRequested() } catch { return undefined }
+            }
+            const current = (): boolean | undefined => {
+              if (!input) return undefined
+              try {
+                const now = readAdvisorInputSnapshot(managedStateDir, job.id)
+                return now.revision === input.revision && now.digest === input.digest
+                  && now.revision === activeInputRevision
+              } catch { return undefined } // The normal final seal still verifies the durable input.
+            }
+            options.signal?.addEventListener('abort', abort, { once: true })
+            const poll = setInterval(() => {
+              if (cancelled() !== false || current() !== true) abort()
+            }, APP_SERVER_CONTROL_POLL_MS)
+            try {
+              if (options.signal?.aborted || cancelled() !== false || current() !== true) abort()
+              if (!input) throw new Error('delivery input snapshot unavailable')
+              if (plan.omitted) throw new Error('retained answer history was truncated')
+              const { sanitizeExecutionTextForSlack } = await import('./job-runner.ts')
+              const visible = (text: string) => sanitizeExecutionTextForSlack(job, observedSessionId ?? '', text, managedStateDir)
+              const consolidate = options.consolidateAnswerForTesting
+                ?? ((request, signal) => consolidateAnswer(request, { model, signal }))
+              const answer = validateConsolidatedAnswer(await consolidate({
+                question: input.entries.at(-1)?.task ?? job.task,
+                messages: plan.messages.map(visible),
+                latestMessage: visible(latestMessage.split(/<zerokun_files>/i)[0]!.trim()),
+                goalStatus: taskGoalStatus!,
+              }, controller.signal))
+              // The editor cannot grant attachment authority. Revalidate after
+              // its await, so a replaced/withdrawn proposal is never revived.
+              if (selectArtifacts() !== selected) throw new Error('retained artifacts changed')
+              finalMessage = attachAnswer(answer, plan)
+            } catch (error) {
+              if (error instanceof CodexCleanupPendingError) {
+                await retireCompletedRegistration()
+                throw error
+              }
+              if (cancelled() !== true && current() !== false) {
+                // Preserve source answers on editor outage, without silently
+                // dropping a question's explanation or repeating it as prose.
+                const fallbackSelected = selectArtifacts()
+                const fallback = continuedAnswer.plan(fallbackSelected, activeInputRevision, taskGoalStatus)
+                let files: unknown = []
+                try {
+                  if (fallback?.marker) files = JSON.parse(fallback.marker.replace(/^<zerokun_files>|<\/zerokun_files>$/gi, ''))
+                } catch { files = null }
+                finalMessage = '回答の統合を完了できませんでした。以下に生成順の回答記録を保持します。\n\n'
+                  + continuedAnswer.resolve(fallbackSelected, activeInputRevision, taskGoalStatus)
+                if (fallback && Array.isArray(files) && files.length < 10) {
+                  try {
+                    const historyPath = join(artifactDir, `answer-history-${randomUUID()}.txt`)
+                    const { sanitizeExecutionTextForSlack } = await import('./job-runner.ts')
+                    atomicWritePrivateFile(historyPath, (fallback.omitted ? '保持容量の上限により古い説明の一部は省略されています。\n\n' : '')
+                      + fallback.messages.map((message, index) =>
+                        `回答記録 ${index + 1}\n${sanitizeExecutionTextForSlack(job, observedSessionId ?? '', message, managedStateDir)}`).join('\n\n'))
+                    finalMessage = '回答の統合を完了できなかったため、保持できた説明・訂正を回答記録の添付に保存しました。\n\n'
+                      + `${latestMessage.split(/<zerokun_files>/i)[0]!.trim()}\n`
+                      + `<zerokun_files>${JSON.stringify([...files, historyPath])}</zerokun_files>`
+                  } catch { /* The source record in the body remains deliverable. */ }
+                }
+                process.stderr.write('zerochan: answer consolidation unavailable; source answers retained\n')
+              }
+            } finally {
+              clearInterval(poll)
+              options.signal?.removeEventListener('abort', abort)
+            }
+            // Unknown control reads defer to the mandatory transactional final
+            // seal, which checks cancellation and input identity before delivery.
+            userCancelled = cancelled() === true
+            if (current() === false) inputChangedBeforeDispatch = true
+          }
         }
-        atomicWritePrivateFile(finalPath, finalMessage)
+        // Primary completion was sealed before delivery editing. Host shutdown
+        // may stop the editor, but must not recast completed work as uncertain.
+        if (!userCancelled && !inputChangedBeforeDispatch) {
+          atomicWritePrivateFile(finalPath, finalMessage)
+        }
       }
       if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
         await retireCompletedRegistration()
@@ -11580,7 +11676,7 @@ export async function executeCodexJob(
                 seatbeltFingerprint: execution.seatbeltFingerprint,
               }, completeAdvisorRounds)
               return true
-            }) === true
+            }, true) === true
             : await bestEffortAdvisorVerification('completion-coverage', async () => {
               const overrides = nativeAdvisorHistoryPermissionOverrides(execution.advisorPermissionOverrides)
               const observations = await observeNativeAdvisorCoverage({
@@ -11593,13 +11689,15 @@ export async function executeCodexJob(
                   job.id.replace(/[^A-Za-z0-9._-]/g, '_'), `${execution.advisorAttemptNonce}.json`),
                 execution.advisorAttemptNonce, () => {}),
                 read: (method, params) => bestEffortAdvisorVerification(`coverage-${method}`, () => (
-                  readCodexAppServer(codexBin, job.repoPath, overrides, method,
+                  options.readNativeAdvisorCoverageForTesting
+                    ? options.readNativeAdvisorCoverageForTesting(method, params)
+                    : readCodexAppServer(codexBin, job.repoPath, overrides, method,
                     buildCodexChildEnvironment(), {
                       params, signal: options.signal, timeoutMs: 15_000,
                       seatbeltFingerprint: execution.seatbeltFingerprint,
                       seatbeltStateDir: managedStateDir,
                     })
-                )),
+                ), true),
               })
               // Keep source IDs/digests for later diagnosis without copying
               // private response text. Storage failure never changes counts.
@@ -11611,7 +11709,7 @@ export async function executeCodexJob(
                 }))
               })
               return observations
-            })
+            }, true)
           const advisorCoverage = collectHostAdvisorCoverage(
             managedStateDir,
             job.id,
