@@ -32,6 +32,7 @@ import {
   signalProcessIfLive,
 } from './process-generation.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
+import { isStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 import { verifyEncodedOfficialCodexSnapshot } from './standalone-codex.ts'
 import { decodeClaudeExecutableSnapshot } from './claude-executable.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
@@ -526,6 +527,12 @@ async function main(): Promise<void> {
     process.exit(logicalStopDelivered ? LOGICAL_CLEANUP_EXIT_CODE : exitCode)
   } catch (error) {
     stopTracking?.()
+    // Even the final receipt can fail after process cleanup has completed.
+    // Preserve the cause on the ordered stderr stream before either exit or
+    // retained-cleanup handling replaces it with a generic protocol failure.
+    if (isStorageFailure(error)) {
+      try { writeSync(2, '\n' + JSON.stringify({ type: 'zero-app-server-error', message: STORAGE_FAILURE }) + '\n') } catch {}
+    }
     if (!childStarted) cleanupConfirmed = true
     if (cleanupConfirmed) throw error
     supervisionStage = 'retained'

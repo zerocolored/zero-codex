@@ -1,3 +1,4 @@
+import { buildStorageInstructions, storageFailureFromDiagnostics } from './storage-failure.ts'
 import { classifyCodexFailure, codexRateLimitResumeAt, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitInfo, type CodexRateLimitReason } from './codex-rate-limit.ts'
 export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-limit.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
@@ -4238,7 +4239,7 @@ export function buildCodexDeveloperInstructions(
       'capture path for local UI evidence; do not claim a site is unreachable before attempting it',
       'with an available browser capability.',
     ].join('\n')
-    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}\n\n${protocol}${githubReadProtocol}${advisorProtocol}`
+    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}${buildStorageInstructions(job.repoPath)}\n\n${protocol}${githubReadProtocol}${advisorProtocol}`
   }
 
   const readOnlyProtocol = [
@@ -4248,7 +4249,7 @@ export function buildCodexDeveloperInstructions(
     'Follow AGENTS.md for any read-only investigation or review it actually requires. Do not run',
     'a host phase protocol, emit ZERO_* markers, or wait for host-side advisor reconciliation.',
   ].join('\n')
-  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}\n\n${readOnlyProtocol}${githubReadProtocol}${advisorProtocol}`
+  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}${buildStorageInstructions(job.repoPath)}\n\n${readOnlyProtocol}${githubReadProtocol}${advisorProtocol}`
 }
 
 export type CodexWorkerPromptContext = {
@@ -6443,7 +6444,13 @@ export class CodexRateLimitError extends Error {
 }
 
 export class CodexInterruptedError extends Error {}
-export class CodexCleanupPendingError extends Error {}
+export class CodexCleanupPendingError extends Error {
+  readonly code?: 'ENOSPC'
+  constructor(message?: string, diagnostics?: string) {
+    super(message)
+    if (diagnostics && storageFailureFromDiagnostics(diagnostics)) this.code = 'ENOSPC'
+  }
+}
 export class CodexOwnedProcessStillLiveError extends CodexCleanupPendingError {}
 export class RetainedSlackAttachmentUnavailableError extends Error {
   constructor(
@@ -9511,7 +9518,9 @@ export async function executeCodexJob(
       protocolError ??= readerError
       protocolError ??= lateProtocolError
       if (protocolError && !userCancelled) {
-        const detail = protocolError instanceof Error ? protocolError.message : String(protocolError)
+        const storageCause = storageFailureFromDiagnostics(stderr)
+        // Retain the fixed cause even when the stderr prefix reached its cap.
+        const detail = storageCause ?? (protocolError instanceof Error ? protocolError.message : String(protocolError))
         // stdout may already have reached its persistence cap (especially for
         // legacy full-history responses). Persist the original bounded cause
         // after the stderr relay has closed, before cleanup classification can
@@ -9519,7 +9528,7 @@ export async function executeCodexJob(
         try {
           const descriptor = openSafeLog(stderrPath, 'append')
           try {
-            writeSync(descriptor, `${JSON.stringify({
+            writeSync(descriptor, `\n${JSON.stringify({
               type: 'zero-app-server-error', stage,
               message: detail.slice(0, MAX_FAILURE_CHARS),
             })}\n`)
@@ -9645,7 +9654,17 @@ export async function executeCodexJob(
         browserReceiptKey: advisorAttempt.browserReceiptKey,
         browserReceiptKeyPath: advisorAttempt.browserReceiptKeyPath,
         seatbeltFingerprint: advisorAttempt.seatbeltFingerprint,
-        retireCompletedRegistration,
+        retireCompletedRegistration: async () => {
+          try { await retireCompletedRegistration() }
+          catch (error) {
+            // Preserve the cleanup error class; this cause also survives when
+            // the disk cannot accept the final diagnostic append above.
+            if (error instanceof Error && storageFailureFromDiagnostics(stderr)) {
+              Object.assign(error, { code: 'ENOSPC' })
+            }
+            throw error
+          }
+        },
         retireCancelledRegistration,
         userCancelled,
         interjectionAnswerRetry,
@@ -10187,7 +10206,7 @@ export async function executeCodexJob(
       }
       if (execution.forcedCleanupUsed) {
         throw new CodexCleanupPendingError(
-          'Codex interjection cleanup was not self-confirmed; resume is blocked',
+          'Codex interjection cleanup was not self-confirmed; resume is blocked', execution.stderr,
         )
       }
       if ('inputChangedBeforeDispatch' in execution
@@ -10316,7 +10335,7 @@ export async function executeCodexJob(
         }
         if (execution.forcedCleanupUsed) {
           throw new CodexCleanupPendingError(
-            'Codex phase cleanup was not self-confirmed; publication and queue progress are blocked',
+            'Codex phase cleanup was not self-confirmed; publication and queue progress are blocked', execution.stderr,
           )
         }
         if ('inputChangedBeforeDispatch' in execution
@@ -11453,7 +11472,7 @@ export async function executeCodexJob(
     }
     if (execution.forcedCleanupUsed) {
       throw new CodexCleanupPendingError(
-        'Codex interjection cleanup was not self-confirmed; resume is blocked',
+        'Codex interjection cleanup was not self-confirmed; resume is blocked', execution.stderr,
       )
     }
     if ('inputChangedBeforeDispatch' in execution
@@ -11551,7 +11570,7 @@ export async function executeCodexJob(
     }
     if (execution.forcedCleanupUsed) {
       throw new CodexCleanupPendingError(
-        'Codex supervisor cleanup was not self-confirmed; completion and queue progress are blocked',
+        'Codex supervisor cleanup was not self-confirmed; completion and queue progress are blocked', execution.stderr,
       )
     }
     if ('inputChangedBeforeDispatch' in execution
