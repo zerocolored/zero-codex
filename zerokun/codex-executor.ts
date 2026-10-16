@@ -4261,12 +4261,14 @@ export type CodexWorkerPromptContext = {
   computerUseEnabled?: boolean
 }
 
-/** Native resume already carries its own turns; a cold start receives the durable Slack history. */
+/** Native turns can omit Slack requests that failed before dispatch. Supply history on
+ * the initial dispatch of each logical attempt, or when a physical session starts fresh. */
 export function threadHistoryForPhysicalSession(
   snapshot: DurableThreadHistorySnapshot | undefined,
   resumed: boolean,
+  initialDispatch = true,
 ): DurableThreadHistorySnapshot | undefined {
-  return resumed ? undefined : snapshot
+  return !resumed || initialDispatch ? snapshot : undefined
 }
 
 const SLACK_PUBLIC_PROSE_GUIDANCE = [
@@ -8733,7 +8735,7 @@ export async function executeCodexJob(
                 advisorAttempt.inputSnapshot,
                 advisorAttempt.attemptNonce,
                 options.publicationContinuation!,
-                threadHistoryForPhysicalSession(options.threadHistory, resumed),
+                threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch),
               )
               : stage === 'complete'
               ? (networkRecoveryPending ? `${CODEX_NETWORK_CONTINUATION}\n\n` : '') + buildCodexWorkerPrompt(job, advisorAttempt.inputSnapshot, {
@@ -8742,7 +8744,7 @@ export async function executeCodexJob(
                 advisorEnabled: advisorAttempt.advisorEnabled,
                 browserEnabled: advisorAttempt.browserEnabled,
                 computerUseEnabled: advisorAttempt.computerUseEnabled,
-              }, threadHistoryForPhysicalSession(options.threadHistory, resumed))
+              }, threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch))
               : buildCodexPhasePrompt(
                 job,
                 stage,
@@ -8753,7 +8755,7 @@ export async function executeCodexJob(
                 advisorAttempt.browserEnabled,
                 options.uiApproval,
                 logicalAttempt.uiApprovalRepositoryChange,
-                threadHistoryForPhysicalSession(options.threadHistory, resumed),
+                threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch),
                 advisorRepositoryIdentifiers(legacyRepositorySnapshot()),
                 stage === 'prepare'
                   ? undefined
