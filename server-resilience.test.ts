@@ -231,6 +231,9 @@ describe('Slack bridge resilience wiring', () => {
       server.indexOf('function resolveRepoPath('),
     )
     expect(admission).not.toContain('reactions.add')
+    expect(admission).toContain('void drainSlackThreadFailureReactions()')
+    expect(admission).toContain('Date.now() + delay,\n          !(error instanceof SlackMethodBudgetExhausted),')
+    expect(server).toContain('apply: createSlackThreadFailureReactionApplier(BOT_TOKEN)')
     expect(admission).not.toContain('chat.postMessage')
     expect(admission).not.toContain('stageInboundDeliveryForControl')
     expect(admission).not.toContain('stageInboundDeliveryAndAdoptSlackThread')
