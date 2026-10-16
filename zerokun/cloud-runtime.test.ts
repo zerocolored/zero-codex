@@ -6,7 +6,7 @@ import { tmpdir } from 'os'
 import { JobStore, publicJobFailureSummary } from './job-runner.ts'
 import { CloudRuntime, CLOUD_PREPARATION_FAILURE_MESSAGES, continuationCheckpointBase } from './cloud-runtime.ts'
 import { CloudHandoffClient, CloudHandoffError, digestBytes, type CloudHandoff } from './cloud-handoff.ts'
-import { writeCheckpoint } from './handoff-coordinator.ts'
+import { CloudCheckpointBlockedError, writeCheckpoint } from './handoff-coordinator.ts'
 import { resolveProjectLayout } from './project-layout.ts'
 import { buildCodexDeveloperInstructions } from './codex-executor.ts'
 import { prepareClaudeJobContext } from './claude-job-context.ts'
@@ -266,6 +266,81 @@ class MemberClient extends CloudHandoffClient {
     this.shared.h.state = 'active'; return this.find()
   }
 }
+
+test('a permanently blocked checkpoint retries once per explicit control across restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-blocked-reservation-')); roots.push(root)
+  let store = new JobStore(join(root, 'jobs.sqlite3'))
+  const cloud = new CloudFixture(), client = new MemberClient(cloud, ownerA, 'UA')
+  const request = { channel: 'C1', thread: '1.0', message: '2.0', user: 'USER', bot: 'UA', project: root, writeEnabled: true, action: 'continue' as const }
+  try {
+    const job = store.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'USER', repoPath: root, task: 'original', writeEnabled: true }).job
+    store.claimNext('worker'); store.bindCloudHandoff(job.id, initial.id, 1, JSON.stringify(initial))
+    writeCheckpoint(join(root, 'cloud-checkpoints', `${initial.id}-1.json`), Buffer.from('{}'))
+    let runtime = new CloudRuntime(store, root, client)
+    await expect(runtime.pause(job, undefined)).rejects.toBeInstanceOf(CloudCheckpointBlockedError)
+    expect(store.pendingCloudSaves()).toHaveLength(0)
+    await runtime.receive(request)
+    expect(store.pendingCloudSaves()).toHaveLength(1)
+    await expect(runtime.pause(job, undefined)).rejects.toBeInstanceOf(CloudCheckpointBlockedError)
+    const beforePoll = store.statusNotificationCount()
+    store.close(); store = new JobStore(join(root, 'jobs.sqlite3'))
+    runtime = new CloudRuntime(store, root, client)
+    await runtime.receive(request)
+    await runtime.receive(request)
+    expect(store.pendingCloudSaves()).toHaveLength(0)
+    expect(store.pendingCloudControls(Date.now() + 60_000)).toHaveLength(0)
+    const blocked = () => store.pendingStatusNotifications().filter(n => n.payload.includes('保存対象のファイル'))
+    expect(blocked()).toHaveLength(1)
+    expect(store.statusNotificationCount()).toBe(beforePoll)
+    const rejectedNotice = blocked()[0]!.id
+    await runtime.receive({ ...request, message: '3.0' })
+    expect(store.pendingCloudSaves()).toHaveLength(1)
+    await expect(runtime.pause(job, undefined)).rejects.toBeInstanceOf(CloudCheckpointBlockedError)
+    expect(blocked()).toHaveLength(1)
+    expect(blocked()[0]!.id).not.toBe(rejectedNotice)
+    expect(cloud.events.size).toBe(0)
+  } finally { store.close() }
+})
+
+test('continue during saving remains reserved, then imports once after saving and quota recovery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-reserved-')); roots.push(root)
+  const source = join(root, 'source'); mkdirSync(source); git(source, 'init', '--quiet')
+  git(source, 'remote', 'add', 'origin', 'https://github.com/example/project.git')
+  writeFileSync(join(source, 'file.txt'), 'base'); git(source, 'add', '.'); git(source, 'commit', '--quiet', '-m', 'base')
+  const base = git(source, 'rev-parse', 'HEAD'), state = join(root, 'state')
+  let store = new JobStore(join(state, 'jobs.sqlite3'))
+  const cloud = new CloudFixture(), client = new MemberClient(cloud, ownerA, 'UA')
+  const request = { channel: 'C1', thread: '1.0', message: '2.0', user: 'USER', bot: 'UA', project: source, writeEnabled: true, action: 'continue' as const }
+  try {
+    const job = store.enqueue({ chatId: 'C1', threadTs: '1.0', messageId: '1.0', userId: 'USER', repoPath: source, task: 'original', writeEnabled: true }).job
+    store.claimNext('worker'); store.bindCloudHandoff(job.id, initial.id, 1, JSON.stringify(initial))
+    writeCheckpoint(join(state, 'cloud-workspaces', `${initial.id}.json`), Buffer.from(JSON.stringify({ epoch: 1, project: source,
+      repositories: [{ root: source, name: 'source', base }] })))
+    let runtime = new CloudRuntime(store, state, client, join(root, 'imports'))
+    const publish = client.publish.bind(client)
+    client.publish = async () => { throw new CloudHandoffError(400, 'upload', 'EntityTooLarge') }
+    await expect(runtime.pause(job, undefined)).rejects.toThrow('EntityTooLarge')
+    store.stageCloudControl(request)
+    expect(await runtime.receive(request)).toBe('pending')
+    expect(cloud.events.size).toBe(0)
+    expect(store.pendingCloudControls(Date.now() + 60_000)).toHaveLength(1)
+    store.close(); store = new JobStore(join(state, 'jobs.sqlite3'))
+    runtime = new CloudRuntime(store, state, client, join(root, 'imports'))
+    client.publish = publish
+    await runtime.pause(store.get(job.id)!, undefined)
+    cloud.h.reset_at = new Date(Date.now() + 60_000).toISOString()
+    expect(await runtime.receive(request)).toBe('pending')
+    expect(cloud.events.size).toBe(0)
+    cloud.h.reset_at = null
+    expect(await runtime.receive(request)).toBeUndefined()
+    store.finishCloudControl('C1:2.0')
+    await runtime.receive(request)
+    expect(cloud.events.size).toBe(1)
+    expect(store.list().filter(j => j.messageId === '2.0')).toHaveLength(1)
+    expect(store.pendingCloudControls(Date.now() + 60_000)).toHaveLength(0)
+    expect(store.pendingStatusNotifications().filter(n => n.payload.includes('再開の依頼を受け付けました'))).toHaveLength(1)
+  } finally { store.close() }
+}, 30_000)
 
 for (const core of ['codex', 'claude-code'] as const) test(`${core}: follow-up branch in the same managed repository preserves prior work through handoff A -> B -> A`, async () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-runtime-test-')); roots.push(root)

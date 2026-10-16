@@ -40,20 +40,61 @@ function stage(
   })
 }
 
+test('cloud continuation holds execution but not receipt, later admission or unrelated input across restart', () => {
+  const fixtureState = fixture(), root = fixtureState.root
+  let store = fixtureState.store
+  const input = { chatId: 'C0THREAD1', threadTs: '1789000000.000001', userId: 'U0ALICE', repoPath: root, writeEnabled: true }
+  const first = store.enqueue({ ...input, messageId: input.threadTs, task: 'original' }).job
+  store.claimNext('worker')
+  const cloudId = '11111111-1111-4111-8111-111111111111'
+  store.bindCloudHandoff(first.id, cloudId, 1, '{}')
+  store.parkCloudHandoff(first.id, 'quota')
+  const control = { channel: input.chatId, thread: input.threadTs, message: '1789000001.000001', user: input.userId,
+    bot: 'UBOT', project: root, writeEnabled: true, action: 'continue' as const }
+  store.deferCloudControl(control)
+  const earlier = stage(store, '1789000002.000001')
+  store.claimSlackThreadReplyIntent(earlier.idempotencyKey)
+  store.completeSlackThreadReplyIntent(earlier.idempotencyKey, 'addressed')
+  const newest = stage(store, '1789000003.000001')
+  expect(store.claimSlackThreadReplyIntent(newest.idempotencyKey)).toBeNull()
+  store.stageInboundDelivery({ ...input, messageId: earlier.messageId, text: '処理続いてる？' })
+  expect(store.claimSlackThreadReplyIntent(newest.idempotencyKey)?.status).toBe('processing')
+  expect(store.pendingStatusNotifications().filter(n => n.payload.includes('クラウド保存を再試行中'))).toHaveLength(1)
+  expect(store.claimNextInboundDelivery()).toBeNull()
+  store.stageInboundDelivery({ ...input, chatId: 'COTHER', threadTs: '1.0', messageId: '2.0', text: 'unrelated' })
+  expect(store.claimNextInboundDelivery()?.chatId).toBe('COTHER')
+  store.completeInboundDelivery('COTHER:2.0')
+  store.close(); store = new JobStore(join(root, 'jobs.sqlite3'))
+  try {
+    store.stageInboundDelivery({ ...input, messageId: earlier.messageId, text: '処理続いてる？' })
+    store.deferCloudControl(control)
+    expect(store.pendingStatusNotifications().filter(n => n.payload.includes('クラウド保存を再試行中'))).toHaveLength(1)
+    expect(store.pendingStatusNotifications().filter(n => n.payload.includes('再開の依頼を受け付けました'))).toHaveLength(1)
+    expect(store.claimNext('worker')).toBeNull()
+    const resumed = store.enqueueCloudImport({ ...input, messageId: control.message, task: 'resumed original' }, cloudId, 2, '{}').job
+    store.finishCloudControl(`${control.channel}:${control.message}`)
+    const pending = store.claimNextInboundDelivery()!
+    expect(pending.messageId).toBe(earlier.messageId)
+    store.enqueue({ ...input, messageId: pending.messageId, task: pending.text })
+    store.completeInboundDelivery(pending.idempotencyKey)
+    expect(store.claimNext('worker')?.id).toBe(resumed.id)
+  } finally { store.close() }
+})
+
 describe('durable Slack thread reply intent ledger', () => {
   test('upgrade時は旧classifierの15分待ちだけを短縮し、leaseと別用途の延期を保持する', () => {
     const { root, store } = fixture()
-    const now = Date.now()
-    const deadline = now + 15 * 60_000
     const failure = stage(store, '1789000001.000001')
     const follower = stage(store, '1789000002.000001')
     const context = stage(store, '1789000101.000001', '1789000100.000001')
     const processing = stage(store, '1789000201.000001', '1789000200.000001')
+    const now = Date.now()
+    const deadline = now + 15 * 60_000
     store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)
     store.deferSlackThreadReplyIntent(failure.idempotencyKey, 'thread intent classifier exited 1', deadline, true)
     store.claimSlackThreadReplyIntent(context.idempotencyKey, now)
     store.deferSlackThreadReplyIntent(context.idempotencyKey, 'Slack context rate limited', deadline)
-    store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)
+    expect(store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)).not.toBeNull()
     store.close()
 
     const beforeOpen = Date.now()
@@ -73,10 +114,10 @@ describe('durable Slack thread reply intent ledger', () => {
   })
   test('障害中の16件超の後続投稿が別threadを塞がず、再起動後も保存順で復旧する', () => {
     const { root, store } = fixture()
-    const now = Date.now()
     const first = stage(store, '1789000001.000001')
     const followers = Array.from({ length: 20 }, (_, i) => stage(store, `${1789000002 + i}.000001`))
     const other = stage(store, '1789000101.000001', '1789000100.000001', 'C0THREAD2')
+    const now = Date.now()
     expect(store.claimSlackThreadReplyIntent(first.idempotencyKey, now)).not.toBeNull()
     const delay = slackThreadIntentRetryDelay(50)
     expect(delay).toBe(60_000)

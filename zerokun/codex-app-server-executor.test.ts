@@ -510,8 +510,14 @@ for line in sys.stdin:
         repo_access = "write" if json.dumps(handshake_cwd) + '=\\"write\\"' in argv_text else "read"
         phase_log = os.environ.get("ZERO_PHASE_LOG")
         if phase_log and turn_count == 1:
+            # Live filesystem telemetry may change between phases. Compare the
+            # actual instructions, retaining every other byte of their content.
+            stable_instructions = re.sub(
+                r"(Project filesystem free space at turn setup: )[0-9]+[.][0-9]( GiB; recheck before large writes[.])",
+                r"\\1<observed>\\2", developer_instructions,
+            )
             with open(phase_log, "a", encoding="utf-8") as stream:
-                stream.write(stage + "\\t" + str(os.getpid()) + "\\t" + (requested_thread or thread_id) + "\\t" + handshake_method + "\\t" + repo_access + "\\t" + permission_profile + "\\t" + hashlib.sha256(developer_instructions.encode("utf-8")).hexdigest() + "\\n")
+                stream.write(stage + "\\t" + str(os.getpid()) + "\\t" + (requested_thread or thread_id) + "\\t" + handshake_method + "\\t" + repo_access + "\\t" + permission_profile + "\\t" + hashlib.sha256(stable_instructions.encode("utf-8")).hexdigest() + "\\n")
         prompt_log = os.environ.get("ZERO_PROMPT_LOG")
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:
