@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { JobStore } from './job-runner.ts'
+import { slackThreadIntentRetryDelay } from './slack-thread-intent-runtime.ts'
 
 const roots: string[] = []
 afterEach(() => {
@@ -40,6 +41,69 @@ function stage(
 }
 
 describe('durable Slack thread reply intent ledger', () => {
+  test('upgrade時は旧classifierの15分待ちだけを短縮し、leaseと別用途の延期を保持する', () => {
+    const { root, store } = fixture()
+    const now = Date.now()
+    const deadline = now + 15 * 60_000
+    const failure = stage(store, '1789000001.000001')
+    const follower = stage(store, '1789000002.000001')
+    const context = stage(store, '1789000101.000001', '1789000100.000001')
+    const processing = stage(store, '1789000201.000001', '1789000200.000001')
+    store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)
+    store.deferSlackThreadReplyIntent(failure.idempotencyKey, 'thread intent classifier exited 1', deadline, true)
+    store.claimSlackThreadReplyIntent(context.idempotencyKey, now)
+    store.deferSlackThreadReplyIntent(context.idempotencyKey, 'Slack context rate limited', deadline)
+    store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)
+    store.close()
+
+    const beforeOpen = Date.now()
+    const reopened = new JobStore(join(root, 'jobs.sqlite3'))
+    const afterOpen = Date.now()
+    const restored = reopened.getSlackThreadReplyIntent(failure.idempotencyKey)!
+    expect(restored.notBefore).toBeGreaterThanOrEqual(beforeOpen + 60_000)
+    expect(restored.notBefore).toBeLessThanOrEqual(afterOpen + 60_000)
+    expect(restored.snapshotJson).toBe(failure.snapshotJson)
+    expect(reopened.getSlackThreadReplyIntent(context.idempotencyKey)?.notBefore).toBe(deadline)
+    expect(reopened.getSlackThreadReplyIntent(processing.idempotencyKey)?.leaseExpiresAt).toBe(deadline)
+    expect(reopened.listDueSlackThreadReplyIntents(afterOpen + 60_001).map(row => row.idempotencyKey))
+      .toEqual([failure.idempotencyKey])
+    expect(reopened.claimSlackThreadReplyIntent(follower.idempotencyKey, afterOpen + 60_001)).toBeNull()
+    expect(reopened.claimSlackThreadReplyIntent(failure.idempotencyKey, afterOpen + 60_001)?.attempts).toBe(2)
+    reopened.close()
+  })
+  test('障害中の16件超の後続投稿が別threadを塞がず、再起動後も保存順で復旧する', () => {
+    const { root, store } = fixture()
+    const now = Date.now()
+    const first = stage(store, '1789000001.000001')
+    const followers = Array.from({ length: 20 }, (_, i) => stage(store, `${1789000002 + i}.000001`))
+    const other = stage(store, '1789000101.000001', '1789000100.000001', 'C0THREAD2')
+    expect(store.claimSlackThreadReplyIntent(first.idempotencyKey, now)).not.toBeNull()
+    const delay = slackThreadIntentRetryDelay(50)
+    expect(delay).toBe(60_000)
+    store.deferSlackThreadReplyIntent(first.idempotencyKey, 'ZERO_THREAD_INTENT_RUNTIME:unclassified (exit=1)', now + delay, true)
+    expect(store.listDueSlackThreadReplyIntents(now + 1000, 16).map(row => row.idempotencyKey))
+      .toEqual([other.idempotencyKey])
+    store.close()
+
+    const reopened = new JobStore(join(root, 'jobs.sqlite3'))
+    expect(reopened.listDueSlackThreadReplyIntents(now + delay + 1, 16).map(row => row.idempotencyKey))
+      .toEqual([first.idempotencyKey, other.idempotencyKey])
+    expect(reopened.claimSlackThreadReplyIntent(first.idempotencyKey, now + delay + 1)?.snapshotJson).toBe(first.snapshotJson)
+    reopened.completeSlackThreadReplyIntent(first.idempotencyKey, 'addressed')
+    expect(reopened.listDueSlackThreadFailureReactions()[0]?.desired).toBe(0)
+    // Classification alone is not a durable handoff. Later posts must still wait.
+    expect(reopened.claimSlackThreadReplyIntent(followers[0]!.idempotencyKey)).toBeNull()
+    reopened.recordDeliveryTombstone(first.idempotencyKey)
+    for (const follower of followers) {
+      expect(reopened.listDueSlackThreadReplyIntents(now + delay + 1, 16).map(row => row.idempotencyKey))
+        .toEqual([follower.idempotencyKey, other.idempotencyKey])
+      expect(reopened.claimSlackThreadReplyIntent(follower.idempotencyKey)?.attempts).toBe(1)
+      reopened.completeSlackThreadReplyIntent(follower.idempotencyKey, 'ignored')
+    }
+    expect(reopened.listDueSlackThreadReplyIntents(now + delay + 1, 16).map(row => row.idempotencyKey))
+      .toEqual([other.idempotencyKey])
+    reopened.close()
+  })
   test('raw candidateは文脈取得前から永続化され、snapshot準備後だけclaimできる', () => {
     const { root, store } = fixture()
     const now = Date.now()

@@ -2087,6 +2087,25 @@ function ensureJobSchemaMigrations(db: Database): void {
   const threadIntentColumns = db.query<{ name: string }, []>(
     'PRAGMA table_info(slack_thread_reply_intents)',
   ).all()
+  // Older gateways persisted exponential classifier backoff up to 15 minutes.
+  // Only shorten known classifier failures, never a lease or a Slack/context
+  // retry. Keep the original decision input and ordering intact across upgrade.
+  db.transaction(() => {
+    const ceiling = Date.now() + 60_000
+    const delayed = db.query<{ idempotency_key: string; last_error: string }, [number]>(
+      `SELECT idempotency_key, last_error FROM slack_thread_reply_intents
+       WHERE status = 'pending' AND attempts > 0 AND not_before > ?
+         AND last_error LIKE 'thread intent classifier %'`,
+    ).all(ceiling)
+    for (const row of delayed) {
+      if (!/^thread intent classifier (?:exited [0-9]+|timed out)$/.test(row.last_error)) continue
+      db.run(
+        `UPDATE slack_thread_reply_intents SET not_before = ?
+         WHERE idempotency_key = ? AND status = 'pending' AND not_before > ?`,
+        [ceiling, row.idempotency_key, ceiling],
+      )
+    }
+  }).immediate()
   for (const [name, definition] of [
     ['candidate_text', "TEXT NOT NULL DEFAULT ''"],
     ['file_ids_json', "TEXT NOT NULL DEFAULT '[]'"],
@@ -5487,6 +5506,22 @@ export class JobStore {
          UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = intent.idempotency_key
          UNION ALL SELECT 1 FROM cloud_handoff_controls WHERE event_id = intent.idempotency_key
          LIMIT 1
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM slack_thread_reply_intents AS earlier
+         WHERE earlier.chat_id = intent.chat_id AND earlier.thread_ts = intent.thread_ts
+           AND CAST(earlier.message_id AS REAL) < CAST(intent.message_id AS REAL)
+           AND earlier.status IN ('pending', 'processing', 'addressed')
+           AND NOT EXISTS (
+             SELECT 1 FROM inbound_deliveries WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM jobs WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM job_controls WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM job_interjections WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM delivery_tombstones WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM update_request_ledger WHERE idempotency_key = earlier.idempotency_key
+             UNION ALL SELECT 1 FROM cloud_handoff_controls WHERE event_id = earlier.idempotency_key
+             LIMIT 1
+           )
        )
        ORDER BY intent.chat_id, intent.thread_ts,
                 CAST(intent.message_id AS REAL), intent.created_at

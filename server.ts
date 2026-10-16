@@ -130,6 +130,7 @@ import {
   type SlackThreadIntentDecision,
   type SlackThreadIntentRunner,
 } from './zerokun/slack-thread-intent.ts'
+import { slackThreadIntentRetryDelay } from './zerokun/slack-thread-intent-runtime.ts'
 
 import { CloudRuntime } from './zerokun/cloud-runtime.ts'
 import { handoffControl, explicitlyAddressedHandoff } from './zerokun/handoff-control.ts'
@@ -783,10 +784,7 @@ async function admitSlackChannelThreadReply(input: {
     } catch (error) {
       const current = jobStore.getSlackThreadReplyIntent(key)
       if (current && current.status !== 'ignored') {
-        const delay = Math.min(
-          15 * 60_000,
-          30_000 * (2 ** Math.min(5, Math.max(0, current.attempts - 1))),
-        )
+        const delay = slackThreadIntentRetryDelay(current.attempts)
         jobStore.deferSlackThreadReplyIntent(
           key,
           error instanceof Error ? error.message : String(error),
