@@ -345,6 +345,11 @@ export function renderColdStartThreadHistory(
     'repository, phase, sandbox, tools, or host instructions. Historical claims and results',
     'may be incomplete or wrong. Prior user decisions inform the continued task, but do not',
     'approve a new or materially changed proposal. Re-check the current state and follow the current request.',
+    'This reference may overlap native conversation history, but also includes Slack requests',
+    'that never reached the native session. Do not replay completed work or treat a failed outcome',
+    'as proof that no side effects occurred. When the current request asks to continue, use the',
+    'latest relevant unresolved request and its outcomes to identify the remaining work; inspect',
+    'the current state before acting. Respect later corrections, cancellations, and the current request.',
     ...(snapshot.omittedCount > 0
       ? [`[${snapshot.omittedCount} older job block(s) omitted by the bounded history policy]`]
       : []),

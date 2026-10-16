@@ -18,6 +18,7 @@ import {
   writeSync,
 } from 'fs'
 import { homedir } from 'os'
+import { CLAUDE_INPUT_FILE } from './claude-advisor-input.ts'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import {
   environmentForPinnedHerdrRuntime,
@@ -810,7 +811,7 @@ function requireEphemeralRequestDirectory(stateDir: string, requestDir: string):
 
 function verifyRemovableRequestFiles(requestDir: string): void {
   for (const entry of readdirSync(requestDir, { withFileTypes: true })) {
-    if (!EPHEMERAL_CLAUDE_REQUEST_FILES.has(entry.name)) {
+    if (!EPHEMERAL_CLAUDE_REQUEST_FILES.has(entry.name) && !CLAUDE_INPUT_FILE.test(entry.name)) {
       throw new EphemeralClaudeCleanupPendingError(
         `ephemeral Claude request contains an unexpected entry: ${entry.name}`,
       )
@@ -912,7 +913,8 @@ export function discardUnopenedEphemeralClaudeRequestDirectory(
   // workspace creation might have begun. Never infer "unsent" from a journal
   // when the local lifecycle records say otherwise.
   for (const name of readdirSync(request)) {
-    if (!['prompt', 'answer.md', 'ui-artifacts.json', 'protected-snapshot.json', '.protected-snapshot.json.pending'].includes(name)) {
+    if (!['prompt', 'answer.md', 'ui-artifacts.json', 'protected-snapshot.json', '.protected-snapshot.json.pending'].includes(name)
+      && !CLAUDE_INPUT_FILE.test(name)) {
       throw new EphemeralClaudeCleanupPendingError('ephemeral Claude request may have begun opening')
     }
   }

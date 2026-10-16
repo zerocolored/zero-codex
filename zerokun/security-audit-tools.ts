@@ -12,6 +12,8 @@ import {
   cpSync,
   chmodSync,
   realpathSync,
+  lstatSync,
+  statfsSync,
 } from 'fs'
 import { join, dirname, basename, resolve, relative } from 'path'
 import { homedir } from 'os'
@@ -57,6 +59,7 @@ export type AuditToolContext = {
   /** Host-created fixture only, never read from project configuration. */
   semgrepProbe?: boolean
   socketReceiptPath?: string
+  retryDelay?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 export type CommandResult = {
   exitCode: number
@@ -65,6 +68,13 @@ export type CommandResult = {
   truncated: boolean
 }
 const OUTPUT_LIMIT = 12_000_000
+const SCANNER_REPORT_LIMIT = 256 * 1024 * 1024
+export function requireAuditDiskSpace(root: string, freeBytes?: number): void {
+  const fs = freeBytes === undefined ? statfsSync(root) : null
+  const available = freeBytes ?? fs!.bavail * fs!.bsize
+  if (available < 4 * 1024 ** 3)
+    throw Error(`検査用ディスク容量が不足しています（空き${(available / 1024 ** 3).toFixed(1)} GiB、最低4 GiB）。不要なデータを整理後に再実行してください。`)
+}
 const toolsRoot = (c: AuditToolContext) =>
   join(c.stateDir, 'security-audit-tools')
 function environment(c: AuditToolContext, extra: Record<string, string> = {}) {
@@ -109,6 +119,7 @@ export async function auditCommand(
     input?: string
     localPort?: number
     offline?: boolean
+    reports?: string[]
   } = {},
 ): Promise<CommandResult> {
   checkAuditInterrupted(c)
@@ -229,6 +240,7 @@ export async function auditCommand(
   let registered = false,
     truncated = false,
     timedOut = false,
+    reportLimit = false,
     stopping = false
   const stop = () => {
     if (proc.exitCode !== null || stopping) return
@@ -266,6 +278,15 @@ export async function auditCommand(
   )
   const poll = setInterval(() => {
     if (c.cancelled?.()) stop()
+    for (const path of options.reports ?? []) {
+      try {
+        const info = lstatSync(path)
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > SCANNER_REPORT_LIMIT) {
+          reportLimit = true
+          stop()
+        }
+      } catch (error: any) { if (error?.code !== 'ENOENT') { reportLimit = true; stop() } }
+    }
   }, 1000)
   c.signal?.addEventListener('abort', stop, { once: true })
   try {
@@ -287,9 +308,9 @@ export async function auditCommand(
     checkAuditInterrupted(c)
     return {
       stdout,
-      stderr: timedOut ? 'command timeout' : stderr,
-      exitCode: timedOut ? 124 : exitCode,
-      truncated,
+      stderr: reportLimit ? 'scanner report size/type limit exceeded' : timedOut ? 'command timeout' : stderr,
+      exitCode: reportLimit ? 125 : timedOut ? 124 : exitCode,
+      truncated: truncated || reportLimit,
     }
   } finally {
     clearTimeout(timer)
@@ -1156,6 +1177,24 @@ async function preparePlaywrightDependencies(work: string, configPath: string, c
   return cli
 }
 
+/** Install the browser version requested by the selected project's Playwright.
+ * The installer is a host-managed official package, never a project-authored CLI.
+ * The same read-only browser cache is exposed to the probe and the real runner.
+ */
+async function prepareNodeBrowser(work: string, cwd: string, c: AuditToolContext): Promise<Record<string, string>> {
+  const manifest = [join(work, cwd, 'node_modules/playwright/package.json'), join(work, 'node_modules/playwright/package.json')]
+    .find(path => existsSync(path))
+  if (!manifest) throw Error('selected Node E2E does not provide Playwright')
+  const version = JSON.parse(readFileSync(manifest, 'utf8')).version
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) throw Error('invalid Playwright version')
+  const install = join(toolsRoot(c), `node-playwright-${version}`)
+  const cli = join(install, 'node_modules/playwright/cli.js')
+  if (!existsSync(cli)) await checked(['npm', 'install', '--prefix', install, '--ignore-scripts', '--no-audit', '--no-fund', `playwright@${version}`], c.root, c)
+  const env = { PLAYWRIGHT_BROWSERS_PATH: join(install, 'browsers') }
+  await checked(['node', cli, 'install', 'chromium'], c.root, c, { env })
+  return env
+}
+
 export function nodeE2EEvidence(stdout: string): number {
   // Custom assertion runners can expose a final count; Node's TAP runner exposes pass/fail totals.
   const count = /(?:^|\n)[^\n]*?\b(\d+) checks passed(?:[;.]|$)/.exec(stdout)?.[1]
@@ -1167,14 +1206,16 @@ async function nodeE2E(number: number, c: AuditToolContext, entry: Extract<Audit
   const work = join(c.root, `e2e-${number}`)
   cpSync(c.source, work, {recursive: true, force: false, errorOnExist: true})
   await prepareE2EDependencies(work, c)
+  const browserEnv = await prepareNodeBrowser(work, entry.cwd, c)
   const version = (await checked(['node', '--version'], work, c, {sandbox: true})).stdout.trim()
   const result = await auditCommand(['node', entry.entry], join(work, entry.cwd), c, {
-    sandbox: true, offline: true, localPort: c.settings.e2ePort,
+    sandbox: true, offline: true, localPort: c.settings.e2ePort, env: browserEnv,
   })
   const checks = nodeE2EEvidence(result.stdout)
   return {result, version, findings: [] as AuditFinding[], incomplete: checks <= 0,
     note: `Node E2E: ${entry.cwd}/${entry.entry}; assertions: ${checks}。実認証・Docker socketは渡さず隔離実行。`
-      + (checks ? '' : '完了した検査件数を確認できません。成功したE2Eとして扱いません。')}
+      + (checks ? '' : '完了した検査件数を確認できません。成功したE2Eとして扱いません。')
+      + (result.exitCode || result.truncated ? `\nexit=${result.exitCode}${result.truncated ? '; output limit' : ''}; ${auditClean(result.stderr).slice(-2400)}` : '')}
 }
 
 async function playwright(
@@ -1451,13 +1492,17 @@ export async function runAuditTool(
   const evidence = createHash('sha256')
   let evidenceRecorded = false
   const readEvidence = (path: string): string => {
-    const raw = readFileSync(path, 'utf8')
+    const raw = number === 7 ? readOptionalBoundedOwnerOnlyRegularFile(path, SCANNER_REPORT_LIMIT) : readFileSync(path, 'utf8')
+    if (raw === null) throw Error('scanner report file is missing')
     evidence.update(`${basename(path)}\0${Buffer.byteLength(raw)}\0`).update(raw)
     evidenceRecorded = true
     return raw
   }
-  const stageRoot = join(c.root, `stage-${number}`)
-  mkdirSync(stageRoot, { recursive: true, mode: 0o700 })
+  const stagePath = join(c.root, `stage-${number}`)
+  mkdirSync(stagePath, { recursive: true, mode: 0o700 })
+  // cwd is physical on macOS. Mixing /tmp or /var aliases with that cwd breaks
+  // Semgrep import resolution and Socket's relative manifest upload paths.
+  const stageRoot = realpathSync(stagePath)
   const stageSource = join(stageRoot, 'source')
   if (!existsSync(stageSource))
     cpSync(c.source, stageSource, {
@@ -1469,7 +1514,7 @@ export async function runAuditTool(
   const output = join(c.root, `tool-${number}.json`)
   try {
     if (number === 1 || number === 11) {
-      step.tool = 'Playwright channel=chrome'
+      step.tool = selectedE2E(c).kind === 'node' ? 'Node E2E / project Playwright' : 'Playwright channel=chrome'
       let auth: { ok: boolean; note: string; findings: AuditFinding[] }
       try {
         auth = await authenticatedBrowser(c)
@@ -1515,10 +1560,12 @@ export async function runAuditTool(
         )
       step.scope =
         'filesystem: vuln,misconfig,secret,license; configured container images'
+      writeFileSync(output, '', { mode: 0o600, flag: 'wx' })
       result = await auditCommand(
         [
           exe,
           'fs',
+          '--quiet', '--output', output,
           '--scanners',
           'vuln,misconfig,secret,license',
           '--format',
@@ -1529,15 +1576,22 @@ export async function runAuditTool(
         ],
         c.root,
         c,
-        { sandbox: true },
+        { sandbox: true, reports: [output] },
       )
-      step.findings.push(...scannerFindings('trivy', JSON.parse(result.stdout)))
-      for (const image of c.settings.images) {
+      step.exitCode = result.exitCode
+      if (result.exitCode !== 0 || result.truncated)
+        throw Error(`Trivy filesystem failed (exit=${result.exitCode}${result.truncated ? ', output limit' : ''}): ${auditClean(result.stderr).slice(-2400)}`)
+      try { step.findings.push(...scannerFindings('trivy', JSON.parse(readEvidence(output)))) }
+      catch (error) { throw Error(`Trivy report invalid: ${auditClean(error instanceof Error ? error.message : 'invalid report')}`) }
+      for (const [index, image] of c.settings.images.entries()) {
         try {
+          const imageReport = join(c.root, `image-${index}.json`)
+          writeFileSync(imageReport, '', { mode: 0o600, flag: 'wx' })
           const r = await checked(
             [
               exe,
               'image',
+              '--quiet', '--output', imageReport,
               '--image-src',
               'remote',
               '--scanners',
@@ -1550,9 +1604,9 @@ export async function runAuditTool(
             ],
             c.root,
             c,
-            { sandbox: true },
+            { sandbox: true, reports: [imageReport] },
           )
-          step.findings.push(...scannerFindings('trivy', JSON.parse(r.stdout)))
+          step.findings.push(...scannerFindings('trivy', JSON.parse(readEvidence(imageReport))))
         } catch (error) {
           if (
             error instanceof CodexCleanupPendingError ||
@@ -1561,7 +1615,7 @@ export async function runAuditTool(
           )
             throw error
           step.status = 'unavailable'
-          step.note += `\nImage ${image}: 検査失敗。filesystemの結果は保持。`
+          step.note += `\nImage ${image}: 検査失敗。filesystemの結果は保持。${auditClean(error instanceof Error ? error.message : 'image scan failed').slice(-1600)}`
         }
       }
     }
@@ -1694,8 +1748,19 @@ export async function runAuditTool(
         c,
         { sandbox: true, env: { SOCKET_CLI_API_TOKEN: token } },
       )
-      if (result.exitCode !== 0 || result.truncated)
-        throw Error('Socket scan creation failed')
+      if (result.exitCode !== 0 || result.truncated) {
+        let code: unknown
+        let emptyUpload = false
+        try {
+          const failure = JSON.parse(result.stdout)
+          code = failure?.data?.code
+          emptyUpload = code === 400 && typeof failure?.cause === 'string'
+            && failure.cause.includes('Need at least one file to be uploaded')
+        } catch { /* Keep raw authenticated CLI diagnostics private. */ }
+        const status = Number.isInteger(code) && Number(code) >= 400 && Number(code) <= 599
+          ? `; API HTTP ${code}` : ''
+        throw Error(`Socket scan creation failed (exit=${result.exitCode}${status}${result.truncated ? '; output truncated' : ''}${emptyUpload ? '; no manifests were uploaded' : ''})`)
+      }
       const created = JSON.parse(result.stdout.replaceAll(token, '[認証情報を除去]'))
       scanId = created.ok === true ? created.data?.id : undefined
       if (typeof scanId !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(scanId))
@@ -1875,6 +1940,7 @@ export async function runAuditTool(
     step.evidenceDigest = evidenceRecorded ? evidence.digest('hex')
       : result.stdout ? createHash('sha256').update(result.stdout).digest('hex') : null
     if (number === 6) {
+      if (result.truncated) throw Error(`Semgrep Code scan failed (exit=${result.exitCode}, output limit)`)
       try {
         const data = JSON.parse(result.stdout)
         assertSemgrepCodeResult(data)
@@ -1883,16 +1949,20 @@ export async function runAuditTool(
           number === 6 &&
           (data.errors?.length || data.paths?.skipped?.length)
         ) {
-          step.note += `\nSemgrep errors: ${data.errors?.length ?? 0}; skipped: ${data.paths?.skipped?.length ?? 0}`
+          step.note += `\nSemgrep errors: ${data.errors?.length ?? 0}; skipped: ${data.paths?.skipped?.length ?? 0}; scanned: ${data.paths.scanned.length}; findings retained: ${step.findings.length}。解析できなかった範囲は検査完了として扱いません。`
           for (const error of (data.errors ?? []).slice(0, 50)) {
             const kind = typeof error.type === 'string' ? error.type : Array.isArray(error.type) ? error.type[0] : 'unknown'
-            step.note += `\n${auditClean(String(kind)).slice(0, 100)}: ${auditClean(String(error.path ?? 'unknown path')).slice(0, 1000)} (code=${Number(error.code)})`
+            const spans = Array.isArray(error.spans) ? error.spans : []
+            const locations = spans.length ? spans.map((span: any) => `${auditClean(String(span.file ?? error.path ?? 'unknown path')).slice(0, 1000)}:${Number(span.start?.line) || '?'}–${Number(span.end?.line) || '?'}`).join(', ')
+              : auditClean(String(error.path ?? 'unknown path')).slice(0, 1000)
+            step.note += `\n${auditClean(String(kind)).slice(0, 100)}: ${locations.slice(0, 4000)} (code=${Number(error.code)})`
           }
           step.status = 'unavailable'
         }
       } catch {
-        throw Error('scanner structured output is invalid')
+        throw Error(`scanner structured output is invalid (exit=${result.exitCode})`)
       }
+      if (result.exitCode !== 0) throw Error(`Semgrep Code scan failed (exit=${result.exitCode}); obtained findings retained`)
     }
     if (number === 9) {
       const data = JSON.parse(result.stdout)
@@ -1941,7 +2011,7 @@ export async function runAuditProbe(
 ): Promise<AuditStep> {
   checkAuditInterrupted(original)
   if (!Number.isInteger(number) || number < 1 || number > 12) throw Error('unknown availability stage')
-  const root = mkdtempSync(join(original.root, `probe-${number}-`))
+  const root = realpathSync(mkdtempSync(join(original.root, `probe-${number}-`)))
   chmodSync(root, 0o700)
   const source = join(root, 'source')
   mkdirSync(source, { mode: 0o700 })
@@ -1985,13 +2055,14 @@ export async function runAuditProbe(
       cpSync(original.source, work, { recursive: true, force: false, errorOnExist: true })
       if (selected.kind === 'node') {
         await prepareE2EDependencies(work, c)
+        const browserEnv = await prepareNodeBrowser(work, selected.cwd, c)
         const hello = join(work, selected.cwd, 'zero-audit-node-hello.cjs')
         writeFileSync(hello, `const {chromium}=require('playwright');
-(async()=>{const browser=await chromium.launch({channel:'chrome'});try{const page=await browser.newPage();await page.setContent('<h1>Hello World</h1>');require('node:assert/strict').equal(await page.locator('h1').innerText(),'Hello World');console.log(JSON.stringify({passed:1}));}finally{await browser.close()}})().catch(()=>{process.exitCode=1});`, {mode: 0o600, flag: 'wx'})
-        const r = await checked(['node', hello], join(work, selected.cwd), c, {sandbox: true, offline: true, timeoutMs: 60000})
+(async()=>{const browser=await chromium.launch();try{const page=await browser.newPage();await page.setContent('<h1>Hello World</h1>');require('node:assert/strict').equal(await page.locator('h1').innerText(),'Hello World');console.log(JSON.stringify({passed:1}));}finally{await browser.close()}})().catch(()=>{process.exitCode=1});`, {mode: 0o600, flag: 'wx'})
+        const r = await checked(['node', hello], join(work, selected.cwd), c, {sandbox: true, offline: true, timeoutMs: 60000, env: browserEnv})
         if (JSON.parse(r.stdout).passed !== 1) throw Error('Node/Playwright Hello World did not pass')
         step.evidenceDigest = createHash('sha256').update(r.stdout).digest('hex')
-        step.note += 'root packageのNode E2E入口とPlaywright/Chrome依存を確認。既存E2E本体の実行結果は本検査に記録します。'
+        step.note += '選択したNode E2Eと同じPlaywright・ブラウザ実体で動作を確認しました。対象E2Eの実行可否は続く対象実行確認で検証します。'
         return
       }
       const configs = [selected.entry]

@@ -21,6 +21,7 @@ import {
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
 import { createSeatbeltFingerprint } from './seatbelt-fingerprint.ts'
 import { subprocessExitCode } from './process-exit-code.ts'
+import { retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 
 const temporaryRoots: string[] = []
 const liveSupervisors: ProcessIdentity[] = []
@@ -40,6 +41,48 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
 }
 
 describe('Codex stable supervisor gate', () => {
+  test.skipIf(process.platform !== 'darwin')('final receipt ENOSPC remains recoverable after the supervisor exits', async () => {
+    const root = prepareManagedStateRoot(mkdtempSync(join(tmpdir(), 'zerokun-supervisor-full-')))
+    temporaryRoots.push(root)
+    const logs = ensureManagedDirectory(root, join(root, 'job-logs'))
+    const registration = join(root, 'executor.json')
+    const fakeCodex = join(root, 'fake-codex')
+    const preload = join(root, 'disk-full.ts')
+    writeFileSync(fakeCodex, '#!/bin/sh\necho completed\nprintf progress >&2\nexit 0\n', { mode: 0o700 })
+    writeFileSync(preload, [
+      "import { mock } from 'bun:test'",
+      `import * as safeFile from ${JSON.stringify(join(import.meta.dir, 'safe-file.ts'))}`,
+      'const original = { ...safeFile }',
+      `mock.module(${JSON.stringify(join(import.meta.dir, 'safe-file.ts'))}, () => ({ ...original,`,
+      'atomicWritePrivateFile(path, content) {',
+      `if (path === ${JSON.stringify(registration)} && JSON.parse(content).phase === 'cleanup-confirmed')`,
+      "throw Object.assign(new Error('simulated final receipt disk full'), {code:'ENOSPC'})",
+      'return original.atomicWritePrivateFile(path, content)',
+      '} }))',
+    ].join('\n'), { mode: 0o600 })
+    const startedAt = Date.now()
+    const supervisor = Bun.spawn([
+      process.execPath, '--config=/dev/null', '--no-env-file', '--preload', preload,
+      join(import.meta.dir, 'codex-supervisor.ts'), 'full-job', registration,
+      '--unverified-for-tests', '--', fakeCodex,
+    ], {
+      cwd: root, env: {PATH:'/usr/bin:/bin', HOME:root, ZEROKUN_SUPERVISOR_TEST_UNVERIFIED:'1'},
+      stdin:'ignore', stdout:'pipe', stderr:'pipe', detached:true,
+    })
+    const identity = readProcessIdentity(supervisor.pid)!
+    liveSupervisors.push(identity)
+    const [code, stdout, stderr] = await Promise.all([
+      supervisor.exited, new Response(supervisor.stdout).text(), new Response(supervisor.stderr).text(),
+    ])
+    expect(code).not.toBe(0)
+    expect(stdout).toContain('completed')
+    expect(stderr).toContain(JSON.stringify({type:'zero-app-server-error',message:STORAGE_FAILURE}))
+    expect(JSON.parse(readFileSync(registration, 'utf8')).phase).not.toBe('cleanup-confirmed')
+    expect(observeProcessGeneration(identity).status).toBe('dead')
+    writeFileSync(join(logs, 'full-job.resume.stderr.log'), stderr, {mode:0o600})
+    expect(retainedStorageFailure(root, {id:'full-job',startedAt})).toBe(STORAGE_FAILURE)
+  }, 10_000)
+
   test.skipIf(process.platform !== 'darwin')('parallel supervisors release their own jobs when exit callbacks are lost', async () => {
     const runs = [0, 17].map(async expectedCode => {
       const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-lost-exit-'))

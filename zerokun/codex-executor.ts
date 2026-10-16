@@ -1,6 +1,10 @@
+import { buildStorageInstructions, storageFailureFromDiagnostics } from './storage-failure.ts'
+import { classifyCodexFailure, codexRateLimitResumeAt, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitInfo, type CodexRateLimitReason } from './codex-rate-limit.ts'
+export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-limit.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
 import { retainGoalForAdvisors, retainGoalForDelegation } from './codex-goal.ts'
 import { loadTaskModelCatalog, requireAvailableTaskModel, type ModelRequest, type TaskModel } from './task-model-selection.ts'
+import { ModelSelectionRuntimeError, modelSelectionRetryDelay, modelSelectionProcessFailure } from './model-selection-runtime.ts'
 import { createUsageRecorder } from './task-usage.ts'
 import { PROPORTIONATE_DESIGN_INSTRUCTIONS } from './design-principles.ts'
 import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
@@ -44,6 +48,7 @@ import { ensureTaskGoal, readTaskGoal, type GoalStatus } from './codex-goal.ts'
 import { previousThreadArtifactRoots } from './artifact-source.ts'
 import { ContinuedArtifactMessage } from './continued-artifact-message.ts'
 import { ContinuedAnswer } from './continued-answer.ts'
+import { attachAnswer, consolidateAnswer, validateConsolidatedAnswer, type AnswerConsolidator } from './answer-consolidation.ts'
 import { homedir, tmpdir } from 'os'
 import { registeredSlackAppStatePaths } from './slack-app-registry.ts'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
@@ -1671,9 +1676,10 @@ export const CODEX_WORKER_SAFETY_PROMPT = [
   'History alone does not approve a new or materially changed proposal. Treat past assistant',
   'claims as provisional and re-check the current state before relying on them.',
   'Answer the latest user question directly even when the underlying task is blocked.',
-  'A question does not itself clear that blocker or grant approval. If the native goal',
-  'continues after an answer, preserve the explanation and any corrections in the final',
-  'response; do not replace them with only a repeated waiting-status message.',
+  'A question does not itself clear that blocker or grant approval. For a blocked or paused',
+  'goal the host retains this input revision\'s answers and consolidates them for one Slack reply.',
+  'Native continuation should add only new information, explicit corrections and the current',
+  'waiting condition, not repeat earlier explanations. A completed task report must stand alone.',
   '',
   'If you create an artifact the Slack user must receive, end the response with exactly one',
   '<zerokun_files> JSON array of absolute local paths </zerokun_files>. Do not include state,',
@@ -4235,7 +4241,7 @@ export function buildCodexDeveloperInstructions(
       'capture path for local UI evidence; do not claim a site is unreachable before attempting it',
       'with an available browser capability.',
     ].join('\n')
-    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}\n\n${protocol}${githubReadProtocol}${advisorProtocol}`
+    return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}${buildStorageInstructions(job.repoPath)}\n\n${protocol}${githubReadProtocol}${advisorProtocol}`
   }
 
   const readOnlyProtocol = [
@@ -4245,7 +4251,7 @@ export function buildCodexDeveloperInstructions(
     'Follow AGENTS.md for any read-only investigation or review it actually requires. Do not run',
     'a host phase protocol, emit ZERO_* markers, or wait for host-side advisor reconciliation.',
   ].join('\n')
-  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}\n\n${readOnlyProtocol}${githubReadProtocol}${advisorProtocol}`
+  return `${CODEX_WORKER_SAFETY_PROMPT}${workspaceProtocol}${auditReportContext}${buildStorageInstructions(job.repoPath)}\n\n${readOnlyProtocol}${githubReadProtocol}${advisorProtocol}`
 }
 
 export type CodexWorkerPromptContext = {
@@ -4256,12 +4262,14 @@ export type CodexWorkerPromptContext = {
   computerUseEnabled?: boolean
 }
 
-/** Native resume already carries its own turns; a cold start receives the durable Slack history. */
+/** Native turns can omit Slack requests that failed before dispatch. Supply history on
+ * the initial dispatch of each logical attempt, or when a physical session starts fresh. */
 export function threadHistoryForPhysicalSession(
   snapshot: DurableThreadHistorySnapshot | undefined,
   resumed: boolean,
+  initialDispatch = true,
 ): DurableThreadHistorySnapshot | undefined {
-  return resumed ? undefined : snapshot
+  return !resumed || initialDispatch ? snapshot : undefined
 }
 
 const SLACK_PUBLIC_PROSE_GUIDANCE = [
@@ -4465,7 +4473,7 @@ export function buildCodexWorkerPrompt(
   }
   control.push(
     'Slack delivery occurs after the logical task suspends or finishes, not after every physical final answer.',
-    'When waiting for user approval, restate the complete proposal/question and zerokun_files declaration in the final answer.',
+    'State the complete proposal/question once; native continuation need not restate it within the same input revision.',
     'An earlier attachment-bearing answer in this same input revision is retained if the goal becomes blocked or paused.',
     'To replace attachments declare the new complete list; to withdraw an earlier proposal explicitly emit <zerokun_files>[]</zerokun_files>.',
     'Do not claim the user has seen a proposal just because you previously generated it in this conversation.',
@@ -6330,18 +6338,12 @@ export function parseCodexResult(stdout: string, finalMessage?: string): string 
   return fromEvents ? capResult(fromEvents) : '処理は完了しましたが、返答本文を取得できませんでした。'
 }
 
-export type CodexRateLimitInfo = {
-  rateLimited: boolean
-  resetsAtMs: number | null
-  reason: 'rate-limit' | 'capacity' | null
-}
-
 function codexFailureRecords(stdout: string): Array<Record<string, unknown>> {
   const projectFailure = (record: Record<string, unknown>): Record<string, unknown> => {
     const projected: Record<string, unknown> = {}
     for (const key of [
       'error', 'message', 'code', 'codexErrorInfo', 'additionalDetails',
-      'retry_after', 'resets_at', 'reset_at',
+      'retry_after', 'resets_at', 'reset_at', 'retryAfter', 'resetsAt', 'resetAt',
     ]) {
       if (record[key] !== undefined) projected[key] = record[key]
     }
@@ -6367,62 +6369,9 @@ function codexFailureRecords(stdout: string): Array<Record<string, unknown>> {
   })
 }
 
-function numericResetCandidates(value: unknown, depth = 0): number[] {
-  if (depth > 6 || !value || typeof value !== 'object') return []
-  if (Array.isArray(value)) {
-    return value.flatMap(item => numericResetCandidates(item, depth + 1))
-  }
-  const record = value as Record<string, unknown>
-  const direct = ['resets_at', 'reset_at', 'retry_after'].flatMap(key => {
-    const candidate = record[key]
-    return typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0
-      ? [candidate]
-      : []
-  })
-  return [
-    ...direct,
-    ...Object.values(record).flatMap(item => numericResetCandidates(item, depth + 1)),
-  ]
-}
-
-export function extractCodexRateLimit(stdout: string, now = Date.now()): CodexRateLimitInfo {
+export function extractCodexRateLimit(stdout: string, now = Date.now(), previousFailures = 0): CodexRateLimitInfo {
   const failures = codexFailureRecords(stdout)
-  let resetsAtMs: number | null = null
-  let rateLimited = false
-  let capacityLimited = false
-  for (const failure of failures) {
-    const serialized = JSON.stringify(failure)
-    if (/(?:rate.?limit|usage.?limit|quota|too many requests|\b429\b)/i.test(serialized)) {
-      rateLimited = true
-    }
-    if (/(?:selected model is at capacity|model[^\n]{0,80}\bat capacity\b|temporarily (?:overloaded|unavailable)|server (?:is )?overloaded)/i
-      .test(serialized)) {
-      rateLimited = true
-      capacityLimited = true
-    }
-    for (const value of numericResetCandidates(failure)) {
-      const candidate = value >= 1_000_000_000_000
-        ? Math.floor(value)
-        : value >= 1_000_000_000
-          ? Math.floor(value * 1000)
-          : now + Math.floor(value * 1000)
-      resetsAtMs = Math.max(resetsAtMs ?? 0, candidate)
-    }
-  }
-  return rateLimited
-    ? {
-        rateLimited: true,
-        resetsAtMs: resetsAtMs ?? now + (capacityLimited ? 60_000 : 60 * 60 * 1000),
-        reason: capacityLimited ? 'capacity' : 'rate-limit',
-      }
-    : { rateLimited: false, resetsAtMs: null, reason: null }
-}
-
-export function codexRateLimitResumeAt(resetsAtMs: number, now = Date.now()): number {
-  if (!Number.isFinite(resetsAtMs) || !Number.isFinite(now)) {
-    throw new Error('Codex rate-limit time is invalid')
-  }
-  return Math.max(Math.floor(now) + 100, Math.floor(resetsAtMs) + 60_000)
+  return classifyCodexFailure(failures.at(-1), now, previousFailures)
 }
 
 /**
@@ -6673,7 +6622,7 @@ export class CodexRateLimitError extends Error {
     message: string,
     readonly resetsAtMs: number,
     readonly sessionId?: string,
-    readonly reason: 'rate-limit' | 'capacity' = 'rate-limit',
+    readonly reason: CodexRateLimitReason = 'rate-limit',
     readonly safeToRetryAfterDelivery = false,
     readonly stage?: CodexExecutionStage,
     readonly phaseSequence?: number,
@@ -6684,7 +6633,13 @@ export class CodexRateLimitError extends Error {
 }
 
 export class CodexInterruptedError extends Error {}
-export class CodexCleanupPendingError extends Error {}
+export class CodexCleanupPendingError extends Error {
+  readonly code?: 'ENOSPC'
+  constructor(message?: string, diagnostics?: string) {
+    super(message)
+    if (diagnostics && storageFailureFromDiagnostics(diagnostics)) this.code = 'ENOSPC'
+  }
+}
 export class CodexOwnedProcessStillLiveError extends CodexCleanupPendingError {}
 export class RetainedSlackAttachmentUnavailableError extends Error {
   constructor(
@@ -6842,8 +6797,9 @@ export interface CodexLiveControlHooks {
     turnId: string
     retainInput: boolean
     rateLimitResumeAt?: number
-    rateLimitReason?: 'rate-limit' | 'capacity'
+    rateLimitReason?: CodexRateLimitReason
     rateLimitSafeToReplay?: boolean
+    rateLimitRetryCount?: number
   }): { closeInput: boolean; cancelled: boolean; pending: number; pendingInbound: number }
   recordRateLimit(options: {
     executorNonce: string
@@ -6936,10 +6892,15 @@ export async function executeCodexJob(
   options: {
     /** Explicit fixture injection. Production callers must use the official standalone install. */
     codexBinForTesting?: string
+    /** Tool-free delivery editor injection for synthetic native-continuation tests. */
+    consolidateAnswerForTesting?: AnswerConsolidator
+    /** Exercise production post-completion coverage with a synthetic history reader. */
+    readNativeAdvisorCoverageForTesting?(method: 'thread/list' | 'thread/read', params: Record<string, unknown>): Promise<Record<string, unknown>>
     /** Let a synthetic App Server exercise the primary browser/CUA request path. */
     browserAccessForTesting?: boolean
     /** Host selector persists semantic decisions; raw CLI/environment overrides remain forbidden. */
     selectModel?(requests: ModelRequest[], models: TaskModel[], signal?: AbortSignal): Promise<string>
+    canDeferModelSelection?(): boolean
     /** Fixture-only model override. */
     model?: string
     /** Fixture-only reasoning override. Production always uses the release constant. */
@@ -7185,6 +7146,7 @@ export async function executeCodexJob(
   // not emulate that API unless an explicit history fixture is supplied.
   const nativeAdvisorHistoryEnabled = testCodexBin === undefined
     || options.nativeAdvisorHistoryFixtureForTesting !== undefined
+    || options.readNativeAdvisorCoverageForTesting !== undefined
   const advisorVerificationWarnings = new Set<string>()
   const reportAdvisorVerificationWarning = (stage: string, error: unknown): void => {
     const category = error instanceof Error ? error.name : 'unknown'
@@ -7204,10 +7166,15 @@ export async function executeCodexJob(
   const bestEffortAdvisorVerification = async <T>(
     stage: string,
     action: () => T | Promise<T>,
+    completedPrimary = false,
   ): Promise<T | undefined> => {
     try {
       return await action()
     } catch (error) {
+      if (completedPrimary && options.signal?.aborted && error instanceof CodexInterruptedError) {
+        reportAdvisorVerificationWarning(stage, error)
+        return undefined
+      }
       if (error instanceof CodexOwnedProcessStillLiveError
         || error instanceof EphemeralClaudeOwnedProcessStillLiveError
         || error instanceof CodexInterruptedError
@@ -7523,6 +7490,8 @@ export async function executeCodexJob(
     }
   }
 
+  let consecutiveThrottles = job.transientRateLimitCount ?? 0
+  let lastThrottleNoticeAt = 0
   let networkRecoveryPending = false
   const runAttempt = async (
     sessionId: string | null,
@@ -8306,13 +8275,64 @@ export async function executeCodexJob(
         const abort = () => controller.abort()
         options.signal?.addEventListener('abort', abort, { once: true })
         if (options.signal?.aborted) abort()
-        const poll = setInterval(() => { if (controls.cancellationRequested()) abort() }, APP_SERVER_CONTROL_POLL_MS)
+        const poll = setInterval(() => {
+          try { if (controls.cancellationRequested()) abort() }
+          catch (error) { controller.abort(error) }
+        }, APP_SERVER_CONTROL_POLL_MS)
         try {
-          const modelCatalog = await loadTaskModelCatalog(async cursor =>
-            (await session.request('model/list', { cursor, limit: 100, includeHidden: false }, { timeoutMs: 15_000 })).result, controller.signal)
-          const selected = await options.selectModel(requests, modelCatalog, controller.signal)
-          if (controls.cancellationRequested()) throw new CodexUserCancelledError()
-          return requireAvailableTaskModel(selected, modelCatalog)
+          let retry = 0
+          for (;;) {
+            controller.signal.throwIfAborted()
+            try {
+              const modelCatalog = await loadTaskModelCatalog(async cursor => {
+                try { return (await session.request('model/list', { cursor, limit: 100, includeHidden: false }, { timeoutMs: 15_000 })).result }
+                catch (error) {
+                  if (error instanceof AppServerAmbiguousRequestError && error.method === 'model/list') {
+                    throw new ModelSelectionRuntimeError('transport') // Read-only RPC, no task delivery.
+                  }
+                  if (error instanceof AppServerProtocolError
+                    && error.message === 'Codex model/list cannot be sent after stream close') {
+                    // A dead session cannot recover in place. Only an unsent
+                    // job may defer and open a fresh process; active work must
+                    // leave this loop for normal cleanup, never spin forever.
+                    throw new ModelSelectionRuntimeError(options.canDeferModelSelection?.() ? 'transport' : 'runtime')
+                  }
+                  if (error instanceof AppServerProtocolError && error.method === 'model/list' && error.rpcError) {
+                    const failure = modelSelectionProcessFailure(1, JSON.stringify(error.rpcError))
+                    if (failure.reason !== 'unclassified') throw failure
+                    throw new ModelSelectionRuntimeError(error.rpcError.code === -32603 ? 'transport' : 'configuration')
+                  }
+                  throw error
+                }
+              }, controller.signal)
+              const selected = await options.selectModel(requests, modelCatalog, controller.signal)
+              controller.signal.throwIfAborted()
+              if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+              return requireAvailableTaskModel(selected, modelCatalog)
+            } catch (error) {
+              controller.signal.throwIfAborted()
+              if (!(error instanceof ModelSelectionRuntimeError) || !error.retryable) throw error
+              if (retry >= 2 && ['invalid-output', 'unclassified'].includes(error.reason)) {
+                // Persistent malformed output / unknown failures are not proof
+                // of a transient outage. Keep the input, but don't queue forever.
+                throw new ModelSelectionRuntimeError(error.reason, error.exitCode, true)
+              }
+              // The host may release the serial worker only before any task or
+              // control delivery. Active work keeps its existing thread instead.
+              if ((retry >= 2 || error.reason === 'quota') && options.canDeferModelSelection?.()) throw error
+              // This call has not dispatched the input. Retry only the input
+              // check, never the task or a primary turn; never choose a fallback model.
+              const delay = options.transientRetryDelayMsForTesting ?? modelSelectionRetryDelay(retry)
+              retry += 1
+              try { options.onMonitorMessage?.(`入力の確認処理を再試行します（${error.reason}）。依頼内容は保持しています。`) } catch {}
+              const until = Date.now() + delay
+              while (Date.now() < until) {
+                controller.signal.throwIfAborted()
+                if (controls.cancellationRequested()) throw new CodexUserCancelledError()
+                await Bun.sleep(Math.min(100, until - Date.now()))
+              }
+            }
+          }
         } catch (error) {
           if (controls.cancellationRequested()) throw new CodexUserCancelledError()
           throw error
@@ -8357,6 +8377,7 @@ export async function executeCodexJob(
       let currentTurnId: string | null = null
       let activeInputRevision = advisorAttempt.inputSnapshot.revision
       let activeTurnTransientFailure: CodexRateLimitInfo | null = null
+      let terminalRateLimitInfo: CodexRateLimitInfo | null = null
       let pausedInterjection: JobInterjectionRecord | null = null
       let cancellationTerminalDeadline: number | null = null
       const rejectedSteerState: { current: {
@@ -8913,7 +8934,7 @@ export async function executeCodexJob(
                 advisorAttempt.inputSnapshot,
                 advisorAttempt.attemptNonce,
                 options.publicationContinuation!,
-                threadHistoryForPhysicalSession(options.threadHistory, resumed),
+                threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch),
               )
               : stage === 'complete'
               ? (networkRecoveryPending ? `${CODEX_NETWORK_CONTINUATION}\n\n` : '') + buildCodexWorkerPrompt(job, advisorAttempt.inputSnapshot, {
@@ -8922,7 +8943,7 @@ export async function executeCodexJob(
                 advisorEnabled: advisorAttempt.advisorEnabled,
                 browserEnabled: advisorAttempt.browserEnabled,
                 computerUseEnabled: advisorAttempt.computerUseEnabled,
-              }, threadHistoryForPhysicalSession(options.threadHistory, resumed))
+              }, threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch))
               : buildCodexPhasePrompt(
                 job,
                 stage,
@@ -8933,7 +8954,7 @@ export async function executeCodexJob(
                 advisorAttempt.browserEnabled,
                 options.uiApproval,
                 logicalAttempt.uiApprovalRepositoryChange,
-                threadHistoryForPhysicalSession(options.threadHistory, resumed),
+                threadHistoryForPhysicalSession(options.threadHistory, resumed, usesInitialDispatch),
                 advisorRepositoryIdentifiers(legacyRepositorySnapshot()),
                 stage === 'prepare'
                   ? undefined
@@ -9066,9 +9087,9 @@ export async function executeCodexJob(
             }
             const rateLimit = extractCodexRateLimit(JSON.stringify({
               method: 'error', params: appServerError,
-            }))
+            }), Date.now(), consecutiveThrottles)
             if (rateLimit.rateLimited) activeTurnTransientFailure = rateLimit
-            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+            if (options.parkOnUsageLimit && rateLimit.rateLimited && rateLimit.reason === 'rate-limit') {
               options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
               // The catch below stops and reaps this exact supervisor before
               // the typed exception is allowed to reach the cloud checkpoint.
@@ -9082,17 +9103,21 @@ export async function executeCodexJob(
                 executorNonce: advisorAttempt.attemptNonce,
                 threadId: currentThreadId,
                 turnId: currentTurnId,
-                resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
+                resumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs, Date.now(), rateLimit.reason ?? 'rate-limit'),
               })
             }
             if (appServerError.willRetry && rateLimit.rateLimited
+              && (rateLimit.reason !== 'throttled' || Date.now() - lastThrottleNoticeAt >= THROTTLE_NOTICE_INTERVAL_MS)
               && rateLimitWaitReportedForTurnId !== currentTurnId) {
               try {
                 const staged = options.onRateLimitWait?.({
                   threadId: currentThreadId,
                   turnId: currentTurnId,
                 }) === true
-                if (staged) rateLimitWaitReportedForTurnId = currentTurnId
+                if (staged) {
+                  rateLimitWaitReportedForTurnId = currentTurnId
+                  if (rateLimit.reason === 'throttled') lastThrottleNoticeAt = Date.now()
+                }
               } catch (error) {
                 process.stderr.write(
                   `zerochan: rate-limit wait notification could not be staged: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -9194,15 +9219,18 @@ export async function executeCodexJob(
               ? extractCodexRateLimit(JSON.stringify({
                 method: 'turn/completed',
                 params: { threadId: currentThreadId, turn: terminal.turn },
-              }))
+              }), Date.now(), consecutiveThrottles)
               : { rateLimited: false, resetsAtMs: null, reason: null }
             const rateLimit = terminalRateLimit.rateLimited
               ? terminalRateLimit
               : terminal.turn.status === 'failed' && activeTurnTransientFailure?.rateLimited
                 ? activeTurnTransientFailure
                 : terminalRateLimit
+            terminalRateLimitInfo = rateLimit as CodexRateLimitInfo
+            if (rateLimit.reason === 'throttled') consecutiveThrottles = Math.min(4, consecutiveThrottles + 1)
+            else if (terminal.turn.status === 'completed') consecutiveThrottles = 0
             if (options.parkOnUsageLimit && terminal.turn.status === 'failed'
-              && rateLimit.rateLimited && rateLimit.reason !== 'capacity') {
+              && rateLimit.rateLimited && rateLimit.reason === 'rate-limit') {
               options.onCloudQuotaDetected?.(rateLimit.resetsAtMs ?? undefined)
               throw new CodexRateLimitError('Usage limit requires explicit cloud continuation',
                 rateLimit.resetsAtMs ?? Date.now(), currentThreadId, 'rate-limit', false, stage, phaseSequence)
@@ -9352,9 +9380,10 @@ export async function executeCodexJob(
                 || (terminal.turn.status === 'failed' && isTransientCodexNetworkError(terminal.turn.error)),
               ...(rateLimit.rateLimited && rateLimit.resetsAtMs !== null
                 ? {
-                    rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs),
+                    rateLimitResumeAt: codexRateLimitResumeAt(rateLimit.resetsAtMs, Date.now(), rateLimit.reason ?? 'rate-limit'),
                     rateLimitReason: rateLimit.reason ?? 'rate-limit',
                     rateLimitSafeToReplay: transientFailureSafeToRetry,
+                    rateLimitRetryCount: consecutiveThrottles,
                   }
                 : {}),
             })
@@ -9743,7 +9772,9 @@ export async function executeCodexJob(
       protocolError ??= readerError
       protocolError ??= lateProtocolError
       if (protocolError && !userCancelled) {
-        const detail = protocolError instanceof Error ? protocolError.message : String(protocolError)
+        const storageCause = storageFailureFromDiagnostics(stderr)
+        // Retain the fixed cause even when the stderr prefix reached its cap.
+        const detail = storageCause ?? (protocolError instanceof Error ? protocolError.message : String(protocolError))
         // stdout may already have reached its persistence cap (especially for
         // legacy full-history responses). Persist the original bounded cause
         // after the stderr relay has closed, before cleanup classification can
@@ -9751,7 +9782,7 @@ export async function executeCodexJob(
         try {
           const descriptor = openSafeLog(stderrPath, 'append')
           try {
-            writeSync(descriptor, `${JSON.stringify({
+            writeSync(descriptor, `\n${JSON.stringify({
               type: 'zero-app-server-error', stage,
               message: detail.slice(0, MAX_FAILURE_CHARS),
             })}\n`)
@@ -9765,12 +9796,100 @@ export async function executeCodexJob(
       }
       if (protocolCompleted && protocolError == null && finalMessage && interjectionAnswerRetry === null) {
         if (!userCancelled && stage === 'complete') {
-          finalMessage = continuedArtifactMessage.resolve(finalMessage, activeInputRevision, taskGoalStatus)
-          finalMessage = continuedAnswer.resolve(finalMessage, activeInputRevision, taskGoalStatus)
+          const latestMessage = finalMessage
+          const selectArtifacts = () => continuedArtifactMessage.resolve(latestMessage, activeInputRevision, taskGoalStatus)
+          const selected = selectArtifacts()
+          const plan = continuedAnswer.plan(selected, activeInputRevision, taskGoalStatus)
+          finalMessage = continuedAnswer.resolve(selected, activeInputRevision, taskGoalStatus)
+          if (plan && plan.messages.length > 1) {
+            let input: AdvisorInputSnapshot | undefined
+            try { input = readAdvisorInputSnapshot(managedStateDir, job.id) } catch { /* Use the retained answers. */ }
+            const controller = new AbortController()
+            const abort = () => controller.abort()
+            const cancelled = (): boolean | undefined => {
+              try { return controls.cancellationRequested() } catch { return undefined }
+            }
+            const current = (): boolean | undefined => {
+              if (!input) return undefined
+              try {
+                const now = readAdvisorInputSnapshot(managedStateDir, job.id)
+                return now.revision === input.revision && now.digest === input.digest
+                  && now.revision === activeInputRevision
+              } catch { return undefined } // The normal final seal still verifies the durable input.
+            }
+            options.signal?.addEventListener('abort', abort, { once: true })
+            const poll = setInterval(() => {
+              if (cancelled() !== false || current() !== true) abort()
+            }, APP_SERVER_CONTROL_POLL_MS)
+            try {
+              if (options.signal?.aborted || cancelled() !== false || current() !== true) abort()
+              if (!input) throw new Error('delivery input snapshot unavailable')
+              if (plan.omitted) throw new Error('retained answer history was truncated')
+              const { sanitizeExecutionTextForSlack } = await import('./job-runner.ts')
+              const visible = (text: string) => sanitizeExecutionTextForSlack(job, observedSessionId ?? '', text, managedStateDir)
+              const consolidate = options.consolidateAnswerForTesting
+                ?? ((request, signal) => consolidateAnswer(request, { model, signal }))
+              const answer = validateConsolidatedAnswer(await consolidate({
+                question: input.entries.at(-1)?.task ?? job.task,
+                messages: plan.messages.map(visible),
+                latestMessage: visible(latestMessage.split(/<zerokun_files>/i)[0]!.trim()),
+                goalStatus: taskGoalStatus!,
+              }, controller.signal))
+              // The editor cannot grant attachment authority. Revalidate after
+              // its await, so a replaced/withdrawn proposal is never revived.
+              if (selectArtifacts() !== selected) throw new Error('retained artifacts changed')
+              finalMessage = attachAnswer(answer, plan)
+            } catch (error) {
+              if (error instanceof CodexCleanupPendingError) {
+                await retireCompletedRegistration()
+                throw error
+              }
+              if (cancelled() !== true && current() !== false) {
+                // Preserve source answers on editor outage, without silently
+                // dropping a question's explanation or repeating it as prose.
+                const fallbackSelected = selectArtifacts()
+                const fallback = continuedAnswer.plan(fallbackSelected, activeInputRevision, taskGoalStatus)
+                let files: unknown = []
+                try {
+                  if (fallback?.marker) files = JSON.parse(fallback.marker.replace(/^<zerokun_files>|<\/zerokun_files>$/gi, ''))
+                } catch { files = null }
+                finalMessage = '回答の統合を完了できませんでした。以下に生成順の回答記録を保持します。\n\n'
+                  + continuedAnswer.resolve(fallbackSelected, activeInputRevision, taskGoalStatus)
+                if (fallback && Array.isArray(files) && files.length < 10) {
+                  try {
+                    const historyPath = join(artifactDir, `answer-history-${randomUUID()}.txt`)
+                    const { sanitizeExecutionTextForSlack } = await import('./job-runner.ts')
+                    atomicWritePrivateFile(historyPath, (fallback.omitted ? '保持容量の上限により古い説明の一部は省略されています。\n\n' : '')
+                      + fallback.messages.map((message, index) =>
+                        `回答記録 ${index + 1}\n${sanitizeExecutionTextForSlack(job, observedSessionId ?? '', message, managedStateDir)}`).join('\n\n'))
+                    finalMessage = '回答の統合を完了できなかったため、保持できた説明・訂正を回答記録の添付に保存しました。\n\n'
+                      + `${latestMessage.split(/<zerokun_files>/i)[0]!.trim()}\n`
+                      + `<zerokun_files>${JSON.stringify([...files, historyPath])}</zerokun_files>`
+                  } catch { /* The source record in the body remains deliverable. */ }
+                }
+                process.stderr.write('zerochan: answer consolidation unavailable; source answers retained\n')
+              }
+            } finally {
+              clearInterval(poll)
+              options.signal?.removeEventListener('abort', abort)
+            }
+            // Unknown control reads defer to the mandatory transactional final
+            // seal, which checks cancellation and input identity before delivery.
+            userCancelled = cancelled() === true
+            if (current() === false) inputChangedBeforeDispatch = true
+          }
         }
-        atomicWritePrivateFile(finalPath, finalMessage)
+        // Primary completion was sealed before delivery editing. Host shutdown
+        // may stop the editor, but must not recast completed work as uncertain.
+        if (!userCancelled && !inputChangedBeforeDispatch) {
+          atomicWritePrivateFile(finalPath, finalMessage)
+        }
       }
       if (protocolError instanceof CodexRateLimitError && options.parkOnUsageLimit && !userCancelled) {
+        await retireCompletedRegistration()
+        throw protocolError
+      }
+      if (protocolError instanceof ModelSelectionRuntimeError && !userCancelled && !interruptedAtExit) {
         await retireCompletedRegistration()
         throw protocolError
       }
@@ -9793,12 +9912,23 @@ export async function executeCodexJob(
         browserReceiptKey: advisorAttempt.browserReceiptKey,
         browserReceiptKeyPath: advisorAttempt.browserReceiptKeyPath,
         seatbeltFingerprint: advisorAttempt.seatbeltFingerprint,
-        retireCompletedRegistration,
+        retireCompletedRegistration: async () => {
+          try { await retireCompletedRegistration() }
+          catch (error) {
+            // Preserve the cleanup error class; this cause also survives when
+            // the disk cannot accept the final diagnostic append above.
+            if (error instanceof Error && storageFailureFromDiagnostics(stderr)) {
+              Object.assign(error, { code: 'ENOSPC' })
+            }
+            throw error
+          }
+        },
         retireCancelledRegistration,
         userCancelled,
         interjectionAnswerRetry,
         inputChangedBeforeDispatch,
         finalTurn,
+        rateLimit: terminalRateLimitInfo,
         parentTurnIds,
         parentChildBaseline: parentChildBaseline ?? [],
         parentTurnBaseline: parentTurnBaseline ?? [],
@@ -10108,6 +10238,7 @@ export async function executeCodexJob(
     }
     return {
       exitCode, stdout, stderr, timedOut, finalMessage, observedSessionId,
+      rateLimit: extractCodexRateLimit(stdout, Date.now(), consecutiveThrottles),
       interruptedAtExit,
       protocolCompleted: protocolSequenceValid && finalSnapshot !== null,
       logicalCleanup,
@@ -10193,7 +10324,7 @@ export async function executeCodexJob(
     const parentTurnIds: string[] = []
     let nextStage: 'prepare' | 'implementation' | 'review' = 'prepare'
     let pendingTerminalRateLimitRecovery: {
-      reason: 'rate-limit' | 'capacity'
+      reason: CodexRateLimitReason
       resetsAtMs: number
       stage: 'prepare' | 'implementation' | 'review'
       phaseSequence: number
@@ -10219,7 +10350,7 @@ export async function executeCodexJob(
     let continuationProbePending = continuationBundle !== undefined
 
     const waitForTransientModelRecovery = async (input: {
-      reason: 'rate-limit' | 'capacity'
+      reason: CodexRateLimitReason
       resetsAtMs: number
       stage: 'prepare' | 'implementation' | 'review' | 'interjection'
       phaseSequence: number
@@ -10231,7 +10362,7 @@ export async function executeCodexJob(
           input.resetsAtMs, sessionId ?? undefined, 'rate-limit', false, input.stage, input.phaseSequence)
       }
       const resumeAt = options.transientRetryDelayMsForTesting === undefined
-        ? codexRateLimitResumeAt(input.resetsAtMs)
+        ? codexRateLimitResumeAt(input.resetsAtMs, Date.now(), input.reason)
         : Date.now() + positiveInteger(options.transientRetryDelayMsForTesting, 1)
       const message = input.reason === 'capacity'
         ? input.partialImplementation
@@ -10246,10 +10377,17 @@ export async function executeCodexJob(
         // Operator-only monitor output is not part of task correctness.
       }
       try {
-        options.onCommentaryMessage?.({
-          sourceKey: `host-transient:${input.stage}:${input.phaseSequence}`,
-          text: message,
-        })
+        if (input.reason !== 'throttled' || Date.now() - lastThrottleNoticeAt >= THROTTLE_NOTICE_INTERVAL_MS) {
+          options.onCommentaryMessage?.({
+            sourceKey: createHash('sha256').update(JSON.stringify([
+              job.id, job.attempts, 'host-transient', input.stage, input.phaseSequence, resumeAt,
+            ])).digest('hex'),
+            text: input.reason === 'throttled'
+              ? `⏸ 一時的にリクエストが制限されています。作業を保持し、${new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(resumeAt))} に再試行します。`
+              : message,
+          })
+          if (input.reason === 'throttled') lastThrottleNoticeAt = Date.now()
+        }
       } catch {
         // This status is advisory. Losing it must not turn a recoverable model
         // congestion event into a terminal job failure.
@@ -10326,7 +10464,7 @@ export async function executeCodexJob(
       }
       if (execution.forcedCleanupUsed) {
         throw new CodexCleanupPendingError(
-          'Codex interjection cleanup was not self-confirmed; resume is blocked',
+          'Codex interjection cleanup was not self-confirmed; resume is blocked', execution.stderr,
         )
       }
       if ('inputChangedBeforeDispatch' in execution
@@ -10352,7 +10490,7 @@ export async function executeCodexJob(
           execution.stderr,
           execution.stdoutPath,
         )
-        const rateLimit = extractCodexRateLimit(execution.stdout)
+        const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
         if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
           recordPhaseIdentity(execution)
           throw new CodexRateLimitError(
@@ -10455,7 +10593,7 @@ export async function executeCodexJob(
         }
         if (execution.forcedCleanupUsed) {
           throw new CodexCleanupPendingError(
-            'Codex phase cleanup was not self-confirmed; publication and queue progress are blocked',
+            'Codex phase cleanup was not self-confirmed; publication and queue progress are blocked', execution.stderr,
           )
         }
         if ('inputChangedBeforeDispatch' in execution
@@ -10516,7 +10654,7 @@ export async function executeCodexJob(
           await execution.retireCompletedRegistration()
           throw new CodexInterruptedError('Codex job was interrupted')
         }
-        const rateLimit = extractCodexRateLimit(execution.stdout)
+        const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
         const failure = describeCodexFailure(
           execution.exitCode,
           execution.stdout,
@@ -11592,7 +11730,7 @@ export async function executeCodexJob(
     }
     if (execution.forcedCleanupUsed) {
       throw new CodexCleanupPendingError(
-        'Codex interjection cleanup was not self-confirmed; resume is blocked',
+        'Codex interjection cleanup was not self-confirmed; resume is blocked', execution.stderr,
       )
     }
     if ('inputChangedBeforeDispatch' in execution
@@ -11618,7 +11756,7 @@ export async function executeCodexJob(
         execution.stderr,
         execution.stdoutPath,
       )
-      const rateLimit = extractCodexRateLimit(execution.stdout)
+      const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
       if (rateLimit.rateLimited && rateLimit.resetsAtMs !== null) {
         throw new CodexRateLimitError(
           failure,
@@ -11690,7 +11828,7 @@ export async function executeCodexJob(
     }
     if (execution.forcedCleanupUsed) {
       throw new CodexCleanupPendingError(
-        'Codex supervisor cleanup was not self-confirmed; completion and queue progress are blocked',
+        'Codex supervisor cleanup was not self-confirmed; completion and queue progress are blocked', execution.stderr,
       )
     }
     if ('inputChangedBeforeDispatch' in execution
@@ -11815,7 +11953,7 @@ export async function executeCodexJob(
                 seatbeltFingerprint: execution.seatbeltFingerprint,
               }, completeAdvisorRounds)
               return true
-            }) === true
+            }, true) === true
             : await bestEffortAdvisorVerification('completion-coverage', async () => {
               const overrides = nativeAdvisorHistoryPermissionOverrides(execution.advisorPermissionOverrides)
               const observations = await observeNativeAdvisorCoverage({
@@ -11828,13 +11966,15 @@ export async function executeCodexJob(
                   job.id.replace(/[^A-Za-z0-9._-]/g, '_'), `${execution.advisorAttemptNonce}.json`),
                 execution.advisorAttemptNonce, () => {}),
                 read: (method, params) => bestEffortAdvisorVerification(`coverage-${method}`, () => (
-                  readCodexAppServer(codexBin, job.repoPath, overrides, method,
+                  options.readNativeAdvisorCoverageForTesting
+                    ? options.readNativeAdvisorCoverageForTesting(method, params)
+                    : readCodexAppServer(codexBin, job.repoPath, overrides, method,
                     buildCodexChildEnvironment(), {
                       params, signal: options.signal, timeoutMs: 15_000,
                       seatbeltFingerprint: execution.seatbeltFingerprint,
                       seatbeltStateDir: managedStateDir,
                     })
-                )),
+                ), true),
               })
               // Keep source IDs/digests for later diagnosis without copying
               // private response text. Storage failure never changes counts.
@@ -11846,7 +11986,7 @@ export async function executeCodexJob(
                 }))
               })
               return observations
-            })
+            }, true)
           const advisorCoverage = collectHostAdvisorCoverage(
             managedStateDir,
             job.id,
@@ -11923,7 +12063,7 @@ export async function executeCodexJob(
       throw new CodexInterruptedError('Codex job was interrupted')
     }
 
-    const rateLimit = extractCodexRateLimit(execution.stdout)
+    const rateLimit = execution.rateLimit ?? extractCodexRateLimit(execution.stdout, Date.now(), consecutiveThrottles)
     const failure = describeCodexFailure(
       execution.exitCode,
       execution.stdout,

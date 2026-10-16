@@ -5,6 +5,20 @@ import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.
 import { atomicWritePrivateFile } from './safe-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
 
+/** Recognize the active working-directory permission dialog, not quoted history.
+ * Its stable semantic identity excludes changing tool/progress text above it.
+ */
+export function claudeBlockedPermission(transcript: string): boolean {
+  transcript = transcript.replace(/\s+/g, ' ')
+  const start = transcript.lastIndexOf('Read outside the working directories')
+  if (start < 0) return false
+  const dialog = transcript.slice(start)
+  return /Allow this read outside the working directories\?/.test(dialog)
+    && /1\.\s*Yes, and keep allowing any reads outside the working directories/.test(dialog)
+    && /2\.\s*No, and block reads outside the working directories/.test(dialog)
+    && /Esc to cancel/.test(dialog)
+}
+
 const STARTUP_CODES = ['prohibited-ui', 'authentication-ui', 'rate-limit-ui', 'billing-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
   'trust-confirmation-timeout', 'readiness-timeout', 'identity-check-failed', 'startup-failed'] as const
 export type ClaudeFailureDiagnostic = {
@@ -154,6 +168,7 @@ export function saveClaudeResponseDiagnostic(options: {
   sendCode?: 'agent_not_ready' | 'agent_blocked' | 'empty_agent_prompt'
     | 'agent_prompt_stalled' | 'agent_prompt_failed' | 'timeout' | 'unknown-error'
   sendStatus?: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed'
+  timing?: { startedAt: number; acquisitionStartedAt?: number; elapsedMs: number; acquisitionElapsedMs?: number; acquisitionLimitMs: number }
 }): ClaudeDiagnosticReceipt {
   try {
     if (!/^[a-f0-9]{32}$/.test(options.attempt)) return { status: 'unavailable' }
@@ -186,6 +201,7 @@ export function saveClaudeResponseDiagnostic(options: {
       snapshot: options.snapshot,
       sendCode: options.sendCode,
       sendStatus: options.sendStatus,
+      timing: options.timing,
       reads: options.reads.slice(-3),
       transcript: {
         available: options.transcript !== undefined,

@@ -124,8 +124,10 @@ active jobの固定済み権限で処理するため、active write jobでは同
 更新するlocal safety policyです。これとは別に、terminal jobのrequest、同thread follow-up、公開済み
 commentary／回答、最終結果または公開用失敗分類を`slack_thread_job_history`へsanitized blockとして永続化します。
 次jobをclaimするtransaction内で、完全一致する`chat_id + thread_ts + repo_path`のimmutable snapshotを
-`job_thread_history_snapshots`へ固定します。native resumeはprovider側の会話を使って二重注入せず、fresh
-threadだけがsnapshotをcurrent requestより前のuntrusted referenceとして受け取ります。write mode／senderは
+`job_thread_history_snapshots`へ固定します。各論理依頼の初回送信では、native resumeでもsnapshotをcurrent request
+より前のuntrusted referenceとして渡し、送信前に失敗してnative会話に残らなかった依頼も引き継ぎます。
+後続phaseへは重複注入せず、fresh threadには従来どおり渡します。履歴の完了・失敗結果と現在状態を照合し、
+完了済み作業を再実行せず、現在の依頼に従って未完了部分を継続します。write mode／senderは
 snapshot scopeではないため、権限を継承せずに同じ会話だけを継続できます。failed／completed job、daemon再起動、
 20 job rotation、protocol変更、job retention GCをまたいでもarchiveは残ります。
 
@@ -542,3 +544,7 @@ APIからの実際のIAM拒否を分けて報告します。読取り補助ツ�
 `zerochan update --recover-only` は現在projectの未完了切替を復旧します。
 旧方式の共有更新journalが残っている場合は、その復旧を先に行います。
 旧方式からの移行中は元checkoutを保持し、使用中releaseの自動削除は行いません。
+
+### 容量不足の復旧
+
+終了状態の保存中に容量不足が起きた場合は、監視タブの喪失や一般的な内部エラーへ原因を置き換えず、同じ実行の保存済み診断から容量不足を通知します。停止確認や保存済み結果の検証は省略せず、未確定の変更を自動再送しません。大きなビルドを行う主担当には空き容量と、生成キャッシュの重複コピーを避けて自分の不要キャッシュだけを整理する指示を渡します。容量計測に失敗しても通常の作業を一律停止せず、利用者の履歴・成果物や他ジョブを自動削除しません。

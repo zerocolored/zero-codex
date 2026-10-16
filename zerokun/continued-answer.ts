@@ -4,6 +4,12 @@ const MAX_RETAINED_CHARS = 1024 * 1024
 // Leave room below the host's 12K result cap for delivery status/coverage text.
 const MAX_DELIVERY_CHARS = 11_000
 
+export interface ContinuedAnswerPlan {
+  messages: string[]
+  marker: string
+  omitted: boolean
+}
+
 export class ContinuedAnswer {
   private revision?: number
   private messages: string[] = []
@@ -37,13 +43,13 @@ export class ContinuedAnswer {
     this.chars += text.length
   }
 
-  resolve(finalMessage: string, revision: number, goalStatus: string | undefined): string {
-    if (this.revision !== revision || !['blocked', 'paused'].includes(goalStatus ?? '')) return finalMessage
+  plan(finalMessage: string, revision: number, goalStatus: string | undefined): ContinuedAnswerPlan | undefined {
+    if (this.revision !== revision || !['blocked', 'paused'].includes(goalStatus ?? '')) return undefined
     // The artifact resolver has already selected/validated the only declaration
     // eligible for delivery. Keep that declaration at the end, never older ones.
     const opening = /<zerokun_files>/i.exec(finalMessage)
     const marker = opening ? /^<zerokun_files>[\s\S]*<\/zerokun_files>\s*$/i.exec(finalMessage.slice(opening.index))?.[0].trim() : ''
-    if (opening && !marker) return finalMessage
+    if (opening && !marker) return undefined
     const selected = finalMessage.trim()
     const observed = [...this.messages]
     if (!observed.includes(selected)) observed.push(selected)
@@ -53,6 +59,15 @@ export class ContinuedAnswer {
       // Discard replaced, withdrawn, changed or invalid attachment messages.
       return message === selected ? [message.slice(0, declaration.index).trimEnd()] : []
     }).filter(Boolean)
+    return { messages, marker: marker ?? '', omitted: this.omitted }
+  }
+
+  // Information-preserving emergency rendering. Normal multi-answer delivery
+  // uses semantic consolidation, never this exact-match-only concatenation.
+  resolve(finalMessage: string, revision: number, goalStatus: string | undefined): string {
+    const plan = this.plan(finalMessage, revision, goalStatus)
+    if (!plan) return finalMessage
+    const { messages, marker } = plan
     const attach = (text: string) => marker ? `${text}\n${marker}` : text
     const combined = messages.join('\n\n')
     if (!this.omitted && combined.length <= MAX_DELIVERY_CHARS) return attach(combined)

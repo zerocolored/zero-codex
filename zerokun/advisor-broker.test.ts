@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'fs'
 import { homedir, tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readProcessIdentity } from './process-tree.ts'
@@ -296,6 +296,8 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and state.get("prompt") and 
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "visible", "--lines"]:
     state["visible_observed"] = True
     save()
+    if state.get("changing_blocked_header"):
+        print("Progress: " + str(time.monotonic()))
     print(state.get("blocked_screen", "Do you want to proceed?\\n❯ 1. Yes\\n  2. No") if state.get("prompt") and state.get("agent_status") == "blocked" else "❯", flush=True)
     raise SystemExit(0)
 if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source", "recent-unwrapped", "--lines"]:
@@ -306,6 +308,8 @@ if len(args) == 7 and args[:2] == ["agent", "read"] and args[3:6] == ["--source"
         print(json.dumps({"error": {"code": "agent_not_idle", "message": "private transport detail"}}), file=sys.stderr)
         raise SystemExit(1)
     if state.get("agent_status") == "blocked":
+        if state.get("changing_blocked_header"):
+            print("Progress: " + str(time.monotonic()))
         print(state.get("blocked_screen", "Do you want to proceed?\\n❯ 1. Yes\\n  2. No"), flush=True)
         raise SystemExit(0)
     if state.get("change_during_read") and not state.get("read_changed"):
@@ -428,6 +432,7 @@ async function brokerFixture(options: {
   claudeNeverStarts?: boolean
   claudeBlocked?: boolean
   claudeBlockedRecovers?: boolean
+  withAttachment?: boolean
   claudeReadError?: boolean
   claudeAuthReadyFile?: string
   claudeAuthConfigurationAfterReady?: boolean
@@ -502,6 +507,12 @@ async function brokerFixture(options: {
         stateValue.prompt = instructionPath
           ? readFileSync(JSON.parse(instructionPath[1]!), 'utf8') : request.params.text
         const deliveredPrompt = stateValue.prompt
+        if (options.withAttachment) {
+          const authorizedRoot = (stateValue.claude_args as string[]).find(arg => arg.startsWith('--add-dir='))!.slice('--add-dir='.length)
+          const copied = readdirSync(authorizedRoot).filter(name => name.startsWith('attachment-'))
+          stateValue.attachment_bytes = copied.map(name => readFileSync(join(authorizedRoot, name), 'utf8'))
+          stateValue.attachment_paths = copied.map(name => join(authorizedRoot, name))
+        }
         stateValue.state_change_seq = 2
         stateValue.agent_status = 'done'
         stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
@@ -627,6 +638,11 @@ async function brokerFixture(options: {
   writePinnedHerdrRuntime(state, requireHerdrRuntime(environment))
 
   const store = new JobStore(join(state, 'jobs.sqlite3'))
+  const attachment = join(state, 'inbox', 'synthetic.png')
+  if (options.withAttachment) {
+    mkdirSync(dirname(attachment), { mode: 0o700 })
+    writeFileSync(attachment, 'synthetic image bytes', { mode: 0o600 })
+  }
   const job = store.enqueue({
     chatId: 'C0123456789',
     threadTs: '1800000000.000100',
@@ -634,6 +650,7 @@ async function brokerFixture(options: {
     userId: 'U_FIRST',
     repoPath: repo,
     task: '最初の依頼',
+    attachments: options.withAttachment ? [attachment] : [],
     writeEnabled: options.writeEnabled ?? false,
   }).job
   const revisionOne = readAdvisorInputSnapshot(state, job.id)
@@ -1752,6 +1769,46 @@ print('review complete')
       }))
       expect(JSON.stringify(diagnostic)).not.toContain('private transport detail')
       expect(JSON.stringify(result.payload)).not.toContain('Do you want to proceed?')
+    } finally { await fixture.close() }
+  }, 50_000)
+
+  test('Claudeの実送信promptはinboxではなく許可済み領域の添付を参照しcleanupできる', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, withAttachment: true })
+    try {
+      expect((await fixture.call('investigation', 'revision-two')).payload).toMatchObject({
+        allAdopted: true, claude: { adopted: true, cleanupVerified: true },
+      })
+      const state = JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8'))
+      expect(state.attachment_bytes).toEqual(['synthetic image bytes'])
+      expect(state.prompt).not.toContain(join(fixture.state, 'inbox'))
+      expect(state.prompt).toContain(state.attachment_paths[0])
+      expect(existsSync(state.attachment_paths[0])).toBe(false)
+      expect(readFileSync(join(fixture.state, 'inbox', 'synthetic.png'), 'utf8')).toBe('synthetic image bytes')
+      expect(state.prompt_count).toBe(1)
+      expect(state.close_count).toBe(1)
+    } finally { await fixture.close() }
+  }, 30_000)
+
+  test('添付のフォルダ権限確認は周辺表示が変わっても時間切れと誤報せず一度で終了する', async () => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: true, claudeReadError: true })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      state.changing_blocked_header = true
+      state.blocked_screen = [
+        'Read outside the working\n  directories', 'Read(/synthetic/inbox/image.png)',
+        'Allow this read outside the working directories?',
+        '❯ 1. Yes, and keep allowing\n  any reads outside the working directories',
+        '2. No, and block reads outside the working directories from now on', 'Esc to cancel · Tab to amend',
+      ].join('\n')
+      writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
+      const result = await fixture.call('investigation', 'revision-two')
+      expect(result.payload).toMatchObject({ claude: { adopted: false, cleanupVerified: true,
+        failure: { cause: 'permission' } } })
+      const done = JSON.parse(readFileSync(path, 'utf8'))
+      expect(done.prompt_count).toBe(1)
+      expect(done.close_count).toBe(1)
+      expect(done.owned).toBe(false)
     } finally { await fixture.close() }
   }, 50_000)
 

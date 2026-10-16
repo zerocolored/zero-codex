@@ -11,6 +11,7 @@ import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleet
  */
 
 import { App } from '@slack/bolt'
+import { createSlackThreadFailureReactionApplier, createSlackThreadFailureReactionDrainer } from './zerokun/slack-thread-failure-reaction.ts'
 import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
 import { parseNativeConfirmationAnswer } from './zerokun/native-confirmation.ts'
@@ -559,6 +560,11 @@ const inFlight = new Map<string, Promise<boolean>>()
 type ThreadReplyAdmission = 'addressed' | 'ignored' | 'retry' | 'handled'
 const threadIntentInFlight = new Map<string, Promise<ThreadReplyAdmission>>()
 const threadIntentRunner: SlackThreadIntentRunner = runSlackThreadIntentClassifier
+const drainSlackThreadFailureReactions = createSlackThreadFailureReactionDrainer({
+  store: jobStore,
+  apply: createSlackThreadFailureReactionApplier(BOT_TOKEN),
+  warn: () => process.stderr.write('slack channel: classifier failure reaction pending retry\n'),
+})
 
 function rememberDelivered(key: string): void {
   delivered.add(key)
@@ -653,7 +659,7 @@ function stageEarlierSlackThreadIntentCandidates(input: {
 /**
  * LLM admission for eligible human and explicitly mentioned bot channel replies. It runs before
  * active authority, update detection, attachment downloads, queueing and Slack
- * acknowledgement. A model/runtime failure remains an invisible durable retry.
+ * acknowledgement. A model/runtime failure retains the input and schedules an x reaction.
  */
 async function admitSlackChannelThreadReply(input: {
   channelId: string
@@ -768,6 +774,7 @@ async function admitSlackChannelThreadReply(input: {
         key,
         decision === 'addressed' ? 'addressed' : 'ignored',
       )
+      void drainSlackThreadFailureReactions()
       if (completed.status === 'ignored') {
         rememberDelivered(key)
         return 'ignored'
@@ -784,7 +791,9 @@ async function admitSlackChannelThreadReply(input: {
           key,
           error instanceof Error ? error.message : String(error),
           Date.now() + delay,
+          !(error instanceof SlackMethodBudgetExhausted),
         )
+        void drainSlackThreadFailureReactions()
       }
       process.stderr.write(
         `slack channel: thread audience pending retry for ${key}: `
@@ -2914,6 +2923,7 @@ try {
   // Sweep once on startup for new mentions/DMs, and recover replies in owned threads.
   scheduleInboundDrain()
   void drainSlackThreadReplyIntents()
+  void drainSlackThreadFailureReactions()
   void scheduleCatchupSweep()
   recoverUpdateNotificationWorker()
   // A detached update worker survives gateway replacement. Never enqueue this
@@ -2954,6 +2964,7 @@ try {
   setInterval(() => scheduleInboundDrain(), 5_000).unref()
   setInterval(() => { void drainFleetQueries().catch(() => {}) }, 5_000).unref()
   setInterval(() => { void drainSlackThreadReplyIntents() }, THREAD_INTENT_DRAIN_INTERVAL_MS).unref()
+  setInterval(() => { void drainSlackThreadFailureReactions() }, 5_000).unref()
   setInterval(stopOrphanedUpdateCandidate, 5_000).unref()
 } catch (err) {
   process.stderr.write(`slack channel: failed to start: ${err}\n`)

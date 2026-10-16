@@ -24,6 +24,7 @@ import {
 } from './safe-file.ts'
 import { redactCredentialMaterial } from './public-output-guard.ts'
 import { runIsolatedCodexJson } from './slack-thread-intent.ts'
+import { AuditModelError, auditRetryDelay } from './audit-model-failure.ts'
 import {
   CodexCleanupPendingError,
   CodexUserCancelledError,
@@ -32,6 +33,7 @@ import {
 import {
   runAuditTool,
   runAuditProbe,
+  requireAuditDiskSpace,
   auditCommand,
   cleanupAuditZap,
   checkAuditInterrupted,
@@ -100,6 +102,9 @@ const journalSchema = z
     steps: z.array(stepSchema),
     result: z.string().nullable(),
     reportDigest: z.string().nullable(),
+    targetChecks: z.array(stepSchema).optional(),
+    targetSettingsDigest: z.string().optional(),
+    blockedPreflight: z.array(stepSchema).optional(),
     availabilityResult: z.string().optional(),
     availabilityReportDigest: z.string().optional(),
   })
@@ -117,6 +122,7 @@ export type AuditOptions = {
   tool?: typeof runAuditTool
   model?: typeof runIsolatedCodexJson
   probe?: typeof runAuditProbe
+  retryDelay?: typeof auditRetryDelay
   /** Resolves only after the immediate status has been delivered. */
   milestone?: (phase: 'checking' | 'ready', text: string) => Promise<void>
 }
@@ -519,7 +525,8 @@ export async function auditCodeReview(
   for (const { key, chunk, prompt } of inputs) {
     checkAuditInterrupted(ctx)
     const path = join(cache, `${key}.json`)
-    for (let attempt = 1; attempt <= 2; attempt++) try {
+    let attempts = 2
+    for (let attempt = 1; attempt <= attempts; attempt++) try {
       let raw = readOptionalBoundedOwnerOnlyRegularFile(path, 1_000_000)
       if (!raw) {
         raw = await model(
@@ -559,8 +566,15 @@ export async function auditCodeReview(
       const detail = error instanceof z.ZodError ? 'invalid review schema'
         : error instanceof SyntaxError ? 'invalid review JSON'
         : auditClean(error instanceof Error ? error.message : 'review failed').slice(0, 500)
-      diagnostics.push(`${chunk.file}:${chunk.start}${chunk.offsetUtf16 === undefined ? '' : ` (segment offset ${chunk.offsetUtf16})`}: attempt ${attempt}/2: ${detail}`)
-      if (attempt === 2) failed++
+      if (error instanceof AuditModelError && error.retryable) attempts = 3
+      diagnostics.push(`${chunk.file}:${chunk.start}${chunk.offsetUtf16 === undefined ? '' : ` (segment offset ${chunk.offsetUtf16})`}: attempt ${attempt}/${attempts}: ${detail}`)
+      if (attempt === attempts) failed++
+      else if (error instanceof AuditModelError && error.retryable) {
+        ctx.progress?.(`${number}/${AUDIT_STEPS.length} ${chunk.file}:${chunk.start}: ${error.reason}。成功済み区間を保持して待機・再試行します。`)
+        try { await (ctx.retryDelay ?? auditRetryDelay)(30_000 * attempt, ctx.signal) }
+        catch (error) { checkAuditInterrupted(ctx); throw error }
+        checkAuditInterrupted(ctx)
+      }
     }
     processed++
     ctx.progress?.(
@@ -687,6 +701,9 @@ export async function checkAuditAvailability(
   const state = { version: 1, startedAt: Date.now(), finishedAt: null as number | null, steps: [] as AuditStep[] }
   const save = () => atomicWritePrivateFile(path, JSON.stringify(state))
   save()
+  let resourceFailure: string | undefined
+  if (probe === runAuditProbe) try { requireAuditDiskSpace(ctx.root) }
+  catch (error) { resourceFailure = error instanceof Error ? error.message : '検査用ディスクを確認できませんでした。' }
   for (let number = 1; number <= AUDIT_STEPS.length; number++) {
     checkAuditInterrupted(ctx)
     const running: AuditStep = { number, status: 'running', tool: AUDIT_STEPS[number - 1]!, version: 'pending',
@@ -694,6 +711,7 @@ export async function checkAuditAvailability(
     state.steps.push(running); save()
     ctx.progress?.(`利用可能チェック ${number}/${AUDIT_STEPS.length} ${AUDIT_STEPS[number - 1]}`)
     try {
+      if (resourceFailure) throw Error(resourceFailure)
       const result = stepSchema.parse(await probe(number, ctx, model))
       if (result.number !== number) throw Error('availability probe identity mismatch')
       state.steps[number - 1] = cleanStep({ ...result, status: result.status === 'findings' ? 'completed' : result.status, findings: [] }, ctx.root)
@@ -815,18 +833,120 @@ export async function executeSecurityAudit(
   }
   const checkpoint = () =>
     atomicWritePrivateFile(journalPath, JSON.stringify(journal))
+  const finishReport = (): JobExecutionResult => {
+    const report = renderAuditReport(journal)
+    atomicWritePrivateFile(reportPath, report)
+    journal.reportDigest = createHash('sha256').update(report).digest('hex')
+    const failed = journal.steps.filter(
+      (s) => !['completed', 'findings'].includes(s.status),
+    ).length
+    const findings = journal.steps.reduce((n, s) => n + s.findings.length, 0)
+    const completion = failed ? `セキュリティ検査は未完了です。全${AUDIT_STEPS.length}工程の実行結果を保存しました。`
+      : `セキュリティ検査の全${AUDIT_STEPS.length}工程を完了しました。`
+    journal.result = `${completion}指摘${findings}件、検査不能・失敗・中断${failed}工程です。コードは修正していません。詳細と検査範囲は添付レポートをご確認ください。修正する場合は、このスレッドで「レポートの内容を修正して」と依頼してください。\n<zerokun_files>${JSON.stringify([reportPath])}</zerokun_files>`
+    checkpoint()
+    cleanupAuditWorkingFiles(root)
+    return { sessionId: journal.sessionId, result: journal.result }
+  }
   // Recover owned ZAP containers before a preflight can reuse the job's container identity.
   if (existsSync(join(root, 'stage-10', 'zap'))) {
     await cleanupAuditZap({ ...ctx, root: join(root, 'stage-10') })
     rmSync(join(root, 'stage-10', 'zap'), { recursive: true, force: true })
   }
-  const preflight = await checkAuditAvailability(ctx, options.probe, options.model)
+  const toolContext = { ...ctx, source: auditScannerSource(journal, ctx) }
+  checkpoint()
+  const preflight = journal.blockedPreflight ?? await checkAuditAvailability(toolContext, options.probe, options.model)
+  // Validate target-dependent execution before spending hours on source reviews.
+  // The same immutable snapshot and scanner adapter are used in both phases.
+  if (!journal.blockedPreflight && preflight.every(s => s.status === 'completed')) {
+    const digest = createHash('sha256').update(JSON.stringify(settings)).digest('hex')
+    if (journal.targetSettingsDigest && journal.targetSettingsDigest !== digest)
+      throw Error('対象実行確認後に設定が変わりました。保存済み結果は保持しています。新しい検査依頼が必要です。')
+    journal.targetSettingsDigest = digest
+    journal.targetChecks ??= []
+    for (const number of [1, 6, 7]) {
+      checkAuditInterrupted(options)
+      let checked: AuditStep | undefined = journal.targetChecks.find(s => s.number === number)
+      // Never replay an existing or possibly interrupted E2E on recovery.
+      const previous = journal.steps.find(s => s.number === number)
+      if (!checked && previous) checked = { ...previous }
+      if (checked?.status === 'running' && (number === 6 || number === 7)) {
+        // The runner recovers supervised processes before resuming a job.
+        // These local read-only scans can restart; an E2E with unknown external
+        // actions must retain its interrupted result instead.
+        rmSync(join(root, `stage-${number}`), { recursive: true, force: true })
+        journal.targetChecks = journal.targetChecks.filter(s => s.number !== number)
+        checked = undefined
+      }
+      if (checked?.status === 'running') checked = { ...checked, status: 'interrupted', finishedAt: Date.now(),
+        note: '対象実行確認が中断しました。実行結果が不明な検査は自動で再実行していません。' }
+      if (!checked) {
+        const running: AuditStep = { number, status: 'running', tool: AUDIT_STEPS[number - 1]!,
+          version: 'pending', scope: 'target execution validation', note: '', startedAt: Date.now(),
+          finishedAt: null, exitCode: null, findings: [], evidenceDigest: null }
+        journal.targetChecks.push(running)
+        checkpoint()
+        options.progress?.(`対象実行確認 ${number}/${AUDIT_STEPS.length} ${AUDIT_STEPS[number - 1]}`)
+        try {
+          const actual = stepSchema.parse(await (options.tool ?? runAuditTool)(number, toolContext))
+          if (actual.number !== number) throw Error('target validation identity mismatch')
+          checked = cleanStep(actual, root)
+        } catch (error) {
+          if (error instanceof CodexCleanupPendingError || error instanceof CodexUserCancelledError || error instanceof CodexInterruptedError) throw error
+          checked = { ...running, status: 'unavailable', finishedAt: Date.now(),
+            note: auditClean(error instanceof Error ? error.message : 'target validation failed').slice(0, 2000) }
+        }
+      }
+      journal.targetChecks = [...journal.targetChecks.filter(s => s.number !== number), checked]
+      checkpoint()
+      if (!['completed', 'findings'].includes(checked.status)) {
+        preflight[number - 1] = { ...checked, findings: [] }
+        if (number === 1) preflight[10] = { ...checked, number: 11, findings: [],
+          note: '同じE2E実行入口の対象確認に失敗しました。\n' + checked.note }
+      }
+    }
+    const availability = JSON.parse(readFileSync(join(root, 'preflight.json'), 'utf8'))
+    atomicWritePrivateFile(join(root, 'preflight.json'), JSON.stringify({ ...availability, steps: preflight,
+      targetCheckedAt: Date.now() }))
+  }
   if (preflight.some(s => s.status !== 'completed')) {
     const failed = preflight.filter(s => s.status !== 'completed')
+    if (journal.steps.length) {
+      // A resumed audit is already an audit result, not a readiness-only request.
+      // Preserve completed stages and validated partial review caches before cleanup.
+      // Commit finalization intent before touching any stage. A restart midway
+      // must finish the same incomplete report, never send ready or run reviews.
+      journal.blockedPreflight = preflight
+      checkpoint()
+      const blocked = '再開時の利用可能チェックに失敗したため、残りの検査を実行していません。' +
+        failed.map(s => ` ${s.number}: ${s.note.slice(0, 350)}`).join('')
+      for (let number = 1; number <= AUDIT_STEPS.length; number++) {
+        checkAuditInterrupted(options)
+        const previous = journal.steps.find(s => s.number === number)
+        if (previous && previous.status !== 'running') continue
+        const cached = journal.targetChecks?.find(s => s.number === number)
+        const recoveredScanner = [6, 7].includes(number) && cached && cached.status !== 'running' ? cached : undefined
+        const base: AuditStep = recoveredScanner ?? previous ?? cached ?? { number, status: 'unavailable', tool: AUDIT_STEPS[number - 1]!,
+          version: 'not run', scope: 'not run', note: '', findings: [], startedAt: Date.now(), finishedAt: null,
+          exitCode: null, evidenceDigest: null }
+        let retained = base
+        if (previous?.status === 'running' && number <= 4) {
+          retained = await auditCodeReview(number, journal, ctx, async () => { throw Error('readiness failed; missing review was not run') })
+          retained.findings.push(...(cached?.findings ?? []))
+        }
+        const status = number === AUDIT_STEPS.length ? 'completed' : recoveredScanner ? recoveredScanner.status : previous ? 'interrupted'
+          : number > 4 && cached && cached.status !== 'running' ? cached.status : 'unavailable'
+        const step = cleanStep({ ...retained, status, finishedAt: Date.now(), note: retained.note + '\n' + blocked }, root)
+        journal.steps = [...journal.steps.filter(s => s.number !== number), step].sort((a, b) => a.number - b.number)
+        checkpoint()
+      }
+      return finishReport()
+    }
     const path = join(outbox, `利用可能チェック_${date}.md`)
     const blocked = journal.steps.length ? '本検査を再開していません。前回までの検査記録は保持しています。' : '本検査は開始していません。'
     atomicWritePrivateFile(path, auditClean(`# セキュリティ検査の利用可能チェック\n\n${blocked}以下はツールの動作確認であり、対象コードの脆弱性検査結果ではありません。\n\n` +
-      preflight.map(s => `## ${s.number}. ${AUDIT_STEPS[s.number - 1]} — ${s.status}\n\n${s.note}\n`).join('\n')))
+      preflight.map(s => `## ${s.number}. ${AUDIT_STEPS[s.number - 1]} — ${s.status}\n\n${s.note}\n`).join('\n')
+      + (journal.targetChecks?.length ? '\n## 対象コードでの実行確認結果\n\n以下は実対象で取得した結果です。全工程の検査完了を意味しません。\n\n' + renderAuditReport({ ...journal, steps: journal.targetChecks }) : '')))
     journal.availabilityResult = `セキュリティ${AUDIT_STEPS.length}工程の利用可能チェックで、${failed.length}工程に不備がありました。${blocked}\n` +
       failed.map(s => `・${AUDIT_STEPS[s.number - 1]}: ${s.note.slice(0, 350)}`).join('\n') +
       `\n詳細は添付の利用可能チェックをご確認ください。不備を解消後、再度セキュリティチェックを依頼してください。\n<zerokun_files>${JSON.stringify([path])}</zerokun_files>`
@@ -838,11 +958,16 @@ export async function executeSecurityAudit(
   checkAuditInterrupted(options)
   await options.milestone('ready', '全工程の利用可能状態が確認できましたので、これよりセキュリティチェックを開始します。')
   checkAuditInterrupted(options)
-  const toolContext = { ...ctx, source: auditScannerSource(journal, ctx) }
-  checkpoint()
   for (let number = 1; number <= AUDIT_STEPS.length; number++) {
     const previous = journal.steps.find((s) => s.number === number)
     if (previous && previous.status !== 'running') continue
+    const recoveredTarget = journal.targetChecks?.find(s => s.number === number)
+    if (previous && [6, 7].includes(number) && recoveredTarget &&
+      ['completed', 'findings'].includes(recoveredTarget.status)) {
+      Object.assign(previous, recoveredTarget)
+      checkpoint()
+      continue
+    }
     if (previous && number > 4) {
       if (number === 10 && existsSync(join(root, 'stage-10', 'zap'))) {
         await cleanupAuditZap({ ...ctx, root: join(root, 'stage-10') })
@@ -878,12 +1003,13 @@ export async function executeSecurityAudit(
       if (number <= 4) {
         result = await auditCodeReview(number, journal, ctx, options.model)
         if (number === 1) {
-          const alreadyStarted = !!previous && existsSync(join(root, 'stage-1'))
+          const validated = journal.targetChecks?.find(s => s.number === 1)
+          const alreadyStarted = !validated && !!previous && existsSync(join(root, 'stage-1'))
           // stage-1 is created before any E2E action, including legacy versions.
           // A saved running stage with that marker must never replay the E2E.
-          const e2e = alreadyStarted
+          const e2e = validated ?? (alreadyStarted
             ? { ...running, status: 'interrupted' as const, note: 'E2E was previously started; its external actions were not replayed.', version: 'previous attempt', findings: [] }
-            : await (options.tool ?? runAuditTool)(1, toolContext)
+            : await (options.tool ?? runAuditTool)(1, toolContext))
           result = {
             ...result,
             status:
@@ -912,7 +1038,8 @@ export async function executeSecurityAudit(
           note: `検査不能・失敗・中断: ${incomplete.length}工程。修正は未実施。`,
           finishedAt: Date.now(),
         }
-      } else result = await (options.tool ?? runAuditTool)(number, toolContext)
+      } else result = journal.targetChecks?.find(s => s.number === number)
+        ?? await (options.tool ?? runAuditTool)(number, toolContext)
     } catch (error) {
       if (
         error instanceof CodexCleanupPendingError ||
@@ -932,15 +1059,5 @@ export async function executeSecurityAudit(
     journal.steps[number - 1] = cleanStep(stepSchema.parse(result), root)
     checkpoint()
   }
-  const report = renderAuditReport(journal)
-  atomicWritePrivateFile(reportPath, report)
-  journal.reportDigest = createHash('sha256').update(report).digest('hex')
-  const failed = journal.steps.filter(
-    (s) => !['completed', 'findings'].includes(s.status),
-  ).length
-  const findings = journal.steps.reduce((n, s) => n + s.findings.length, 0)
-  journal.result = `セキュリティ検査の全${AUDIT_STEPS.length}工程を処理しました。指摘${findings}件、検査不能・失敗・中断${failed}工程です。コードは修正していません。詳細と検査範囲は添付レポートをご確認ください。修正する場合は、このスレッドで「レポートの内容を修正して」と依頼してください。\n<zerokun_files>${JSON.stringify([reportPath])}</zerokun_files>`
-  checkpoint()
-  cleanupAuditWorkingFiles(root)
-  return { sessionId: journal.sessionId, result: journal.result }
+  return finishReport()
 }

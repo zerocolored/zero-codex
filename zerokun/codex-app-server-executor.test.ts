@@ -1,7 +1,11 @@
+import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
+import { classifyTaskModel } from './task-model-selection.ts'
+import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
 import {
   chmodSync,
@@ -50,6 +54,7 @@ import {
   CodexPublicationPreflightRetryError,
   CodexRateLimitError,
   CodexUserCancelledError,
+  CodexInterruptedError,
   collectHostAdvisorCoverage,
   executeCodexJob,
   type CodexLiveControlHooks,
@@ -312,6 +317,10 @@ import time
 
 catalog_calls = 0
 mode = os.environ.get("ZERO_FIXTURE_MODE", "normal")
+if os.environ.get("ZERO_FIXTURE_STORAGE_FULL_STDERR") == "1":
+    sys.stderr.write("x" * (21 * 1024 * 1024) + "\\n")
+    sys.stderr.write(json.dumps({"type":"zero-app-server-error", "message":"ZERO_STORAGE_FULL"}) + "\\n")
+    sys.stderr.flush()
 if mode in ("interrupt-no-terminal-forced", "late-error-after-complete"):
     signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 if os.environ.get("ZERO_LATE_PARSE_FAILURE") == "1" or os.environ.get("ZERO_NATIVE_DRAIN_STOP_GATE") == "1":
@@ -399,6 +408,11 @@ for line in sys.stdin:
         emit({"id": request_id, "result": {"userAgent": "fixture", "codexHome": "/tmp/codex-home", "platformFamily": "unix", "platformOs": "macos"}})
     elif method == "model/list":
         catalog_calls += 1
+        if os.environ.get("ZERO_CATALOG_CLOSE") == "1" and catalog_calls > 1:
+            break
+        if os.environ.get("ZERO_CATALOG_TRANSIENT") == "1" and catalog_calls == 1:
+            emit({"id": request_id, "error": {"code": -32603, "message": "503 upstream unavailable"}})
+            continue
         catalog_models = ["gpt-6-astra", "gpt-6-sol"]
         if os.environ.get("ZERO_NEW_CATALOG") == "1" and catalog_calls > 1:
             catalog_models.append("gpt-6.1-sol")
@@ -569,9 +583,9 @@ for line in sys.stdin:
             emit_batch([
                 {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": proposal}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "inProgress", "itemsView": "full", "items": []}}},
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "summary" if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else "full", "items": [] if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else [{"type": "agentMessage", "text": "承認待ちです"}], "error": None}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "completed", "itemsView": "summary" if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else "full", "items": [] if os.environ.get("ZERO_PROPOSAL_TOOL_ONLY") else [{"type": "agentMessage", "text": os.environ.get("ZERO_SECOND_ANSWER", "承認待ちです")}], "error": None}}},
                 {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "inProgress", "itemsView": "full", "items": []}}},
-                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "保持して待機しました"}], "error": None}}},
+                {"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-last", "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": os.environ.get("ZERO_LAST_ANSWER", "保持して待機しました")}], "error": None}}},
             ])
         elif mode in ("goal-native", "goal-native-capacity", "late-command-completion"):
             emit_batch([
@@ -585,6 +599,8 @@ for line in sys.stdin:
                 emit({"method": "item/completed", "params": {"threadId": thread_id, "turnId": turn_id, "item": {"type": late_item_type, "id": "background-command", "command": "fixture-only", "server": "zerokun_github", "tool": "github_wait_delivery", "status": "completed", "exitCode": 0}}})
             if mode == "goal-native-capacity":
                 failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None}
+                if os.environ.get("ZERO_GENERIC_429") == "1":
+                    failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
                 items = [{"type": "commandExecution", "id": "native-write", "command": "fixture-only", "status": "completed", "exitCode": 0}]
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": "native-next", "status": "failed", "itemsView": "full", "items": items, "error": failure}}})
             else:
@@ -786,6 +802,8 @@ for line in sys.stdin:
                 with open(capacity_state, "w", encoding="utf-8") as stream:
                     stream.write(stage)
                 failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+                if os.environ.get("ZERO_GENERIC_429") == "1":
+                    failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
                 items = []
                 if stage == "implementation":
                     command = {"type": "commandExecution", "id": "capacity-partial-command", "command": "echo changed", "status": "completed", "exitCode": 0}
@@ -849,12 +867,14 @@ for line in sys.stdin:
                 emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
                 emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [{"type": "commandExecution", "id": "already-done", "command": "echo completed", "status": "completed", "exitCode": 0}], "error": failure}}})
         elif mode in ("rate-error", "rate-terminal-only"):
-            failure = {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
+            failure = {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}
             if mode != "rate-terminal-only":
                 emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": False, "error": failure}})
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": [], "error": failure}}})
         elif mode in ("capacity-error", "capacity-after-command", "capacity-error-generic-terminal", "capacity-started-command"):
             failure = {"message": "Selected model is at capacity. Please try a different model.", "codexErrorInfo": None, "additionalDetails": None}
+            if os.environ.get("ZERO_GENERIC_429") == "1":
+                failure = {"message": "exceeded retry limit, last status: 429 Too Many Requests", "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "additionalDetails": None}
             items = [] if mode == "capacity-error" else [{"type": "commandExecution", "id": "capacity-command", "command": "echo changed", "status": "completed", "exitCode": 0}]
             if mode in ("capacity-error-generic-terminal", "capacity-started-command"):
                 items = []
@@ -864,8 +884,8 @@ for line in sys.stdin:
             terminal_failure = {"message": "turn failed", "codexErrorInfo": None, "additionalDetails": None} if mode in ("capacity-error-generic-terminal", "capacity-started-command") else failure
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "failed", "itemsView": "full", "items": items, "error": terminal_failure}}})
         elif mode in ("rate-retrying", "rate-retrying-two-turn"):
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
-            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": "rate limit 429", "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
+            emit({"method": "error", "params": {"threadId": thread_id, "turnId": turn_id, "willRetry": True, "error": {"message": ("429 Too Many Requests" if os.environ.get("ZERO_GENERIC_429") == "1" else "usage limit reached (429)"), "codexErrorInfo": {"retry_after": 1}, "additionalDetails": None}}})
             answer = "内部retry後に完了" if mode == "rate-retrying" else "内部retry後に完了-" + str(turn_count)
             emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": answer}], "error": None}}})
         elif mode == "error-steer":
@@ -1412,7 +1432,7 @@ function fixture(
     ),
     finishTurn: ({
       executorNonce, threadId, turnId, retainInput, rateLimitResumeAt,
-      rateLimitReason, rateLimitSafeToReplay,
+      rateLimitReason, rateLimitSafeToReplay, rateLimitRetryCount,
     }) => store.finishAppServerTurn({
       jobId: job.id,
       epoch: job.controlEpoch,
@@ -1423,6 +1443,7 @@ function fixture(
       rateLimitResumeAt,
       rateLimitReason,
       rateLimitSafeToReplay,
+      rateLimitRetryCount,
     }),
     recordRateLimit: ({ executorNonce, threadId, turnId, resumeAt }) => (
       store.recordAppServerRateLimit({
@@ -2485,6 +2506,209 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('言い換え3回答を配送前に1回だけ統合しnative Goalの3turnを変更しない', async () => {
+    const value = fixture('goal-answer', true, 'Global OAuthがよいですか？')
+    const rpcLog = join(value.root, 'consolidation-rpc.log')
+    let edits = 0
+    const messages = [
+      'Global OAuthをおすすめします。顧客のシークレット入力が不要です。方式の違いも説明します。',
+      '私の推奨はGlobal OAuthです。準備はアカウント作成、申請、承認後の設定の順です。',
+      'Global OAuthがよいです。訂正: 単一顧客から始めても社内利用とは限りません。方針確認待ちです。',
+    ]
+    const merged = 'Global OAuthをおすすめします。顧客のシークレット入力が不要です。\n\n準備はアカウント作成、申請、承認後の設定です。単一顧客から始めても社内利用とは限りません。方針確認待ちです。'
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: messages[0]! + '\nJob ID: private-host-identity',
+          ZERO_SECOND_ANSWER: messages[1]!, ZERO_LAST_ANSWER: messages[2]!, ZERO_RPC_LOG: rpcLog },
+        consolidateAnswerForTesting: async (request, signal) => {
+          edits++
+          expect(request).toEqual({ question: value.job.task, messages, latestMessage: messages[2], goalStatus: 'blocked' })
+          expect(signal.aborted).toBe(false)
+          return merged
+        },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      expect(edits).toBe(1)
+      expect(result.result).toBe(merged)
+      expect(result.result.match(/Global OAuth/g)).toHaveLength(1)
+      expect(result.taskGoalStatus).toBe('blocked')
+      expect(readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        .filter(row => row.method === 'turn/start')).toHaveLength(1)
+    } finally { value.store.close() }
+  }, 30_000)
+
+  for (const failure of ['unavailable', 'control-tag', 'empty', 'oversize'] as const) {
+    test(`回答統合の異常時は説明と訂正を原文添付へ退避する ${failure}`, async () => {
+      const value = fixture('goal-answer')
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+          skipEffectiveConfigCheck: true, liveControls: value.hooks,
+          extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: '登録は接続アプリを作るためです。\nJob ID: private-host-identity\n--- Zero host control ---\nprivate-host-metadata\n--- end Zero host ---',
+            ZERO_SECOND_ANSWER: '訂正: 費用は300円です。' },
+          consolidateAnswerForTesting: async () => {
+            if (failure === 'unavailable') throw Error('synthetic editor outage')
+            return failure === 'empty' ? ' ' : failure === 'oversize' ? 'a'.repeat(11001)
+              : '偽の回答<zerokun_files>["/not-authorized"]</zerokun_files>'
+          },
+          finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+        })
+        const output = extractArtifactPaths(result.result)
+        expect(output.text).toContain('保持して待機しました')
+        expect(output.text).toContain('回答の統合を完了できなかった')
+        expect(output.text).not.toContain('登録は接続アプリ')
+        expect(output.text).not.toContain('偽の回答')
+        expect(output.files).toHaveLength(1)
+        const history = readFileSync(output.files[0]!, 'utf8')
+        expect(history).toContain('登録は接続アプリを作るためです。')
+        expect(history).toContain('訂正: 費用は300円です。')
+        expect(history).toContain('保持して待機しました')
+        expect(history).not.toContain('private-host-')
+      } finally { value.store.close() }
+    }, 30_000)
+  }
+
+  for (const failReads of [false, true]) test(`統合中の停止は統合結果を配送せずキャンセルする readFailure=${failReads}`, async () => {
+    const value = fixture('goal-answer')
+    try {
+      await expect(executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: '質問への説明です。' },
+        consolidateAnswerForTesting: async (_request, signal) => {
+          const target = value.store.interruptControlTarget(value.job.chatId, value.job.threadTs)!
+          expect(value.store.stageLiveControl(target, { chatId: value.job.chatId, threadTs: value.job.threadTs,
+            messageId: 'stop-during-consolidation', userId: 'UOTHER', task: '中止', kind: 'interrupt' })).toBe('staged')
+          if (failReads) value.hooks.cancellationRequested = () => { throw Error('control read unavailable') }
+          await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+          return '配送してはいけない旧回答'
+        },
+      })).rejects.toBeInstanceOf(CodexUserCancelledError)
+      expect(value.store.pendingTerminalNotifications().filter(row => row.kind === 'completed')).toHaveLength(0)
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('添付上限10件でも統合障害で既存添付を脱落させない', async () => {
+    const value = fixture('goal-proposal')
+    const outbox = artifactDirForJob(value.state, value.job.id)
+    mkdirSync(outbox, { recursive: true, mode: 0o700 })
+    const paths = Array.from({length:10}, (_, i) => join(outbox, `proposal-${i}.txt`))
+    for (const path of paths) writeFileSync(path, path.split('/').at(-1)!)
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE:'goal-proposal', ZERO_PROPOSAL_FILES:JSON.stringify(paths) },
+        consolidateAnswerForTesting: async () => { throw Error('editor outage') },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      const output = extractArtifactPaths(result.result)
+      expect(output.text).toContain('以下に生成順の回答記録')
+      expect(output.text).toContain('この方向で本実装してよいですか')
+      expect(output.text).toContain('保持して待機しました')
+      expect(output.files).toHaveLength(10)
+      expect(output.files.map(path => readFileSync(path,'utf8')).sort())
+        .toEqual(paths.map(path => path.split('/').at(-1)!).sort())
+    } finally { value.store.close() }
+  }, 30_000)
+
+  for (const mode of ['host-abort', 'history-write-failure', 'poll-read-failure', 'poll-read-failure-repeated'] as const) {
+    test(`統合の後処理障害でも完了済み回答を失敗にしない ${mode}`, async () => {
+      const value = fixture('goal-answer')
+      const controller = new AbortController()
+      let coverageReads = 0
+      try {
+        const result = await executeCodexJob(value.job, {
+          codexBinForTesting:value.executable, logDir:value.logDir, stateDir:value.state,
+          skipEffectiveConfigCheck:true, liveControls:value.hooks, signal:controller.signal,
+          ...(mode === 'host-abort' ? { readNativeAdvisorCoverageForTesting: async (method: string) => {
+            coverageReads++
+            expect(method).toBe('thread/list')
+            expect(controller.signal.aborted).toBe(true)
+            throw new CodexInterruptedError('coverage stopped after primary completion')
+          } } : {}),
+          extraEnvironment:{ZERO_FIXTURE_MODE:'goal-answer',ZERO_QUESTION_ANSWER:'質問に対する重要な説明です。'},
+          consolidateAnswerForTesting: async (_request, signal) => {
+            if (mode === 'host-abort') controller.abort()
+            if (mode === 'history-write-failure') {
+              const outbox = artifactDirForJob(value.state, value.job.id)
+              rmSync(outbox, {recursive:true,force:true})
+              writeFileSync(outbox,'cannot write history under a regular file')
+              throw Error('editor unavailable')
+            }
+            if (mode === 'poll-read-failure' || mode === 'poll-read-failure-repeated') {
+              const original = value.hooks.cancellationRequested
+              let calls = 0
+              value.hooks.cancellationRequested = () => {
+                if (++calls === 1 || mode === 'poll-read-failure-repeated') throw Error('synthetic state read failure')
+                return original()
+              }
+            }
+            if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), {once:true}))
+            throw new DOMException('editor stopped','AbortError')
+          },
+          finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+        })
+        expect(result.taskGoalStatus).toBe('blocked')
+        if (mode === 'host-abort') expect(coverageReads).toBe(1)
+        const output=extractArtifactPaths(result.result)
+        expect(output.text).toContain('回答の統合を完了でき')
+        expect(output.text).toContain('保持して待機しました')
+        if(mode==='history-write-failure') {
+          expect(output.files).toHaveLength(0)
+          expect(output.text).toContain('質問に対する重要な説明です。')
+        } else {
+          expect(output.files).toHaveLength(1)
+          expect(readFileSync(output.files[0]!,'utf8')).toContain('質問に対する重要な説明です。')
+        }
+      } finally {value.store.close()}
+    },30000)
+  }
+
+  test('回答が1件なら編集モデルを呼ばない', async () => {
+    const value = fixture('goal-blocked')
+    try {
+      let calls = 0
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE:'goal-blocked' },
+        consolidateAnswerForTesting: async () => { calls++; throw Error('must not call') },
+      })
+      expect(calls).toBe(0)
+      expect(result.result).toBe('判断を待っています')
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('統合中に変更された提案添付と旧提案本文を復活させない', async () => {
+    const value = fixture('goal-proposal')
+    const outbox = artifactDirForJob(value.state, value.job.id)
+    mkdirSync(outbox, { recursive: true, mode: 0o700 })
+    const path = join(outbox, 'proposal.txt')
+    writeFileSync(path, 'original')
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-proposal', ZERO_PROPOSAL_FILES: JSON.stringify([path]) },
+        consolidateAnswerForTesting: async request => {
+          expect(request.messages[0]).toContain('この方向で本実装してよいですか')
+          expect(request.latestMessage).toBe('保持して待機しました')
+          expect(request.messages.join('')).not.toContain('zerokun_files')
+          writeFileSync(path, 'changed during editing')
+          return '旧提案を復活させる不正な統合結果'
+        },
+        finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
+      })
+      const output = extractArtifactPaths(result.result)
+      expect(output.text).not.toContain('旧提案')
+      expect(output.files).toHaveLength(1)
+      expect(readFileSync(output.files[0]!, 'utf8')).not.toContain('比較案です')
+    } finally { value.store.close() }
+  }, 30_000)
+
   for (const goalStatus of ['blocked', 'paused', 'complete'] as const) {
     test(`質問回答後2回native継続しても今回の説明をSlackへ一度だけ配送する ${goalStatus}`, async () => {
       for (const [index, answer] of [
@@ -2499,6 +2723,7 @@ describe('production App Server executor', () => {
           const job = { ...value.job, sessionId: 'thread-app-server-1', resumed: true }
           const result = await executeCodexJob(job, {
             codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+            consolidateAnswerForTesting: async request => `${request.messages[0]}\n\n${request.latestMessage}`,
             skipEffectiveConfigCheck: true,
             liveControls: { ...value.hooks, recordGoalStatus: status => statuses.push(status) },
             extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-answer', ZERO_QUESTION_ANSWER: answer,
@@ -2549,6 +2774,7 @@ describe('production App Server executor', () => {
       const result = await executeCodexJob(value.job, {
         codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
         skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        consolidateAnswerForTesting: async request => `${request.messages[0]}\n\n${request.latestMessage}`,
         extraEnvironment: { ZERO_FIXTURE_MODE: 'goal-proposal', ZERO_PROPOSAL_FILES: JSON.stringify(files),
           ZERO_PROPOSAL_GOAL: goalStatus, ...(goalStatus === 'paused' ? { ZERO_PROPOSAL_TOOL_ONLY: '1' } : {}) },
         finalizeSuccessfulResult: execution => finalizeSuccessfulExecution(value.job, execution, value.state),
@@ -2773,11 +2999,61 @@ describe('production App Server executor', () => {
       })
       expect(result.sessionId).toBe(shouldResume ? 'thread-existing' : 'thread-app-server-1')
       const prompt = (JSON.parse(readFileSync(promptLog, 'utf8').trim()) as { text: string }).text
-      expect(prompt.includes('Prior Slack thread history')).toBe(!shouldResume)
-      expect(prompt.includes('再利用する論理履歴')).toBe(!shouldResume)
+      expect(prompt).toContain('Prior Slack thread history')
+      expect(prompt).toContain('再利用する論理履歴')
       value.store.close()
     }, 30_000)
   }
+
+  test.each([
+    { write: false, phased: false },
+    { write: true, phased: false },
+    { write: true, phased: true },
+  ])('pre-dispatch failure reaches the next native continuation: %j', async ({ write, phased }) => {
+    const value = fixture('normal', write, '前の調査')
+    const promptLog = join(value.root, 'undelivered-history.jsonl')
+    try {
+      completeFixtureJob(value.store, value.job, 'thread-app-server-1', '前の調査は完了済み')
+      const enqueue = (messageId: string, task: string) => value.store.enqueue({
+        chatId: value.job.chatId, threadTs: value.job.threadTs,
+        repoPath: value.repo, userId: 'UROOT', writeEnabled: write, messageId, task,
+      })
+      const undeliveredTask = '原文パネルを開いたらFAQ領域を縮め、閉じるボタンのホバーを直して'
+      enqueue('1800000000.000200', undeliveredTask)
+      const failed = value.store.claimNext('serial-worker')!
+      expect(failed.resumed).toBe(true)
+      const db = new Database(join(value.state, 'jobs.sqlite3'), { readonly: true })
+      try {
+        expect(db.query('SELECT status, dispatched_at FROM job_initial_dispatches WHERE job_id = ?')
+          .get(failed.id)).toEqual({ status: 'prepared', dispatched_at: null })
+      } finally { db.close() }
+      value.store.fail(failed.id, 'configuration failed before dispatch')
+      enqueue('1800000000.000300', '続けて')
+      Object.assign(value.job, value.store.claimNext('serial-worker')!)
+      expect(value.job).toMatchObject({ resumed: true, sessionId: 'thread-app-server-1' })
+      await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        threadHistory: value.store.threadHistorySnapshot(value.job.id),
+        ...(phased ? { phaseGateForTesting: {} } : {}),
+        extraEnvironment: { ZERO_FIXTURE_MODE: phased ? 'phased' : 'normal', ZERO_PROMPT_LOG: promptLog },
+      })
+      const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { stage: string; text: string })
+      expect(prompts.map(prompt => prompt.stage))
+        .toEqual(phased ? ['prepare', 'implementation', 'review'] : ['complete'])
+      const first = prompts[0]!.text
+      expect(first).toContain(undeliveredTask)
+      expect(first).toContain('prior job did not complete')
+      expect(first).toContain('前の調査は完了済み')
+      expect(first).toContain('Do not replay completed work')
+      expect(first).toContain('Respect later corrections, cancellations, and the current request')
+      expect(first.lastIndexOf('続けて')).toBeGreaterThan(first.indexOf(undeliveredTask))
+      if (!write) expect(first).toContain('Access mode: read-only.')
+      expect(prompts.slice(1).every(prompt => !prompt.text.includes('Prior Slack thread history')))
+        .toBe(true)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test.each([false, true])('semantic selection reaches start/resume and turns (resume=%s)', async resume => {
     const value = fixture('normal', true)
@@ -2801,6 +3077,100 @@ describe('production App Server executor', () => {
     expect(rpc.filter(row=>row.method==='turn/start').every(row=>row.model==='gpt-6-sol' && row.effort==='medium')).toBe(true)
     value.store.close()
   }, 30_000)
+
+  test.each([false,true])('model check runtime recovery executes the unchanged input once (write=%s)',async write=>{
+    const value=fixture('normal',write,'この処理を直して');const rpcLog=join(value.root,'model-retry.jsonl');let calls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        selectModel:async(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,async()=>{
+          calls++;if(calls<3)throw new ModelSelectionRuntimeError(calls===1?'transport':'invalid-output');
+          return {decision:'none',model:null,evidence:'',continuation:false};
+        }),
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      });
+      expect(result.result).toBe('通常完了');expect(calls).toBe(3);
+      const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(1);
+      expect(rpc.filter(row=>row.method==='thread/start')).toHaveLength(1);
+      expect(value.store.taskModels().latest(value.job.id)).toBe('gpt-6-astra');
+    } finally {value.store.close();}
+  },30000);
+
+  test('catalog transport failure retries before any primary dispatch',async()=>{
+    const value=fixture('normal',true);let calls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        selectModel:async()=>{calls++;return 'gpt-6-sol'},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_CATALOG_TRANSIENT:'1'},
+      });expect(result.result).toBe('通常完了');expect(calls).toBe(1);
+    } finally {value.store.close();}
+  },30000);
+
+  test.each(['invalid-output','unclassified'] as const)('model check repeated %s exhausts instead of requeueing forever',async reason=>{
+    const value=fixture('normal',true);let calls=0;
+    try {
+      let observed:unknown;
+      try {await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>true,selectModel:async()=>{calls++;throw new ModelSelectionRuntimeError(reason)},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal'},
+      });}catch(error){observed=error;}
+      expect(observed).toBeInstanceOf(ModelSelectionRuntimeError);
+      expect(observed).toMatchObject({reason,retryable:false,exhausted:true});expect(calls).toBe(3);
+    } finally {value.store.close();}
+  },30000);
+
+  test('model check outage releases a safely deferrable executor after three tries',async()=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'defer-model.jsonl');let calls=0;
+    try {
+      await expect(executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>true,selectModel:async()=>{calls++;throw new ModelSelectionRuntimeError('transport')},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      })).rejects.toBeInstanceOf(ModelSelectionRuntimeError);
+      expect(calls).toBe(3);expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('');
+    } finally {value.store.close();}
+  },30000);
+
+  test('the incident acknowledgement dispatches without a model classifier process',async()=>{
+    const value=fixture('normal',true,'よい');let classifierCalls=0;
+    try {
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,
+        selectModel:(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,
+          (text,models,previous,abort)=>classifyTaskModel(text,models,previous,abort,async()=>{classifierCalls++;throw Error('offline')})),
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal'},
+      });
+      expect(result.result).toBe('通常完了');expect(classifierCalls).toBe(0);
+    } finally {value.store.close();}
+  },30000);
+
+  test.each(['cancel','abort','permanent'] as const)('model check recovery respects %s before primary dispatch',async kind=>{
+    const value=fixture('normal',true),rpcLog=join(value.root,'model-abort.jsonl');let calls=0,cancelled=false;
+    const controller=new AbortController();const hooks={...value.hooks,cancellationRequested:()=>cancelled};
+    try {
+      const execution=executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:hooks,signal:controller.signal,transientRetryDelayMsForTesting:50,
+        selectModel:async()=>{
+          calls++;if(kind==='cancel')cancelled=true;else if(kind==='abort')controller.abort();
+          throw new ModelSelectionRuntimeError(kind==='permanent'?'authentication':'transport');
+        },
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      });
+      if(kind==='cancel')await expect(execution).rejects.toBeInstanceOf(CodexUserCancelledError);
+      else if(kind==='abort')await expect(execution).rejects.toBeInstanceOf(CodexInterruptedError);
+      else await expect(execution).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:authentication');
+      expect(calls).toBe(1);expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('');
+    } finally {value.store.close();}
+  },30000);
 
   test('unavailable semantic selection cannot dispatch a primary thread or fall back', async () => {
     const value=fixture('normal',true), rpcLog=join(value.root,'unavailable-model.jsonl')
@@ -5825,6 +6195,24 @@ describe('production App Server executor', () => {
     value.store.close()
   })
 
+  test('model check leaves a dead active session instead of retrying it forever',async()=>{
+    const value=fixture('defer'),rpcLog=join(value.root,'dead-model-catalog.jsonl');let calls=0;
+    const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
+    try {
+      await expect(executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,signal:controller.signal,transientRetryDelayMsForTesting:1,
+        canDeferModelSelection:()=>value.store.initialTurnDispatchIsSafeToRetry(value.job.id),
+        selectModel:async()=>{calls++;return 'gpt-6-astra'},
+        extraEnvironment:{ZERO_FIXTURE_MODE:'defer',ZERO_CATALOG_CLOSE:'1',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1'},
+      })).rejects.toThrow('ZERO_INPUT_CHECK_RUNTIME:runtime');
+      expect(calls).toBe(1);
+      const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(1);
+      expect(rpc.filter(row=>row.method==='turn/steer')).toHaveLength(0);
+    } finally {clearTimeout(timer);value.store.close();}
+  },15000);
+
   test('model change interrupts the old turn and dispatches the input once under Sol', async () => {
     const value=fixture('defer'), rpcLog=join(value.root,'model-switch.jsonl')
 
@@ -6944,6 +7332,29 @@ describe('production App Server executor', () => {
     } finally { value.store.close() }
   }, 15_000)
 
+  test('storage cause survives stderr prefix saturation through the real executor relay', async () => {
+    const value = fixture('normal')
+    let failure: unknown
+    try {
+      await executeCodexJob(value.job, {
+        codexBinForTesting:value.executable, logDir:value.logDir, stateDir:value.state,
+        skipEffectiveConfigCheck:true,
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal', ZERO_FIXTURE_STORAGE_FULL_STDERR:'1',
+          ZEROKUN_SUPERVISOR_TEST_FORCE_RETAIN_AFTER_CHILD_EXIT:'1'},
+        supervisorCleanupGraceMs:50, liveControls:value.hooks,
+      })
+    } catch (error) { failure = error }
+    try {
+      expect(failure).toBeInstanceOf(CodexCleanupPendingError)
+      expect(isStorageFailure(failure)).toBe(true)
+      const stderr = readFileSync(join(value.logDir, `${value.job.id}.new.stderr.log`), 'utf8')
+      expect(stderr.length).toBeGreaterThan(20 * 1024 * 1024)
+      expect(stderr.length).toBeLessThan(20 * 1024 * 1024 + 1024)
+      expect(stderr.slice(-1024)).toContain(STORAGE_FAILURE)
+      expect(retainedStorageFailure(value.state, value.job)).toBe(STORAGE_FAILURE)
+    } finally { value.store.close() }
+  }, 15_000)
+
   test('supervisor retained-stateは内部通知からbounded recoveryへ入りFIFOを無音停止しない', async () => {
     const value = fixture('normal')
     const processIds: number[] = []
@@ -7551,6 +7962,97 @@ describe('production App Server executor', () => {
     ])
     value.store.close()
   })
+
+  test('native generic429 willRetry remains the same turn and never triggers cloud quota', async () => {
+    const value = fixture('rate-retrying')
+    let waits = 0
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'rate-retrying', ZERO_GENERIC_429: '1' },
+        parkOnUsageLimit: true, liveControls: value.hooks,
+        onCloudQuotaDetected: () => { throw new Error('generic429 is not quota') },
+        onRateLimitWait: () => { waits += 1; return true },
+      })
+      expect(result.result).toBe('内部retry後に完了')
+      expect(waits).toBe(1)
+      expect(value.store.get(value.job.id)?.rateLimitRecovery).toBeNull()
+    } finally { value.store.close() }
+  }, 30_000)
+
+  test('incident transport 429 retains partial work, durable backoff and avoids cloud quota/notice loops', async () => {
+    const value = fixture('capacity-after-command', true)
+    let quotaCalls = 0
+    try {
+      for (const [index, delay] of [30_000, 60_000, 120_000, 300_000, 300_000].entries()) {
+        const before = Date.now()
+        let caught: unknown
+        try {
+          await executeCodexJob(value.job, {
+            codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+            skipEffectiveConfigCheck: true,
+            extraEnvironment: { ZERO_FIXTURE_MODE: 'capacity-after-command', ZERO_GENERIC_429: '1' },
+            parkOnUsageLimit: true, onCloudQuotaDetected: () => { quotaCalls += 1 },
+            liveControls: value.hooks,
+          })
+        } catch (error) { caught = error }
+        expect(caught).toBeInstanceOf(CodexRateLimitError)
+        const error = caught as CodexRateLimitError
+        expect(error.reason).toBe('throttled')
+        expect(error.safeToRetryAfterDelivery).toBe(false)
+        expect(error.resetsAtMs - before).toBeGreaterThanOrEqual(delay)
+        expect(error.resetsAtMs - Date.now()).toBeLessThanOrEqual(delay)
+        value.store.requeueAt(value.job.id, error.resetsAtMs, error.message, error.sessionId, error.reason)
+        const queued = value.store.get(value.job.id)!
+        expect(queued.rateLimitRecovery).toMatchObject({ version: 2, reason: 'throttled', safeToReplay: false, resumeAt: error.resetsAtMs })
+        expect(queued.transientRateLimitCount).toBe(Math.min(4, index + 1))
+        // Reopening the database must not lose the backoff or reinterpret the v2 receipt.
+        const reopened = new JobStore(value.store.dbPath)
+        expect(reopened.get(value.job.id)?.rateLimitRecovery).toEqual(queued.rateLimitRecovery)
+        expect(reopened.get(value.job.id)?.transientRateLimitCount).toBe(Math.min(4, index + 1))
+        reopened.close()
+        const notices = value.store.pendingStatusNotifications().filter(row => row.kind === 'rate-limited')
+        expect(notices).toHaveLength(index === 0 ? 1 : 0)
+        for (const notice of notices) {
+          expect(notice.payload).toContain('一時的にリクエストが制限')
+          expect(notice.payload).not.toContain('使用量上限')
+          value.store.markStatusNotificationDelivered(notice.id)
+        }
+        if (index < 4) Object.assign(value.job, value.store.claimNext('throttle-retry-worker', 20, queued.notBefore! + 1)!)
+      }
+      expect(quotaCalls).toBe(0)
+    } finally { value.store.close() }
+  }, 60_000)
+
+  test('phased incident 429 continues review without repeating implementation or parking cloud quota', async () => {
+    const value = fixture('phased-capacity-review-once', true)
+    const phaseLog = join(value.root, 'throttle-phase.log')
+    const commentary: string[] = []
+    const staged: string[] = []
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, phaseGateForTesting: {}, transientRetryDelayMsForTesting: 1,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'phased-capacity-review-once', ZERO_GENERIC_429: '1',
+          ZERO_PHASE_LOG: phaseLog, ZERO_CAPACITY_FIXTURE_STATE: join(value.root, 'throttle-state') },
+        parkOnUsageLimit: true, onCloudQuotaDetected: () => { throw new Error('generic429 must not park quota') },
+        onCommentaryMessage: event => {
+          commentary.push(event.text)
+          if (event.text.includes('一時的にリクエストが制限')) {
+            staged.push(value.store.stageCommentaryNotification(value.job.id, value.job.attempts,
+              event.sourceKey, `💬 ${event.text}`))
+          }
+        }, liveControls: value.hooks,
+      })
+      expect(result.result).toBe('公開できます')
+      expect(readFileSync(phaseLog, 'utf8').trim().split('\n').map(line => line.split('\t')[0]))
+        .toEqual(['prepare', 'implementation', 'review', 'review'])
+      expect(commentary.filter(text => text.includes('一時的にリクエストが制限'))).toHaveLength(1)
+      expect(staged).toEqual(['staged'])
+      expect(value.store.get(value.job.id)?.transientRateLimitCount).toBe(0)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test('model capacity terminalは副作用のないfull turnだけ同じsessionで再開可能にする', async () => {
     for (const [mode, safe] of [

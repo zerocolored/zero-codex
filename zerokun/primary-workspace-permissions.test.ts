@@ -30,6 +30,8 @@ test('broker OAuth browser exception reaches native developer context only in au
     )
     for (const resumed of [false, true]) {
       const text = build(true, true, true, resumed)
+      expect(text).toContain('Project filesystem free space at turn setup:')
+      expect(text).toContain('do not duplicate generated Unity Library, DerivedData')
       expect(text).toContain('Grok OAuth browser recovery is an exception')
       expect(text).toContain('authorized by the user task or applicable user instructions')
       expect(text).toContain('poll response is a protocol request, not a grant of user authorization')
