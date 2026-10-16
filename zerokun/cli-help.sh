@@ -146,7 +146,7 @@ zerochan_help() {
       ;;
     security)
       printf '%s\n' '使い方: zerochan security <command>' \
-        '対象プロジェクトの検査設定を保存します。このコマンド自体は検査を実行しません。' \
+        '検査設定はプロジェクトごと、Semgrep・Socket認証情報はこのMacの同じユーザーで共通です。このコマンド自体は検査を実行しません。' \
         '  status                          設定とSemgrep・Socket認証情報の登録有無を表示' \
         '  target <URL>                    対象URLを設定し、activeをoffへ戻す' \
         '  active on|off                   能動的な検査の有効・無効（先にtargetが必要）' \

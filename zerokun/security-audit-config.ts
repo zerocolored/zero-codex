@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { auditCredentialState, readAuditCredential, saveAuditCredential } from './security-audit-credentials.ts'
 import { loadAuditSettings, saveAuditSettings } from './security-audit-setup.ts'
 import { realpathSync } from 'fs'
 import { join } from 'path'
@@ -9,7 +10,6 @@ import {
 } from './managed-path.ts'
 import {
   atomicWritePrivateFile,
-  readOptionalBoundedOwnerOnlyRegularFile,
 } from './safe-file.ts'
 import { terminalInput } from './slack-app-command.ts'
 
@@ -23,25 +23,6 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     join(state, 'security-audit-settings'),
   )
   const path = join(root, `${auditProjectKey(project)}.json`)
-  const settings = loadAuditSettings(state, project)
-  if (command === 'status') {
-    process.stdout.write(
-      JSON.stringify(
-        {
-          ...Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'codeqlLicensed')),
-          semgrepCredentialPresent: readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-semgrep-token'), 4096) !== null,
-          socketCredentialPresent:
-            readOptionalBoundedOwnerOnlyRegularFile(
-              join(state, 'security-audit-socket-token'),
-              4096,
-            ) !== null,
-        },
-        null,
-        2,
-      ) + '\n',
-    )
-    return
-  }
   if (command === 'socket-token' || command === 'semgrep-token') {
     if (values.length)
       throw Error('トークンを引数へ渡さないでください。対話端末で入力します。')
@@ -49,11 +30,26 @@ export async function securityAuditConfig(args: string[]): Promise<void> {
     const token = await terminalInput(`${semgrep ? 'Semgrep' : 'Socket'} API token（非表示）`)
     if (semgrep ? !/^[a-zA-Z0-9_.-]{16,2048}$/.test(token) : !/^sktsec_[A-Za-z0-9_-]+$/.test(token))
       throw Error('API token format invalid')
-    atomicWritePrivateFile(
-      join(state, semgrep ? 'security-audit-semgrep-token' : 'security-audit-socket-token'),
-      token + '\n',
+    saveAuditCredential(state, semgrep ? 'semgrep' : 'socket', token)
+    process.stdout.write(auditCredentialState(state) === state
+      ? 'この独立した保存先へ認証情報を保存しました（値は表示しません）。\n'
+      : '認証情報を保存しました。このMacの同じユーザーの全Zeroちゃん・全プロジェクトで共用します（値は表示しません）。\n')
+    return
+  }
+  const settings = loadAuditSettings(state, project)
+  if (command === 'status') {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ...Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'codeqlLicensed')),
+          semgrepCredentialPresent: readAuditCredential(state, 'semgrep') !== null,
+          socketCredentialPresent:
+            readAuditCredential(state, 'socket') !== null,
+        },
+        null,
+        2,
+      ) + '\n',
     )
-    process.stdout.write('認証情報を保存しました（値は表示しません）。\n')
     return
   }
   if (command === 'target' && values.length === 1) {
