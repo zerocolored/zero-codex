@@ -3,6 +3,7 @@ import { Database } from 'bun:sqlite'
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -511,9 +512,24 @@ describe('zerochan service control state', () => {
     expect(serviceControlPauseAcknowledged(state, request)).toBe(false)
     expect(acknowledgeServiceControlPauseIfRequested(state)).toBe(true)
     expect(serviceControlPauseAcknowledged(state, request)).toBe(true)
+    const ackPath = join(state, 'service-control-pause-ack.json')
+    const published = lstatSync(ackPath, { bigint: true })
+    const content = readFileSync(ackPath, 'utf8')
+    // Polling the same pause must leave the published inode stable while the
+    // controller reads it, rather than repeatedly replacing its open file.
+    for (let poll = 0; poll < 100; poll++) {
+      expect(acknowledgeServiceControlPauseIfRequested(state)).toBe(true)
+      expect(lstatSync(ackPath, { bigint: true }).ino).toBe(published.ino)
+    }
+    expect(readFileSync(ackPath, 'utf8')).toBe(content)
     clearServiceControlPauseRequest(state, request)
     expect(existsSync(join(state, 'service-control-pause-request.json'))).toBe(false)
     expect(existsSync(join(state, 'service-control-pause-ack.json'))).toBe(false)
+    const nextRequest = createServiceControlPauseRequest(state, process.pid)
+    expect(acknowledgeServiceControlPauseIfRequested(state)).toBe(true)
+    expect(serviceControlPauseAcknowledged(state, request)).toBe(false)
+    expect(serviceControlPauseAcknowledged(state, nextRequest)).toBe(true)
+    clearServiceControlPauseRequest(state, nextRequest)
   })
 
   test('意図的停止markerはstrict形式で設定・解除する', () => {
