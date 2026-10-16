@@ -1,3 +1,4 @@
+import { AuditCredentialConflictError, auditCommonSchema, auditCredentialState, readAuditCredential } from './security-audit-credentials.ts'
 import { createHash } from 'crypto'
 import { lstatSync, readFileSync } from 'fs'
 import { join, resolve, relative, dirname } from 'path'
@@ -56,20 +57,16 @@ export function discoverAuditE2E(repo: string): { e2e?: AuditE2E; port?: number;
   return {note: rootConfigs.length > 1 ? 'ルートに複数のE2E設定があり実行入口を確定できません。'
     : '対象プロジェクトのE2E実行入口がありません。配下の別サービスの設定では代用しません。'}
 }
-const commonSchema = z.object({
-  socketOrg: z.string().regex(/^[a-zA-Z0-9_-]+$/).optional(),
-  socketCredentialDigest: z.string().optional(),
-}).strict()
 function projectSettings(state: string, repo: string): Partial<AuditSettings> {
   return JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(
     join(state, 'security-audit-settings', auditProjectKey(repo) + '.json'), 30000,
   ) ?? '{}')
 }
 function commonSettings(state: string): Partial<AuditSettings> {
-  const common = commonSchema.parse(JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(
-    join(state, 'security-audit-common.json'), 8192,
+  const token = readAuditCredential(state, 'socket')
+  const common = auditCommonSchema.parse(JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(
+    join(auditCredentialState(state), 'security-audit-common.json'), 8192,
   ) ?? '{}'))
-  const token = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-socket-token'), 4096)?.trim()
   return token && common.socketCredentialDigest === createHash('sha256').update(token).digest('hex')
     ? { socketOrg: common.socketOrg } : {}
 }
@@ -84,14 +81,14 @@ export function saveAuditSettings(state: string, repo: string, settings: AuditSe
   atomicWritePrivateFile(join(root, auditProjectKey(repo) + '.json'), JSON.stringify(saved) + '\n')
 }
 function saveSocketOrganization(state: string, slug: string): void {
-  const token = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-socket-token'), 4096)?.trim()
+  const token = readAuditCredential(state, 'socket')
   if (!token) throw Error('Socket credential unavailable')
-  atomicWritePrivateFile(join(state, 'security-audit-common.json'), JSON.stringify({
+  atomicWritePrivateFile(join(auditCredentialState(state), 'security-audit-common.json'), JSON.stringify({
     socketOrg: slug, socketCredentialDigest: createHash('sha256').update(token).digest('hex'),
   }) + '\n')
 }
 export async function discoverSocketOrganization(state: string, fetcher: typeof fetch = fetch): Promise<string[]> {
-  const token = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-socket-token'), 4096)?.trim()
+  const token = readAuditCredential(state, 'socket')
   if (!token) return []
   const response = await fetcher('https://api.socket.dev/v0/organizations', {
     headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(15000),
@@ -171,6 +168,12 @@ export async function initializeAudit(
     signal?: AbortSignal; cancelled?: () => boolean; onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void } = {},
 ): Promise<AuditSettings> {
   checkAuditInterrupted(options)
+  try {
+    for (const service of ['semgrep', 'socket'] as const) readAuditCredential(state, service)
+  } catch (error) {
+    if (error instanceof AuditCredentialConflictError) throw new AuditSetupRequiredError(error.message, job.inputRevision)
+    throw error
+  }
   const root = ensureManagedDirectory(state, join(state, 'security-audit-initializations'))
   // job IDs come from the durable queue. Do not allow callers to choose a path outside that journal.
   if (!/^[a-zA-Z0-9_-]{1,100}$/.test(job.id)) throw Error('invalid audit job identity')
@@ -238,11 +241,11 @@ export async function initializeAudit(
     }
   }
   saveAuditSettings(state, job.repoPath, settings)
-  const socketToken = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'security-audit-socket-token'), 4096)?.trim()
+  const socketToken = readAuditCredential(state, 'socket')
   if (!settings.socketOrg && socketToken) needs.push(organizations.length
     ? 'Socketの組織候補から使う組織を「Socket: 組織名」で教えてください: ' + organizations.join(' / ') : orgError || 'このSocketキーで利用できる組織が見つかりません。権限の復旧後、このスレッドへ返信してください。')
   for (const [service, name] of [['Semgrep', 'semgrep'], ['Socket', 'socket']] as const) {
-    if (!readOptionalBoundedOwnerOnlyRegularFile(join(state, `security-audit-${name}-token`), 4096)?.trim()) {
+    if (!readAuditCredential(state, name)) {
       needs.push(`${service}の接続が未登録です。このMacの非表示入力（zerochan security ${name}-token）で一度だけ登録後、このスレッドへ「登録した」と返信してください。キーはSlackへ投稿しないでください。`)
     }
   }

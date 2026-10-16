@@ -308,6 +308,7 @@ function fakeCodex(root: string): string {
   writeFileSync(executable, `#!/usr/bin/python3
 import json
 import hashlib
+import re
 import os
 import re
 import signal
@@ -510,8 +511,11 @@ for line in sys.stdin:
         repo_access = "write" if json.dumps(handshake_cwd) + '=\\"write\\"' in argv_text else "read"
         phase_log = os.environ.get("ZERO_PHASE_LOG")
         if phase_log and turn_count == 1:
+            # Free-space telemetry is refreshed at every turn; it is not a
+            # change to the permission/instruction contract being compared.
+            stable_instructions = re.sub(r"(Project filesystem free space at turn setup: )[0-9]+\\.[0-9]( GiB; recheck before large writes\\.)", r"\\1<capacity>\\2", developer_instructions)
             with open(phase_log, "a", encoding="utf-8") as stream:
-                stream.write(stage + "\\t" + str(os.getpid()) + "\\t" + (requested_thread or thread_id) + "\\t" + handshake_method + "\\t" + repo_access + "\\t" + permission_profile + "\\t" + hashlib.sha256(developer_instructions.encode("utf-8")).hexdigest() + "\\n")
+                stream.write(stage + "\\t" + str(os.getpid()) + "\\t" + (requested_thread or thread_id) + "\\t" + handshake_method + "\\t" + repo_access + "\\t" + permission_profile + "\\t" + hashlib.sha256(stable_instructions.encode("utf-8")).hexdigest() + "\\n")
         prompt_log = os.environ.get("ZERO_PROMPT_LOG")
         if prompt_log and turn_count == 1:
             with open(prompt_log, "a", encoding="utf-8") as stream:

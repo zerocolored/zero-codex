@@ -43,17 +43,19 @@ function stage(
 describe('durable Slack thread reply intent ledger', () => {
   test('upgrade時は旧classifierの15分待ちだけを短縮し、leaseと別用途の延期を保持する', () => {
     const { root, store } = fixture()
-    const now = Date.now()
-    const deadline = now + 15 * 60_000
     const failure = stage(store, '1789000001.000001')
     const follower = stage(store, '1789000002.000001')
     const context = stage(store, '1789000101.000001', '1789000100.000001')
     const processing = stage(store, '1789000201.000001', '1789000200.000001')
-    store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)
+    // Staging sets notBefore to its actual creation time. Claim only after all
+    // rows exist, rather than depending on them fitting in the same millisecond.
+    const now = Date.now()
+    const deadline = now + 15 * 60_000
+    expect(store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)).not.toBeNull()
     store.deferSlackThreadReplyIntent(failure.idempotencyKey, 'thread intent classifier exited 1', deadline, true)
-    store.claimSlackThreadReplyIntent(context.idempotencyKey, now)
+    expect(store.claimSlackThreadReplyIntent(context.idempotencyKey, now)).not.toBeNull()
     store.deferSlackThreadReplyIntent(context.idempotencyKey, 'Slack context rate limited', deadline)
-    store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)
+    expect(store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)).not.toBeNull()
     store.close()
 
     const beforeOpen = Date.now()
@@ -73,10 +75,10 @@ describe('durable Slack thread reply intent ledger', () => {
   })
   test('障害中の16件超の後続投稿が別threadを塞がず、再起動後も保存順で復旧する', () => {
     const { root, store } = fixture()
-    const now = Date.now()
     const first = stage(store, '1789000001.000001')
     const followers = Array.from({ length: 20 }, (_, i) => stage(store, `${1789000002 + i}.000001`))
     const other = stage(store, '1789000101.000001', '1789000100.000001', 'C0THREAD2')
+    const now = Date.now()
     expect(store.claimSlackThreadReplyIntent(first.idempotencyKey, now)).not.toBeNull()
     const delay = slackThreadIntentRetryDelay(50)
     expect(delay).toBe(60_000)

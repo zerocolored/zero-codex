@@ -1,3 +1,4 @@
+import { readAuditCredential } from './security-audit-credentials.ts'
 import { discoverAuditE2E, type AuditE2E } from './security-audit-setup.ts'
 import { auditReadUrl, authResponseProof, readAuthResponse, authenticationDiscoveryProgram, LOGIN_MARKERS, type AuthenticationDiscovery } from './security-audit-auth.ts'
 import { createHash, randomUUID } from 'crypto'
@@ -1452,7 +1453,7 @@ async function semgrepRepository(c: AuditToolContext): Promise<string> {
 }
 
 async function semgrepCodeScan(c: AuditToolContext): Promise<{ result: CommandResult; version: string }> {
-  const token = readOptionalBoundedOwnerOnlyRegularFile(join(c.stateDir, 'security-audit-semgrep-token'), 4096)?.trim()
+  const token = readAuditCredential(c.stateDir, 'semgrep')
   if (!token) throw Error('Semgrep Code credential unavailable; configure semgrep-token')
   const exe = await binary('semgrep', c)
   const env = { SEMGREP_APP_TOKEN: token, SEMGREP_REPO_NAME: await semgrepRepository(c) }
@@ -1692,10 +1693,7 @@ export async function runAuditTool(
     }
     if (number === 9) {
       step.tool = 'socket'
-      const token = readOptionalBoundedOwnerOnlyRegularFile(
-        join(c.stateDir, 'security-audit-socket-token'),
-        4096,
-      )?.trim()
+      const token = readAuditCredential(c.stateDir, 'socket')
       if (!token) throw Error('Socket credential unavailable')
       if (!c.settings.socketOrg)
         throw Error('Socket organization is not configured')
