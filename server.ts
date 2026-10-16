@@ -1478,7 +1478,8 @@ function deliver(
   const pending = inFlight.get(key)
   if (pending) return pending
   const resolvedThreadTs = threadTs ?? messageTs
-  if (cloudRuntime && jobStore.hasEarlierPendingCloudControl(chatId, resolvedThreadTs, messageTs)) return Promise.resolve(false)
+  // Persist later input and acknowledge it even while a cloud continuation is
+  // pending. The store holds execution/download ordering, not Slack admission.
   const handOver = (async () => {
     const access = loadAccess()
     const writeEnabled = resolveInboundWriteEnabled(chatId, userId, access.writeAllowFrom)

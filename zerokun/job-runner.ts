@@ -74,7 +74,7 @@ import {
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
 import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
-import { CLOUD_SAVE_FAILED_MESSAGE } from './cloud-handoff.ts'
+import { CLOUD_SAVE_FAILED_MESSAGE, cloudFailureReason } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
 import {
   applyStateEnvironment,
@@ -4508,6 +4508,9 @@ export class JobStore {
             completed_at INTEGER, retry_at INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
           )`)
+          if (!db.query<{ name: string }, []>('PRAGMA table_info(cloud_handoff_controls)').all().some(c => c.name === 'reservation_started')) {
+            db.exec('ALTER TABLE cloud_handoff_controls ADD COLUMN reservation_started INTEGER NOT NULL DEFAULT 0')
+          }
           db.exec(`CREATE TABLE IF NOT EXISTS cloud_handoff_context (
             job_id TEXT NOT NULL REFERENCES jobs(id), source_key TEXT NOT NULL,
             payload TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -5851,6 +5854,7 @@ export class JobStore {
       if (inserted !== 1) {
         return { outcome: 'duplicate' as const, repoPath, initialContextRequired: false }
       }
+      this.notifyCloudWaitingReply({ ...input, chatId, repoPath })
       // A bootstrap candidate is only a pending claim. Publishing ordinary
       // thread ownership before its bounded root→mention snapshot succeeds
       // would let catch-up reinterpret failed context posts as new jobs.
@@ -5971,6 +5975,7 @@ export class JobStore {
         ],
       ).changes
       if (inserted !== 1) return 'duplicate' as const
+      this.notifyCloudWaitingReply(input)
       return boundJobId === null ? 'staged' as const : 'bound' as const
     })
     return retrySqlite(() => stage.immediate())
@@ -6394,6 +6399,12 @@ export class JobStore {
          FROM inbound_deliveries AS inbound
          WHERE inbound.status = 'pending'
            AND (inbound.not_before IS NULL OR inbound.not_before <= ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM cloud_handoff_controls c WHERE c.completed_at IS NULL
+               AND json_extract(c.payload,'$.channel')=inbound.chat_id
+               AND json_extract(c.payload,'$.thread')=inbound.thread_ts
+               AND CAST(json_extract(c.payload,'$.message') AS REAL)<CAST(inbound.message_id AS REAL)
+           )
            AND EXISTS (
              SELECT 1 FROM jobs
              WHERE jobs.runtime IN ('codex', 'claude-code')
@@ -6420,7 +6431,13 @@ export class JobStore {
          LIMIT 1`,
       ).get(now)
       const row = priority ?? this.db.query<InboundDeliveryRow, []>(
-        `SELECT * FROM inbound_deliveries ORDER BY seq ASC LIMIT 1`,
+        `SELECT inbound.* FROM inbound_deliveries inbound
+         WHERE NOT EXISTS (
+           SELECT 1 FROM cloud_handoff_controls c WHERE c.completed_at IS NULL
+             AND json_extract(c.payload,'$.channel')=inbound.chat_id
+             AND json_extract(c.payload,'$.thread')=inbound.thread_ts
+             AND CAST(json_extract(c.payload,'$.message') AS REAL)<CAST(inbound.message_id AS REAL)
+         ) ORDER BY inbound.seq ASC LIMIT 1`,
       ).get()
       if (!row || (row.not_before !== null && row.not_before > now)) return null
       const updated = this.db.run(
@@ -9405,8 +9422,56 @@ export class JobStore {
 
   stageCloudControl(input: CloudControl): void {
     if (!this.hasDurableEvent(`${input.channel}:${input.message}`)) assertSlackProjectAdmission(input.project, input.message)
-    this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
-      [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()])
+    retrySqlite(() => this.db.transaction(() => {
+      const inserted = this.db.run(`INSERT OR IGNORE INTO cloud_handoff_controls(event_id,payload,created_at) VALUES(?,?,?)`,
+        [`${input.channel}:${input.message}`, JSON.stringify(input), Date.now()]).changes
+      if (inserted) this.acknowledgeCloudControl(input)
+    }).immediate())
+  }
+
+  private acknowledgeCloudControl(input: CloudControl): void {
+    this.stageStatusNotificationRow({ idempotencyKey: `cloud-control-reserved:${input.channel}:${input.message}`,
+      jobId: null, chatId: input.channel, threadTs: input.thread, kind: 'rate-limited', createdAt: Date.now(),
+      payload: `${input.action === 'continue' ? '再開' : '引き継ぎ'}の依頼を受け付けました。作業は保持しています。保存・利用上限の確認が終わり次第、一度だけ実行します。` })
+  }
+
+  /** Reservation survives restart; normal pending polling executes it once ready. */
+  deferCloudControl(input: CloudControl, ownedSavingCloudId?: string): void {
+    retrySqlite(() => this.db.transaction(() => {
+      this.stageCloudControl(input)
+      const eventId = `${input.channel}:${input.message}`
+      const first = this.db.run(`UPDATE cloud_handoff_controls SET reservation_started=1
+        WHERE event_id=? AND completed_at IS NULL AND reservation_started=0`, [eventId]).changes === 1
+      if (ownedSavingCloudId) {
+        if (first) this.retryBlockedCloudSave(ownedSavingCloudId)
+        else if (this.db.query<{ blocked: number }, [string]>(`SELECT 1 AS blocked FROM cloud_handoff_jobs
+          WHERE cloud_id=? AND state='saving' AND last_error='checkpoint-blocked'`).get(ownedSavingCloudId)) {
+          // The explicit attempt was rejected. Its blocked notification asks
+          // for a new instruction after repair; polling must not retry it.
+          this.finishCloudControl(eventId)
+          return
+        }
+      }
+      this.db.run('UPDATE cloud_handoff_controls SET retry_at=? WHERE event_id=? AND completed_at IS NULL',
+        [Date.now() + 30_000, eventId])
+      this.acknowledgeCloudControl(input)
+    }).immediate())
+  }
+
+  /** Called inside intake's transaction: acknowledgement never loses the input. */
+  private notifyCloudWaitingReply(input: InboundDeliveryInput): void {
+    const waiting = this.db.query<{ state: string }, [string, string, string]>(
+      `SELECT c.state FROM cloud_handoff_jobs c JOIN jobs j ON j.id=c.job_id
+       WHERE j.chat_id=? AND j.thread_ts=? AND j.repo_path=? AND j.status='queued'
+         AND c.state IN ('saving','waiting') ORDER BY j.seq DESC LIMIT 1`,
+    ).get(input.chatId, input.threadTs ?? input.messageId, input.repoPath)
+    if (!waiting) return
+    this.stageStatusNotificationRow({ idempotencyKey: `cloud-reply-received:${input.chatId}:${input.messageId}`,
+      jobId: null, chatId: input.chatId, threadTs: input.threadTs ?? input.messageId,
+      kind: 'rate-limited', createdAt: Date.now(),
+      payload: waiting.state === 'saving'
+        ? 'メッセージを受け付けました。作業はローカルに保持し、クラウド保存を再試行中です。受け付けた「続けて」は、保存・利用上限の確認後に一度だけ実行します。'
+        : 'メッセージを受け付けました。作業は保存済みで、再開待ちです。受け付けた「続けて」は、利用上限の確認後に一度だけ実行します。' })
   }
 
   hasEarlierPendingCloudControl(channel: string, thread: string, message: string): boolean {
@@ -9423,7 +9488,13 @@ export class JobStore {
 
   pendingCloudControls(now = Date.now()): Array<{ eventId: string; input: CloudControl }> {
     return this.db.query<{ event_id: string; payload: string }, [number]>(
-      `SELECT event_id,payload FROM cloud_handoff_controls WHERE completed_at IS NULL AND retry_at<=? ORDER BY created_at LIMIT 10`,
+      `SELECT c.event_id,c.payload FROM cloud_handoff_controls c WHERE c.completed_at IS NULL AND c.retry_at<=?
+       AND NOT EXISTS (SELECT 1 FROM cloud_handoff_controls earlier
+         WHERE earlier.completed_at IS NULL
+           AND json_extract(earlier.payload,'$.channel')=json_extract(c.payload,'$.channel')
+           AND json_extract(earlier.payload,'$.thread')=json_extract(c.payload,'$.thread')
+           AND CAST(json_extract(earlier.payload,'$.message') AS REAL)<CAST(json_extract(c.payload,'$.message') AS REAL))
+       ORDER BY c.created_at LIMIT 10`,
     ).all(now).map(row => ({ eventId: row.event_id, input: JSON.parse(row.payload) as CloudControl }))
   }
 
@@ -9444,6 +9515,14 @@ export class JobStore {
     if (!job) return
     this.stageStatusNotificationRow({ idempotencyKey: `cloud-save-pending:${id}:${job.attempts}`, jobId: id,
       chatId: job.chatId, threadTs: job.threadTs, kind: 'rate-limited', payload: CLOUD_SAVE_FAILED_MESSAGE, createdAt: Date.now() })
+  }
+
+  recordCloudSaveFailure(id: string, reason: string): void {
+    // Only the fixed classification returned by cloudFailureReason is stored.
+    if (!/^cloud-(?:GET|POST|upload|download|authentication refresh|request):HTTP-[1-5][0-9]{2}(?::[A-Za-z]+)?$/.test(reason)
+      && !['cloud-timeout', 'cloud-operation-failed'].includes(reason)) throw new Error('invalid cloud failure reason')
+    this.db.run("UPDATE cloud_handoff_jobs SET last_error=?,updated_at=? WHERE job_id=? AND state='saving' AND coalesce(last_error,'')<>'checkpoint-blocked'",
+      [reason, Date.now(), id])
   }
 
   enqueueCloudImport(input: EnqueueInput, cloudId: string, epoch: number, receipt: string, primaryModel?: string, executionRepo?: string): ReturnType<JobStore['enqueue']> {
@@ -9482,7 +9561,7 @@ export class JobStore {
         started_at=NULL,accepts_control=0,executor_nonce=NULL,active_thread_id=NULL,active_turn_id=NULL
         WHERE id=? AND status='running'`, [id])
       if (changed.changes !== 1 && binding.state !== 'saving') throw new Error('job cannot park for cloud handoff')
-      this.db.run("UPDATE cloud_handoff_jobs SET state='saving',last_error=?,reset_at=coalesce(?,reset_at),updated_at=? WHERE job_id=?", [message, resetAt, Date.now(), id])
+      this.db.run("UPDATE cloud_handoff_jobs SET state='saving',last_error=CASE WHEN state='saving' THEN last_error ELSE ? END,reset_at=coalesce(?,reset_at),updated_at=? WHERE job_id=?", [message, resetAt, Date.now(), id])
       this.supersedeLifecycleNotifications(id)
     })
     retrySqlite(() => park.immediate())
@@ -18860,11 +18939,14 @@ async function runCli(): Promise<void> {
       for (const control of store.pendingCloudControls()) {
         if (shouldPause()) break
         try {
-          await cloudRuntime.receive(control.input)
-          store.finishCloudControl(control.eventId)
+          const result = await cloudRuntime.receive(control.input)
+          if (result !== 'pending') store.finishCloudControl(control.eventId)
         } catch (error) {
           if (error instanceof CloudControlUnavailableError) store.finishCloudControlWithMessage(control.input, error.message)
-          else store.retryCloudControl(control.eventId, control.input)
+          else {
+            log(`cloud control retry: ${cloudFailureReason(error)}`)
+            store.retryCloudControl(control.eventId, control.input)
+          }
         }
       }
       for (const job of store.pendingCloudSaves()) {
