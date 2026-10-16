@@ -115,6 +115,9 @@ export function acknowledgeServiceControlPauseIfRequested(stateDir: string): boo
   if (raw === null) return false
   const request = parseRequest(raw)
   if (request.runnerPid !== process.pid) return false
+  // This is polled at the between-job barrier. Replacing an already published
+  // ack on every poll races the controller's owner/inode-checked read.
+  if (serviceControlPauseAcknowledged(stateDir, request)) return true
   const ack: PauseAck = { ...request, acknowledgedAt: Date.now() }
   atomicWritePrivateFile(
     join(requireManagedStateRoot(stateDir), SERVICE_CONTROL_PAUSE_ACK_FILE),

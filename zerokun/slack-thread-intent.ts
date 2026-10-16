@@ -23,6 +23,7 @@ import { subprocessExitCode } from './process-exit-code.ts'
 import { ensureManagedDirectory } from './managed-path.ts'
 import { AuditModelError, collectAuditModelDiagnostic } from './audit-model-failure.ts'
 import { ModelSelectionRuntimeError, modelSelectionProcessFailure, collectModelSelectionDiagnostic } from './model-selection-runtime.ts'
+import { SlackThreadIntentRuntimeError, slackThreadIntentProcessFailure } from './slack-thread-intent-runtime.ts'
 
 export const SLACK_THREAD_INTENT_PROMPT_VERSION = 1 as const
 export const MAX_THREAD_INTENT_MESSAGES = 40
@@ -362,16 +363,18 @@ export async function runSlackThreadIntentClassifier(
   snapshotJson: string,
   options: { timeoutMs?: number; model?: string } = {},
 ): Promise<SlackThreadIntentDecision> {
-  return parseSlackThreadIntentDecision(await runIsolatedCodexJson(buildSlackThreadIntentPrompt(snapshotJson), {
+  const result = await runIsolatedCodexJson(buildSlackThreadIntentPrompt(snapshotJson), {
     type: 'object', additionalProperties: false, required: ['audience'],
     properties: { audience: { type: 'string', enum: ['addressed', 'not-addressed'] } },
-  }, options))
+  }, { ...options, purpose: 'thread-intent' })
+  try { return parseSlackThreadIntentDecision(result) }
+  catch { throw new SlackThreadIntentRuntimeError('invalid-output') }
 }
 
 /** Tool-free standalone process; only caller-supplied bounded data reaches the model. */
 export async function runIsolatedCodexJson(prompt: string, schema: object,
   options: { timeoutMs?: number; model?: string; reasoningEffort?: 'medium'; independent?: boolean; signal?: AbortSignal;
-    purpose?: 'security-audit' | 'answer-consolidation' | 'model-selection';
+    purpose?: 'security-audit' | 'answer-consolidation' | 'model-selection' | 'thread-intent';
     onProcessId?: (pid: number) => void; onProcessExit?: (code: number) => void;
     supervision?: { jobId: string; stateDir: string } } = {}): Promise<string> {
   if (Buffer.byteLength(prompt) > 100_000) throw new Error('model input too large')
@@ -382,6 +385,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
   let processRegistered = false
   let timer: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
+  const nativeDiagnostic = options.purpose === 'model-selection' || options.purpose === 'thread-intent'
   try {
     if (options.signal?.aborted) throw new DOMException('model interrupted', 'AbortError')
     if (isolatedStopping) throw new Error('isolated Codex is stopping')
@@ -402,7 +406,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     const args = [
       codex.physical,
       'exec',
-      ...(options.purpose === 'model-selection' ? ['--json'] : []),
+      ...(nativeDiagnostic ? ['--json'] : []),
       '--ephemeral',
       '--skip-git-repo-check',
       '--ignore-user-config',
@@ -437,16 +441,16 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       command = [process.execPath, '--config=/dev/null', '--no-env-file',
         join(import.meta.dir, 'security-audit-supervisor.ts'), jobId, registration, ...args]
     }
-    const captureDiagnostic = options.purpose === 'security-audit' || options.purpose === 'model-selection'
+    const captureDiagnostic = options.purpose === 'security-audit' || nativeDiagnostic
     const spawned = Bun.spawn(command, {
       cwd: runtime,
       env: classifierEnvironment(),
       stdin: 'pipe',
-      stdout: options.purpose === 'model-selection' ? 'pipe' : 'ignore',
+      stdout: nativeDiagnostic ? 'pipe' : 'ignore',
       stderr: options.purpose === 'security-audit' ? 'pipe' : 'ignore',
       detached: true,
     })
-    const diagnostic = options.purpose === 'model-selection'
+    const diagnostic = nativeDiagnostic
       ? collectModelSelectionDiagnostic(spawned.stdout as ReadableStream<Uint8Array>).catch(() => '')
       : options.purpose === 'security-audit'
         ? collectAuditModelDiagnostic(spawned.stderr as ReadableStream<Uint8Array>) : Promise.resolve('')
@@ -480,6 +484,7 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
       await terminateClassifier(proc)
       if (options.purpose === 'security-audit') throw new AuditModelError(124, 'command timeout')
       if (options.purpose === 'model-selection') throw new ModelSelectionRuntimeError('transport', 124)
+      if (options.purpose === 'thread-intent') throw new SlackThreadIntentRuntimeError('transport', 124)
       throw new Error('thread intent classifier timed out')
     }
     if (timer) clearTimeout(timer)
@@ -487,11 +492,17 @@ export async function runIsolatedCodexJson(prompt: string, schema: object,
     if (outcome !== 0) {
       if (options.purpose === 'security-audit') throw new AuditModelError(outcome, await diagnostic)
       if (options.purpose === 'model-selection') throw modelSelectionProcessFailure(outcome, await diagnostic)
+      if (options.purpose === 'thread-intent') throw slackThreadIntentProcessFailure(outcome, await diagnostic)
       throw new Error(`thread intent classifier exited ${outcome}`)
     }
     await diagnostic
-    return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000
-      : options.purpose === 'answer-consolidation' ? 64 * 1024 : MAX_CLASSIFIER_OUTPUT_BYTES)
+    try {
+      return readOwnerOnlyOutput(outputPath, options.purpose === 'security-audit' ? 1_000_000
+        : options.purpose === 'answer-consolidation' ? 64 * 1024 : MAX_CLASSIFIER_OUTPUT_BYTES)
+    } catch (error) {
+      if (options.purpose === 'thread-intent') throw new SlackThreadIntentRuntimeError('invalid-output')
+      throw error
+    }
   } finally {
     if (timer) clearTimeout(timer)
     if (onAbort) options.signal?.removeEventListener('abort', onAbort)
