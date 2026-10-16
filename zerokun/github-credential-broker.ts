@@ -621,10 +621,10 @@ export function registerGitHubCredentialTools(
   })
 
   server.registerTool('github_pull_request', {
-    description: 'Create, approve, or merge a pull request in a repository belonging to the current project. Codex chooses the action; the broker only supplies authenticated, repository-scoped transport and checks the exact head SHA.',
+    description: 'Create, describe, approve, or merge a pull request in a repository belonging to the current project. "describe" replaces the body of an existing pull request. Codex chooses the action; the broker only supplies authenticated, repository-scoped transport and checks the exact head SHA.',
     inputSchema: {
       repository: z.string().max(256),
-      action: z.enum(['create', 'approve', 'merge']),
+      action: z.enum(['create', 'describe', 'approve', 'merge']),
       pullRequestNumber: z.number().int().positive().optional(),
       expectedHeadSha: z.string().regex(SHA),
       baseBranch: z.string().min(1).max(255).optional(),
@@ -690,6 +690,33 @@ export function registerGitHubCredentialTools(
         commands, input.repository, input.pullRequestNumber, extra.signal,
       )
       assertExpectedHead(view, expected)
+      // 本文を書き直す手段が無いと、作った後に分かったことを本文へ反映できず、
+      // 「本文を貼り替えてください」と人へ頼んで止まる(2026-09-30 実測)。
+      if (input.action === 'describe') {
+        if (input.body === undefined) throw new Error('pull request body is required')
+        if (containsCredentialMaterial(input.body)) {
+          throw new Error('pull request text is invalid or contains protected material')
+        }
+        const described = await commands.runGh([
+          'pr', 'edit', String(view.number), '--repo', input.repository, '--body-file', '-',
+        ], input.body, extra.signal)
+        // A lost mutation response may still have committed. Read the actual
+        // body, not only the head SHA, before claiming publication succeeded.
+        const confirmation = await commands.runGh([
+          'pr', 'view', String(view.number), '--repo', input.repository,
+          '--json', 'headRefOid,body',
+        ], undefined, extra.signal)
+        if (confirmation.exitCode !== 0) commandFailure(confirmation, 'GitHub pull request description verification')
+        const confirmed = parseJson(confirmation.stdout, 'GitHub pull request description verification') as Record<string, unknown>
+        if (!confirmed || confirmed.headRefOid !== expected) throw new Error('GitHub pull request head changed')
+        if (confirmed.body !== input.body) {
+          if (described.exitCode !== 0) commandFailure(described, 'GitHub pull request description')
+          throw new Error('GitHub pull request description was not confirmed; inspect before retrying')
+        }
+        view = await readPullRequest(commands, input.repository, view.number, extra.signal)
+        assertExpectedHead(view, expected)
+        return toolText({ complete: true, action: input.action, pullRequest: view })
+      }
       if (input.action === 'approve') {
         if (view.state !== 'OPEN') throw new Error('only an open pull request can be approved')
         if (!await approvalExists(

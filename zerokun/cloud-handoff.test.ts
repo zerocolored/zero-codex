@@ -28,6 +28,26 @@ test('observed quota survives a runner crash before cloud park', () => {
   expect(store.claimNext('worker')).toBeNull()
   store.close()
 })
+test('later cloud controls acknowledge on intake while execution remains ordered across restart', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cloud-control-receipt-')); roots.push(root)
+  let store = new JobStore(join(root, 'jobs.sqlite3'))
+  const control = { channel: 'C1', thread: '1.0', message: '2.0', user: 'U1', bot: 'UBOT', project: root, writeEnabled: true, action: 'continue' as const }
+  try {
+    store.deferCloudControl(control)
+    const later = { ...control, message: '3.0' }
+    store.stageCloudControl(later)
+    store.stageCloudControl({ ...control, channel: 'C2' })
+    expect(store.pendingStatusNotifications()).toHaveLength(3)
+    expect(store.pendingCloudControls().map(c => c.eventId)).toEqual(['C2:2.0'])
+    store.close(); store = new JobStore(join(root, 'jobs.sqlite3'))
+    store.stageCloudControl(later)
+    expect(store.pendingStatusNotifications()).toHaveLength(3)
+    expect(store.pendingCloudControls(Date.now() + 60_000).map(c => c.eventId)).toEqual(['C1:2.0', 'C2:2.0'])
+    store.finishCloudControl('C1:2.0')
+    expect(store.pendingCloudControls().map(c => c.eventId)).toEqual(['C1:3.0', 'C2:2.0'])
+  } finally { store.close() }
+})
+
 test('pending import holds later same-thread execution but not unrelated work', () => {
   const root = mkdtempSync(join(tmpdir(), 'cloud-fifo-test-')); roots.push(root)
   const store = new JobStore(join(root, 'jobs.sqlite3'))

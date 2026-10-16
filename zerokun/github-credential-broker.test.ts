@@ -576,8 +576,12 @@ describe('GitHub credential broker', () => {
     let approvals = 0
     let creates = 0
     let merges = 0
+    let describes = 0
+    let description = ''
+    let ignoreDescription = false
     const pullRequest = () => ({
       number: 42,
+      body: description,
       url: 'https://github.com/example/broker-fixture/pull/42',
       state: merged ? 'MERGED' : 'OPEN',
       isDraft: false,
@@ -598,7 +602,7 @@ describe('GitHub credential broker', () => {
         }
         return result(1, '', `unexpected git command: ${args.join(' ')}`)
       },
-      async runGh(args) {
+      async runGh(args, stdin) {
         if (args[0] === 'pr' && args[1] === 'list') {
           return result(0, JSON.stringify(exists ? [pullRequest()] : []))
         }
@@ -622,6 +626,12 @@ describe('GitHub credential broker', () => {
         if (args[0] === 'api' && args.includes('event=APPROVE')) {
           approvals += 1
           approvedCommit = args.find(arg => arg.startsWith('commit_id='))?.slice(10) ?? null
+          return result(0)
+        }
+        if (args[0] === 'pr' && args[1] === 'edit') {
+          describes += 1
+          if (!ignoreDescription) description = stdin ?? ''
+          expect(args).toContain('--body-file')
           return result(0)
         }
         if (args[0] === 'pr' && args[1] === 'merge') {
@@ -678,6 +688,35 @@ describe('GitHub credential broker', () => {
         action: 'create',
         pullRequest: { number: 42, state: 'OPEN', headSha: value.commitSha },
       })
+
+      // 本文を書き直せないと、作った後に分かったことを反映できず人へ頼んで
+      // 止まる(2026-09-30 実測)。書いた後は読み直して反映を確かめる。
+      const described = await callBrokerTool(client, {
+        name: 'github_pull_request',
+        arguments: {
+          repository: 'example/broker-fixture',
+          action: 'describe',
+          pullRequestNumber: 42,
+          expectedHeadSha: value.commitSha,
+          body: '## 変更内容\n更新後の本文。',
+        },
+      })
+      expect(described.isError).not.toBe(true)
+      expect(responseJson(described)).toMatchObject({
+        complete: true, action: 'describe',
+        pullRequest: { number: 42, headSha: value.commitSha },
+      })
+      expect(describes).toBe(1)
+      ignoreDescription = true
+      const unconfirmed = await callBrokerTool(client, {
+        name: 'github_pull_request', arguments: {
+          repository: 'example/broker-fixture', action: 'describe', pullRequestNumber: 42,
+          expectedHeadSha: value.commitSha, body: 'This update was not stored remotely.',
+        },
+      })
+      expect(unconfirmed.isError).toBe(true)
+      expect(responseJson(unconfirmed)).toMatchObject({ complete: false })
+      expect(description).toBe('## 変更内容\n更新後の本文。')
 
       const approved = await callBrokerTool(client, {
         name: 'github_pull_request',
