@@ -1,5 +1,5 @@
 /** Stable user-facing classifications; raw CLI output never goes to Slack. */
-export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'auth-check', 'auth-recovery', 'connection', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
+export const ADVISOR_FAILURE_CAUSES = ['authentication', 'billing', 'configuration', 'permission', 'auth-check', 'auth-recovery', 'connection', 'network', 'rate-limit', 'timeout', 'startup', 'workspace', 'response', 'validation', 'interrupted', 'unknown'] as const
 export type AdvisorFailure = {
   advisor: 'codex' | 'grok' | 'claude'
   cause: typeof ADVISOR_FAILURE_CAUSES[number]
@@ -10,7 +10,7 @@ export class AdvisorFailureError extends Error {
 }
 
 export function classifyAdvisorFailure(advisor: AdvisorFailure['advisor'], reason: string): AdvisorFailure {
-  const cause = /Herdr current pane verification (?:timed out|failed)/i.test(reason) ? 'connection'
+  const cause = /Herdr current pane verification (?:timed out|failed)|advisor connection (?:deadline|retry budget)|Claude terminal observation failed/i.test(reason) ? 'connection'
     : /project is not a Git worktree or pinned workspace|workspace configuration/i.test(reason) ? 'workspace'
     : /payment required|insufficient (?:credit|balance)|credit balance.*(?:low|exhausted)|billing.*(?:disabled|failed)|subscription (?:expired|inactive)/i.test(reason) ? 'billing'
     : /rate.?limit|quota|at capacity|429/i.test(reason) ? 'rate-limit'
@@ -38,6 +38,7 @@ export function advisorFailureMessage(failure: AdvisorFailure): string {
     authentication: '認証が必要です。このMacでログインを確認してください。',
     billing: '支払い・残高・契約に関するエラーが報告されました。利用アカウントの契約状態を確認してください。',
     configuration: '必要なログイン方式または実行設定と一致しません。このMacの設定を確認してください。',
+    permission: '必要なファイルへのアクセス確認で停止しました。回答生成の時間切れではありません。',
     'auth-check': 'ログイン状態の確認処理に失敗しました。未ログインや課金不足と確定したわけではありません。',
     'auth-recovery': '自動再認証を完了できませんでした。停止理由を実行記録に保存しています。',
     connection: '連携状態の確認に失敗しました。レビュー回答の時間切れではありません。',

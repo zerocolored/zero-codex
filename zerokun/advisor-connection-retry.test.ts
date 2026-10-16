@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
-import { retryAdvisorConnection } from './advisor-connection-retry.ts'
+import { AdvisorConnectionDeadlineError, retryAdvisorConnection } from './advisor-connection-retry.ts'
+import { classifyAdvisorFailure } from './advisor-availability.ts'
 import { retryableClaudeObservation } from './advisor-broker.ts'
 import { HerdrObservationUnavailableError } from './herdr-runtime.ts'
 import { ClaudeReadError } from './claude-response-diagnostic.ts'
@@ -47,7 +48,8 @@ test('接続不能が続いても全体期限を延長せず利用不能にな�
     read: async () => { calls++; throw new Error('offline') },
     retryable: () => true, timeoutMs: 3500, now: () => now,
     wait: async ms => { now += ms },
-  })).rejects.toThrow('deadline exceeded')
+  })).rejects.toBeInstanceOf(AdvisorConnectionDeadlineError)
   expect(now).toBe(3500)
   expect(calls).toBe(3)
+  expect(classifyAdvisorFailure('claude', String(new AdvisorConnectionDeadlineError())).cause).toBe('connection')
 })
