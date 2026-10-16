@@ -264,7 +264,8 @@ export const READER_ACTION_BANNER = {
   decide: '🙋 要判断 ／ あなたの決定が要ります',
   act: '⏸️ 待ち ／ あなたの作業が要ります',
   auto: '⏸️ 待ち ／ 対応不要（自動で再開します）',
-  failed: '🛑 失敗 ／ 対応不要（私が追います）',
+  resume: '⏸️ 未完了 ／ 制限の解消後、同じスレッドで再開を依頼してください',
+  failed: '🛑 失敗 ／ 再開するには同じスレッドで依頼してください',
   stopped: '🛑 中止 ／ 対応不要',
 } as const
 
@@ -272,7 +273,7 @@ export const READER_ACTION_BANNER = {
 export function readerActionBanner(taskGoalStatus: string | null | undefined): string {
   switch (taskGoalStatus) {
     case 'paused': return READER_ACTION_BANNER.decide
-    case 'usageLimited': case 'budgetLimited': return READER_ACTION_BANNER.auto
+    case 'usageLimited': case 'budgetLimited': return READER_ACTION_BANNER.resume
     case 'blocked': case 'active': return READER_ACTION_BANNER.act
     default: return READER_ACTION_BANNER.done
   }

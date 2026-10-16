@@ -95,3 +95,41 @@ test('通常の通信は壊れない', () => {
   expect(result.code).toBe(0)
   expect(result.stdout.trim()).toBe('connected')
 })
+
+for (const source of [
+  "require('child_process').spawn('/zerokun-absent/tool')",
+  "require('net').connect({ path: '/zerokun-absent/socket' })",
+]) {
+  test(`diagnostics preserve unhandled error termination: ${source}`, () => {
+    const baseline = Bun.spawnSync(['node', '-e', source], { stdout: 'pipe', stderr: 'pipe' })
+    const observed = runNode(source)
+    expect(baseline.exitCode).not.toBe(0)
+    expect(observed.code).toBe(baseline.exitCode)
+    expect(observed.stderr).toContain('ENOENT')
+  })
+}
+
+test('promisify(execFile) preserves stdout/stderr and child promise contract', () => {
+  const result = runNode(`
+    const execFile = require('util').promisify(require('child_process').execFile)
+    const promise = execFile(process.execPath, ['-e', 'process.stdout.write("x");process.stderr.write("y")'])
+    const child = Boolean(promise.child && promise.child.pid)
+    promise.then(result => console.log(JSON.stringify({ result, child })))
+  `)
+  expect(result.code).toBe(0)
+  expect(JSON.parse(result.stdout)).toEqual({ result: { stdout: 'x', stderr: 'y' }, child: true })
+})
+
+test('Unix socket の拒否を外向きプロキシの問題と誤診断しない', () => {
+  const result = runNode(`
+    const net = require('net')
+    for (const target of [{ path: '/zerokun-absent/socket' }, '/zerokun-absent/socket']) {
+      const socket = net.connect(target)
+      socket.on('error', () => {})
+      process.nextTick(() => socket.emit('error', Object.assign(new Error('x'), { code: 'EPERM', syscall: 'connect' })))
+    }
+    setTimeout(() => process.exit(0), 20)
+  `)
+  expect(result.code).toBe(0)
+  expect(result.stderr).not.toContain('proxy')
+})

@@ -5888,18 +5888,16 @@ export function buildCodexPermissionOverrides(
   // 使う dns.lookup だけが ENOTFOUND になる。ジョブ内の Node に preload させて
   // DNS へ引き直させる。scratchDir はジョブ専用で読み書きできる唯一の置き場。
   const dnsFallbackPath = join(scratchDir, '.zerokun-dns-fallback.cjs')
-  writeFileSync(
+  atomicWritePrivateFile(
     dnsFallbackPath,
     readFileSync(join(import.meta.dir, 'sandbox-dns-fallback.cjs'), 'utf8'),
-    { mode: 0o600 },
   )
   // 塞がれた結果が errno としてしか見えないと、箱の何が原因かを推理できず
   // 人への依頼で止まる。既知の形だけ、何が塞いでいるかを stderr へ出す。
   const diagnosticsPath = join(scratchDir, '.zerokun-sandbox-diagnostics.cjs')
-  writeFileSync(
+  atomicWritePrivateFile(
     diagnosticsPath,
     readFileSync(join(import.meta.dir, 'sandbox-diagnostics.cjs'), 'utf8'),
-    { mode: 0o600 },
   )
   const liveInputRoot = options.liveInputDir
     ? requireManagedDirectory(options.stateDir, options.liveInputDir)
@@ -6139,7 +6137,7 @@ export function buildCodexPermissionOverrides(
     ...Object.entries(nativeCliShellEnvironment(home, scratchDir, primaryWorkspaceAccess))
       .map(([key, value]) => `${tomlString(key)}=${tomlString(value)}`),
     `"TMPDIR"=${tomlString(jobTempDir)}`,
-    `"NODE_OPTIONS"=${tomlString(`--require ${dnsFallbackPath} --require ${diagnosticsPath}`)}`,
+    `"NODE_OPTIONS"=${tomlString(`--require ${JSON.stringify(dnsFallbackPath)} --require ${JSON.stringify(diagnosticsPath)}`)}`,
     `"PATH"=${tomlString(cloudBin ? `${cloudBin}:${toolchain.path}` : toolchain.path)}`,
     ...(dockerRuntime && dockerConfig ? [
       `"DOCKER_HOST"=${tomlString(dockerRuntime.host)}`,

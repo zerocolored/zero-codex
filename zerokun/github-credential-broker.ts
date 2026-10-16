@@ -700,9 +700,19 @@ export function registerGitHubCredentialTools(
         const described = await commands.runGh([
           'pr', 'edit', String(view.number), '--repo', input.repository, '--body-file', '-',
         ], input.body, extra.signal)
-        if (described.exitCode !== 0) commandFailure(described, 'GitHub pull request description')
-        // 書けたことを GitHub 側から読み直して確かめる。書き込みの戻り値だけを
-        // 根拠にすると、反映されていないまま完了と報告してしまう。
+        // A lost mutation response may still have committed. Read the actual
+        // body, not only the head SHA, before claiming publication succeeded.
+        const confirmation = await commands.runGh([
+          'pr', 'view', String(view.number), '--repo', input.repository,
+          '--json', 'headRefOid,body',
+        ], undefined, extra.signal)
+        if (confirmation.exitCode !== 0) commandFailure(confirmation, 'GitHub pull request description verification')
+        const confirmed = parseJson(confirmation.stdout, 'GitHub pull request description verification') as Record<string, unknown>
+        if (!confirmed || confirmed.headRefOid !== expected) throw new Error('GitHub pull request head changed')
+        if (confirmed.body !== input.body) {
+          if (described.exitCode !== 0) commandFailure(described, 'GitHub pull request description')
+          throw new Error('GitHub pull request description was not confirmed; inspect before retrying')
+        }
         view = await readPullRequest(commands, input.repository, view.number, extra.signal)
         assertExpectedHead(view, expected)
         return toolText({ complete: true, action: input.action, pullRequest: view })

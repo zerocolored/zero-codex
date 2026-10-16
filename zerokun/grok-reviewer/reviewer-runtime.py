@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,8 @@ def _read_safe_regular(
             chunks.append(chunk)
         if not _same(opened, os.fstat(descriptor)):
             raise OSError(f"file changed while reading: {path}")
+        if not _same(before, os.fstat(descriptor)):
+            raise OSError("auth file changed while reading")
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -459,10 +462,12 @@ def _auth_accounts_conflict(host: object, candidate: object) -> bool:
 
 
 def _read_auth_bytes(path: Path) -> bytes | None:
-    _safe_regular(path, executable=False, maximum=MAX_AUTH_BYTES, private=True)
+    before = _safe_regular(path, executable=False, maximum=MAX_AUTH_BYTES, private=True)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
+        if not _same(before, os.fstat(descriptor)):
+            raise OSError("auth file changed while opening")
         chunks = []
         total = 0
         while True:
@@ -481,6 +486,8 @@ def _read_auth_bytes(path: Path) -> bytes | None:
 def _reviewer_real_home(reviewer_root: Path) -> Path:
     root = reviewer_root.resolve(strict=True)
     runtime = root.parent
+    if runtime.parent.name == "releases" and re.fullmatch(r"[0-9a-f]{40}", runtime.name):
+        runtime = runtime.parent.parent
     zerokun = runtime.parent
     if (
         root.name != "grok-reviewer"
@@ -491,7 +498,7 @@ def _reviewer_real_home(reviewer_root: Path) -> Path:
     return zerokun.parent
 
 
-def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
+def _sync_auth_back(reviewer_root: Path, run_root: Path, initial_digest: str | None) -> int:
     """Persist tokens the isolated run refreshed so the host copy stays alive.
 
     Grok rotates its 6-hour access token inside the throwaway run home; without
@@ -500,6 +507,8 @@ def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
     run starts failing with an auth error.
     """
     try:
+        if initial_digest is None or not re.fullmatch(r"[0-9a-f]{64}", initial_digest):
+            return 3
         reviewer_root = reviewer_root.resolve(strict=True)
         run_root = run_root.resolve(strict=True)
         if not _is_direct_run_directory(reviewer_root, run_root):
@@ -539,10 +548,13 @@ def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
             try:
                 host_bytes = _read_auth_bytes(host_auth)
             except FileNotFoundError:
-                host_bytes = None
+                return 3
             except OSError:
                 return 5
             if host_bytes is not None:
+                # Do not replace a concurrent login, refresh or intentional logout.
+                if hashlib.sha256(host_bytes).hexdigest() != initial_digest:
+                    return 3
                 if host_bytes == run_bytes:
                     return 3
                 try:
@@ -581,7 +593,21 @@ def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
                         staging.unlink()
                     except OSError:
                         pass
+            # Non-cooperating writers do not take our lock; recheck immediately
+            # before publication (the final check/rename race remains bounded).
+            try:
+                if hashlib.sha256(_read_auth_bytes(host_auth) or b"").hexdigest() != initial_digest:
+                    staging.unlink()
+                    return 3
+            except OSError:
+                staging.unlink()
+                return 3
             os.replace(staging, host_auth)
+            directory_fd = os.open(grok_directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             return 0
         finally:
             os.close(lock_descriptor)
@@ -589,9 +615,9 @@ def _sync_auth_back(reviewer_root: Path, run_root: Path) -> int:
         return 5
 
 
-def _sync_auth_back_quietly(reviewer_root: Path, run_root: Path) -> None:
+def _sync_auth_back_quietly(reviewer_root: Path, run_root: Path, initial_digest: str | None) -> None:
     try:
-        _sync_auth_back(reviewer_root, run_root)
+        _sync_auth_back(reviewer_root, run_root, initial_digest)
     except Exception:
         pass
 
@@ -1165,6 +1191,14 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
     except OSError:
         return 126
 
+    initial_auth_digest = None
+    try:
+        initial_auth = _read_auth_bytes(run_root / "user-home" / ".grok" / "auth.json")
+        if initial_auth:
+            initial_auth_digest = hashlib.sha256(initial_auth).hexdigest()
+    except OSError:
+        pass
+
     blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
     active_mask = set(previous_mask) - blocked_signals
@@ -1360,7 +1394,8 @@ def _run_supervised(reviewer_root: Path, run_root: Path, command: list[str]) -> 
                     capture.close()
                 except (OSError, ValueError):
                     cleanup_error = True
-        _sync_auth_back_quietly(reviewer_root, run_root)
+        if outcome == "ordinary" and not cleanup_error:
+            _sync_auth_back_quietly(reviewer_root, run_root, initial_auth_digest)
         cleanup_ok = _remove_run_directory(reviewer_root, run_root) and not cleanup_error
 
     if not cleanup_ok:
@@ -1461,8 +1496,8 @@ def _print_resolved_grok(real_home: Path, grok: Path) -> int:
 def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "copy-auth":
         return _copy_auth(Path(sys.argv[2]), Path(sys.argv[3]))
-    if len(sys.argv) == 4 and sys.argv[1] == "sync-auth-back":
-        return _sync_auth_back(Path(sys.argv[2]), Path(sys.argv[3]))
+    if len(sys.argv) == 5 and sys.argv[1] == "sync-auth-back":
+        return _sync_auth_back(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
     if len(sys.argv) == 3 and sys.argv[1] == "cleanup-stale":
         return _cleanup_stale(Path(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == "create-run":

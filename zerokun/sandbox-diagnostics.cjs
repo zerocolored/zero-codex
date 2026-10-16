@@ -4,6 +4,8 @@
 // 止まっていた。既知の形に当てはまったときだけ、何が塞いでいるかを1行
 // stderr へ出す。errorオブジェクトは書き換えない(テストの期待値を壊すため)。
 const net = require('net')
+const { errorMonitor } = require('events')
+const { promisify } = require('util')
 
 const announced = new Set()
 function announce(key, lines) {
@@ -22,10 +24,15 @@ function proxyState() {
 
 const originalConnect = net.Socket.prototype.connect
 net.Socket.prototype.connect = function connect(...args) {
+  // net.connect may pass Node's normalized [options, callback] array.
+  const target = Array.isArray(args[0]) ? args[0][0] : args[0]
+  const unixSocket = target && typeof target === 'object'
+    ? target.path != null
+    : typeof target === 'string' && !/^\d+$/.test(target)
   const socket = originalConnect.apply(this, args)
-  this.once('error', error => {
+  this.once(errorMonitor, error => {
     if (!error || (error.code !== 'EPERM' && error.code !== 'EACCES')) return
-    if (error.syscall !== 'connect') return
+    if (error.syscall !== 'connect' || unixSocket) return
     announce('connect-denied', [
       `connect ${error.code}: this sandbox permits outbound connections only through its own proxy.`,
       `Proxy environment is ${proxyState()}.`,
@@ -43,7 +50,7 @@ const childProcess = require('child_process')
 for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync']) {
   const original = childProcess[name]
   if (typeof original !== 'function') continue
-  childProcess[name] = function wrapped(command, ...rest) {
+  const wrapped = function wrapped(command, ...rest) {
     const explain = error => {
       if (!error || (error.code !== 'EPERM' && error.code !== 'EACCES')) return
       announce(`spawn-denied:${String(command)}`, [
@@ -53,8 +60,12 @@ for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync']) {
       ])
     }
     const result = original.call(this, command, ...rest)
-    if (result && typeof result.once === 'function') result.once('error', explain)
+    if (result && typeof result.once === 'function') result.once(errorMonitor, explain)
     else if (result && result.error) explain(result.error)
     return result
   }
+  if (original[promisify.custom]) {
+    Object.defineProperty(wrapped, promisify.custom, Object.getOwnPropertyDescriptor(original, promisify.custom))
+  }
+  childProcess[name] = wrapped
 }

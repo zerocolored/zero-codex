@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'crypto'
 import { spawnSync } from 'child_process'
 import {
   chmodSync,
@@ -43,11 +44,13 @@ function authJson(issuedAt: number, email = 'ai01@zerocolored.co.jp'): string {
   })
 }
 
-function fixture(): { home: string; reviewerRoot: string; runRoot: string; runAuth: string; hostAuth: string } {
+function fixture(release = false): { home: string; reviewerRoot: string; runRoot: string; runAuth: string; hostAuth: string } {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'zerokun-auth-sync-')))
   temporaryRoots.push(home)
   chmodSync(home, 0o700)
-  const reviewerRoot = join(home, '.zerokun', 'runtime', 'grok-reviewer')
+  const reviewerRoot = release
+    ? join(home, '.zerokun', 'runtime', 'releases', 'a'.repeat(40), 'grok-reviewer')
+    : join(home, '.zerokun', 'runtime', 'grok-reviewer')
   mkdirSync(reviewerRoot, { recursive: true, mode: 0o700 })
   chmodSync(join(home, '.zerokun'), 0o700)
   chmodSync(join(home, '.zerokun', 'runtime'), 0o700)
@@ -66,8 +69,8 @@ function fixture(): { home: string; reviewerRoot: string; runRoot: string; runAu
   }
 }
 
-function syncAuthBack(reviewerRoot: string, runRoot: string): number {
-  const result = spawnSync('/usr/bin/python3', ['-I', RUNTIME, 'sync-auth-back', reviewerRoot, runRoot], {
+function syncAuthBack(reviewerRoot: string, runRoot: string, initial = authJson(1_000_000)): number {
+  const result = spawnSync('/usr/bin/python3', ['-I', RUNTIME, 'sync-auth-back', reviewerRoot, runRoot, createHash('sha256').update(initial).digest('hex')], {
     encoding: 'utf8',
   })
   expect(result.stdout).toBe('')
@@ -84,12 +87,11 @@ describe('sync-auth-back', () => {
     expect(lstatSync(hostAuth).mode & 0o777).toBe(0o600)
   })
 
-  test('ホストが消されていても（自動復旧のパージ後）runのコピーから復元する', () => {
+  test('ホストのlogout後はrunのコピーから認証を復活させない', () => {
     const { reviewerRoot, runRoot, runAuth, hostAuth } = fixture()
     writeFileSync(runAuth, authJson(2_000_000), { mode: 0o600 })
-    expect(syncAuthBack(reviewerRoot, runRoot)).toBe(0)
-    expect(readFileSync(hostAuth, 'utf8')).toBe(authJson(2_000_000))
-    expect(lstatSync(hostAuth).mode & 0o777).toBe(0o600)
+    expect(syncAuthBack(reviewerRoot, runRoot)).toBe(3)
+    expect(existsSync(hostAuth)).toBe(false)
   })
 
   test('runのトークンが古い・同時刻なら書き戻さない', () => {
@@ -141,7 +143,7 @@ describe('sync-auth-back', () => {
 })
 
 describe('run後の自動書き戻し', () => {
-  test('run終了時（runディレクトリ削除前）に新トークンがホストへ残る', () => {
+  for (const exitCode of [0, 1]) test(`run終了時(exit ${exitCode})に新トークンがホストへ残る`, () => {
     const { reviewerRoot, runRoot, runAuth, hostAuth } = fixture()
     writeFileSync(hostAuth, authJson(1_000_000), { mode: 0o600 })
     writeFileSync(runAuth, authJson(1_000_000), { mode: 0o600 })
@@ -153,11 +155,24 @@ describe('run後の自動書き戻し', () => {
     const refresh = `require('fs').writeFileSync(${JSON.stringify(runAuth)}, ${JSON.stringify(authJson(2_000_000))})`
     const result = spawnSync(
       '/usr/bin/python3',
-      ['-I', RUNTIME, 'run', reviewerRoot, runRoot, '--', pinned, '-e', refresh],
+      ['-I', RUNTIME, 'run', reviewerRoot, runRoot, '--', pinned, '-e', `${refresh}; process.exit(${exitCode})`],
       { encoding: 'utf8' },
     )
-    expect(result.status).toBe(0)
+    expect(result.status).toBe(exitCode)
     expect(existsSync(runRoot)).toBe(false)
     expect(readFileSync(hostAuth, 'utf8')).toBe(authJson(2_000_000))
   })
 })
+
+for (const release of [false, true]) {
+  test(`refresh persists in ${release ? 'release' : 'legacy'} layout; concurrent same-account login is retained`, () => {
+    const f = fixture(release)
+    writeFileSync(f.hostAuth, authJson(1_000_000), { mode: 0o600 })
+    writeFileSync(f.runAuth, authJson(2_000_000), { mode: 0o600 })
+    expect(syncAuthBack(f.reviewerRoot, f.runRoot)).toBe(0)
+    const changed = authJson(1_500_000)
+    writeFileSync(f.hostAuth, changed, { mode: 0o600 })
+    expect(syncAuthBack(f.reviewerRoot, f.runRoot)).toBe(3)
+    expect(readFileSync(f.hostAuth, 'utf8')).toBe(changed)
+  })
+}

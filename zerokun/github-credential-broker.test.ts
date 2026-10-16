@@ -577,8 +577,11 @@ describe('GitHub credential broker', () => {
     let creates = 0
     let merges = 0
     let describes = 0
+    let description = ''
+    let ignoreDescription = false
     const pullRequest = () => ({
       number: 42,
+      body: description,
       url: 'https://github.com/example/broker-fixture/pull/42',
       state: merged ? 'MERGED' : 'OPEN',
       isDraft: false,
@@ -599,7 +602,7 @@ describe('GitHub credential broker', () => {
         }
         return result(1, '', `unexpected git command: ${args.join(' ')}`)
       },
-      async runGh(args) {
+      async runGh(args, stdin) {
         if (args[0] === 'pr' && args[1] === 'list') {
           return result(0, JSON.stringify(exists ? [pullRequest()] : []))
         }
@@ -627,6 +630,7 @@ describe('GitHub credential broker', () => {
         }
         if (args[0] === 'pr' && args[1] === 'edit') {
           describes += 1
+          if (!ignoreDescription) description = stdin ?? ''
           expect(args).toContain('--body-file')
           return result(0)
         }
@@ -703,6 +707,16 @@ describe('GitHub credential broker', () => {
         pullRequest: { number: 42, headSha: value.commitSha },
       })
       expect(describes).toBe(1)
+      ignoreDescription = true
+      const unconfirmed = await callBrokerTool(client, {
+        name: 'github_pull_request', arguments: {
+          repository: 'example/broker-fixture', action: 'describe', pullRequestNumber: 42,
+          expectedHeadSha: value.commitSha, body: 'This update was not stored remotely.',
+        },
+      })
+      expect(unconfirmed.isError).toBe(true)
+      expect(responseJson(unconfirmed)).toMatchObject({ complete: false })
+      expect(description).toBe('## 変更内容\n更新後の本文。')
 
       const approved = await callBrokerTool(client, {
         name: 'github_pull_request',

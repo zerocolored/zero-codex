@@ -13899,7 +13899,7 @@ describe('Slack output guard', () => {
     await notifier.failed(job, raw)
 
     expect(posted).toEqual([
-      '🛑 失敗 ／ 対応不要（私が追います）'
+      '🛑 失敗 ／ 再開するには同じスレッドで依頼してください'
         + `\n\n<@${job.userId}> うまく完了できませんでした。`
         + '\n原因: 補助レビューの回答と保存履歴を照合できませんでした。'
         + `\nキュー #${job.seq} の監視タブが残っている場合は、そこで直前の経過を確認できます。`,
