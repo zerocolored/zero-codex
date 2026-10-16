@@ -3,10 +3,6 @@ set -euo pipefail
 
 CANDIDATE_SANDBOX=0
 if [[ "${1:-}" == "--candidate-sandbox" && $# -eq 1 ]]; then
-  if [[ "${ZERO_CODEX_CANDIDATE_SANDBOX:-}" != "1" || "${CODEX_SANDBOX:-}" != "seatbelt" ]]; then
-    echo 'error: --candidate-sandbox はupdaterのmacOS sandbox内でのみ使用できます' >&2
-    exit 2
-  fi
   CANDIDATE_SANDBOX=1
 elif [[ $# -ne 0 ]]; then
   echo 'usage: bash zerokun/verify.sh [--candidate-sandbox]' >&2
@@ -31,6 +27,38 @@ candidate_git_directory_metadata_safe() {
     return 0
   fi
   return 1
+}
+
+# updaterのcandidate sandbox内にいるか。macOSはCodexがSeatbelt内で
+# CODEX_SANDBOX=seatbelt を立てる。LinuxのCodex（bubblewrap）は印を立てないので、
+# updaterが ZERO_CODEX_CANDIDATE_SANDBOX_DENIED に稼働中installの実在fileを渡し、
+# それがsandbox rootから消えていること（deny済み）を証拠にする。sandbox外では
+# 必ず存在するので、staging済みgitを外で使う誤操作はここで止まる。
+candidate_sandbox_active() {
+  [[ "${ZERO_CODEX_CANDIDATE_SANDBOX:-}" == "1" ]] || return 1
+  [[ "${CODEX_SANDBOX:-}" == "seatbelt" ]] && return 0
+  [[ "$(/usr/bin/uname -s 2>/dev/null || uname -s)" == "Linux" ]] || return 1
+  local denied="${ZERO_CODEX_CANDIDATE_SANDBOX_DENIED:-}"
+  [[ -n "$denied" && "$denied" == /* && "$denied" != *$'\n'* && ! -e "$denied" ]]
+}
+
+# '%HT:%u:%l:%Lp' 相当（種別:owner:link数:mode）をmacOS BSD stat / Linux GNU statの
+# どちらでも同じ語で返す。種別は 'Directory' / 'Regular File' / 'Symbolic Link' に揃える
+# （zerokun/stat-compat.sh と同じ対応表。この関数群は単体で抜き出して使われるので
+# sourceしない）。
+candidate_stat_metadata() {
+  local raw
+  if [[ "$(/usr/bin/uname -s 2>/dev/null || uname -s)" == "Darwin" ]]; then
+    LANG=C LC_ALL=C /usr/bin/stat -f '%HT:%u:%l:%Lp' "$1" 2>/dev/null
+    return
+  fi
+  raw="$(LANG=C LC_ALL=C stat -c '%F:%u:%h:%a' "$1" 2>/dev/null)" || return 1
+  case "${raw%%:*}" in
+    'directory') printf 'Directory:%s\n' "${raw#*:}" ;;
+    'regular file'|'regular empty file') printf 'Regular File:%s\n' "${raw#*:}" ;;
+    'symbolic link') printf 'Symbolic Link:%s\n' "${raw#*:}" ;;
+    *) printf '%s\n' "$raw" ;;
+  esac
 }
 
 # Xcode / Command Line Tools が選択されている開発者directoryからgitを解決する。
@@ -131,7 +159,7 @@ staged_candidate_metadata_safe() {
   local target="$1" expected_type="$2" expected_mode="$3" expected_links="${4:-}"
   local metadata file_type owner links mode
 
-  metadata="$(LANG=C LC_ALL=C /usr/bin/stat -f '%HT:%u:%l:%Lp' "$target" 2>/dev/null)" || {
+  metadata="$(candidate_stat_metadata "$target")" || {
     echo "error: staging済みcandidate検証用Gitの ${target} を検証できません" >&2
     return 1
   }
@@ -199,7 +227,7 @@ candidate_git_diff_check() {
   # をZERO_CODEX_CANDIDATE_GITで渡している。sandbox内で開発者directoryを引き直すと
   # 必ず失敗するので、渡されたstaging済みgitを使う。判定は zerokun/project-git.ts の
   # projectGitExecutable と同じく環境変数だけで行い、この関数を単体で呼べる状態に保つ。
-  if [[ "${ZERO_CODEX_CANDIDATE_SANDBOX:-}" == "1" && "${CODEX_SANDBOX:-}" == "seatbelt" ]]; then
+  if candidate_sandbox_active; then
     candidate_git="$(staged_candidate_git)" || return 1
   elif [[ -n "${ZERO_CODEX_CANDIDATE_GIT:-}" ]]; then
     echo 'error: staging済みcandidate検証用Gitは検証済みCodex sandbox内でのみ使用できます' >&2
@@ -211,11 +239,11 @@ candidate_git_diff_check() {
     echo 'error: candidate検証用Gitが安全な実行fileではありません' >&2
     return 1
   fi
-  metadata="$(/usr/bin/stat -f '%u:%l:%Lp' "$candidate_git" 2>/dev/null)" || {
+  metadata="$(candidate_stat_metadata "$candidate_git")" || {
     echo 'error: candidate検証用Gitを検証できません' >&2
     return 1
   }
-  if [[ ! "$metadata" =~ ^([0-9]+):1:([0-7]{3,4})$ ]]; then
+  if [[ ! "$metadata" =~ ^Regular\ File:([0-9]+):1:([0-7]{3,4})$ ]]; then
     echo 'error: candidate検証用Gitのmetadataが不正です' >&2
     return 1
   fi
@@ -256,6 +284,10 @@ candidate_git_diff_check() {
 }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ "$CANDIDATE_SANDBOX" == "1" ]] && ! candidate_sandbox_active; then
+  echo 'error: --candidate-sandbox はupdaterのCodex sandbox内でのみ使用できます' >&2
+  exit 2
+fi
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zerokun-verify.XXXXXX")"
 cleanup_verify() { rm -rf "$BUILD_DIR"; }
 trap cleanup_verify EXIT
