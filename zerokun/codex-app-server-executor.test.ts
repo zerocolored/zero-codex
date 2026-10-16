@@ -5,6 +5,7 @@ import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
 import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
 import {
   chmodSync,
@@ -2998,11 +2999,61 @@ describe('production App Server executor', () => {
       })
       expect(result.sessionId).toBe(shouldResume ? 'thread-existing' : 'thread-app-server-1')
       const prompt = (JSON.parse(readFileSync(promptLog, 'utf8').trim()) as { text: string }).text
-      expect(prompt.includes('Prior Slack thread history')).toBe(!shouldResume)
-      expect(prompt.includes('再利用する論理履歴')).toBe(!shouldResume)
+      expect(prompt).toContain('Prior Slack thread history')
+      expect(prompt).toContain('再利用する論理履歴')
       value.store.close()
     }, 30_000)
   }
+
+  test.each([
+    { write: false, phased: false },
+    { write: true, phased: false },
+    { write: true, phased: true },
+  ])('pre-dispatch failure reaches the next native continuation: %j', async ({ write, phased }) => {
+    const value = fixture('normal', write, '前の調査')
+    const promptLog = join(value.root, 'undelivered-history.jsonl')
+    try {
+      completeFixtureJob(value.store, value.job, 'thread-app-server-1', '前の調査は完了済み')
+      const enqueue = (messageId: string, task: string) => value.store.enqueue({
+        chatId: value.job.chatId, threadTs: value.job.threadTs,
+        repoPath: value.repo, userId: 'UROOT', writeEnabled: write, messageId, task,
+      })
+      const undeliveredTask = '原文パネルを開いたらFAQ領域を縮め、閉じるボタンのホバーを直して'
+      enqueue('1800000000.000200', undeliveredTask)
+      const failed = value.store.claimNext('serial-worker')!
+      expect(failed.resumed).toBe(true)
+      const db = new Database(join(value.state, 'jobs.sqlite3'), { readonly: true })
+      try {
+        expect(db.query('SELECT status, dispatched_at FROM job_initial_dispatches WHERE job_id = ?')
+          .get(failed.id)).toEqual({ status: 'prepared', dispatched_at: null })
+      } finally { db.close() }
+      value.store.fail(failed.id, 'configuration failed before dispatch')
+      enqueue('1800000000.000300', '続けて')
+      Object.assign(value.job, value.store.claimNext('serial-worker')!)
+      expect(value.job).toMatchObject({ resumed: true, sessionId: 'thread-app-server-1' })
+      await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        threadHistory: value.store.threadHistorySnapshot(value.job.id),
+        ...(phased ? { phaseGateForTesting: {} } : {}),
+        extraEnvironment: { ZERO_FIXTURE_MODE: phased ? 'phased' : 'normal', ZERO_PROMPT_LOG: promptLog },
+      })
+      const prompts = readFileSync(promptLog, 'utf8').trim().split('\n')
+        .map(line => JSON.parse(line) as { stage: string; text: string })
+      expect(prompts.map(prompt => prompt.stage))
+        .toEqual(phased ? ['prepare', 'implementation', 'review'] : ['complete'])
+      const first = prompts[0]!.text
+      expect(first).toContain(undeliveredTask)
+      expect(first).toContain('prior job did not complete')
+      expect(first).toContain('前の調査は完了済み')
+      expect(first).toContain('Do not replay completed work')
+      expect(first).toContain('Respect later corrections, cancellations, and the current request')
+      expect(first.lastIndexOf('続けて')).toBeGreaterThan(first.indexOf(undeliveredTask))
+      if (!write) expect(first).toContain('Access mode: read-only.')
+      expect(prompts.slice(1).every(prompt => !prompt.text.includes('Prior Slack thread history')))
+        .toBe(true)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test.each([false, true])('semantic selection reaches start/resume and turns (resume=%s)', async resume => {
     const value = fixture('normal', true)

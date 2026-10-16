@@ -123,7 +123,7 @@ describe('durable Slack thread history', () => {
     expect(renderColdStartThreadHistory(snapshot)).toContain('older job block(s) omitted')
   })
 
-  test('injects history only for a fresh physical session, including resume fallback', () => {
+  test('includes history on initial resume and fresh fallback, but not later resumed phases', () => {
     const snapshot = createDurableThreadHistorySnapshot({
       jobId: 'current', attempt: 1, chatId: 'C0HISTORY01',
       threadTs: '1900000000.000100', repoPath: '/tmp/history-project',
@@ -135,7 +135,9 @@ describe('durable Slack thread history', () => {
         events: [{ order: 0, kind: 'result', text: '前回の結果' }],
       })],
     })
-    expect(threadHistoryForPhysicalSession(snapshot, true)).toBeUndefined()
+    expect(threadHistoryForPhysicalSession(snapshot, true)?.digest).toBe(snapshot.digest)
+    expect(threadHistoryForPhysicalSession(snapshot, true, false)).toBeUndefined()
+    expect(threadHistoryForPhysicalSession(snapshot, false, false)?.digest).toBe(snapshot.digest)
     expect(threadHistoryForPhysicalSession(snapshot, false)?.digest).toBe(snapshot.digest)
   })
 

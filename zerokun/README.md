@@ -124,8 +124,10 @@ active jobの固定済み権限で処理するため、active write jobでは同
 更新するlocal safety policyです。これとは別に、terminal jobのrequest、同thread follow-up、公開済み
 commentary／回答、最終結果または公開用失敗分類を`slack_thread_job_history`へsanitized blockとして永続化します。
 次jobをclaimするtransaction内で、完全一致する`chat_id + thread_ts + repo_path`のimmutable snapshotを
-`job_thread_history_snapshots`へ固定します。native resumeはprovider側の会話を使って二重注入せず、fresh
-threadだけがsnapshotをcurrent requestより前のuntrusted referenceとして受け取ります。write mode／senderは
+`job_thread_history_snapshots`へ固定します。各論理依頼の初回送信では、native resumeでもsnapshotをcurrent request
+より前のuntrusted referenceとして渡し、送信前に失敗してnative会話に残らなかった依頼も引き継ぎます。
+後続phaseへは重複注入せず、fresh threadには従来どおり渡します。履歴の完了・失敗結果と現在状態を照合し、
+完了済み作業を再実行せず、現在の依頼に従って未完了部分を継続します。write mode／senderは
 snapshot scopeではないため、権限を継承せずに同じ会話だけを継続できます。failed／completed job、daemon再起動、
 20 job rotation、protocol変更、job retention GCをまたいでもarchiveは残ります。
 
