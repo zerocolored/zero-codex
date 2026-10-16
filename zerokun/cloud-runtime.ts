@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
-import { CloudHandoffClient, CloudHandoffError, digestBytes, handoffSchema, readCloudConfig } from './cloud-handoff.ts'
+import { CloudHandoffClient, CloudHandoffError, cloudFailureReason, digestBytes, handoffSchema, readCloudConfig } from './cloud-handoff.ts'
 import { CloudCheckpointBlockedError, HandoffCoordinator, writeCheckpoint } from './handoff-coordinator.ts'
 import { captureAttachment, captureRepository, restoreRepository, type HandoffPackage } from './handoff-package.ts'
 import { ensureWorkspacePin, resolveProjectLayout } from './project-layout.ts'
@@ -184,6 +184,7 @@ export class CloudRuntime {
     this.saves.set(job.id, operation)
     try { await operation } catch (error) {
       if (error instanceof CloudCheckpointBlockedError) this.store.blockCloudSave(job.id)
+      else this.store.recordCloudSaveFailure(job.id, cloudFailureReason(error))
       throw error
     } finally { this.saves.delete(job.id) }
   }
@@ -216,7 +217,7 @@ export class CloudRuntime {
     })
   }
 
-  async receive(input: CloudControl): Promise<void> {
+  async receive(input: CloudControl): Promise<'pending' | void> {
     if (this.store.cloudControlHasImported(input.channel, input.message)) return
     const member = await this.client.member()
     if (member.slack_bot_id !== input.bot) throw new CloudControlUnavailableError('このPCのクラウド登録とSlackアプリが一致しません。接続設定を確認してください。')
@@ -229,15 +230,14 @@ export class CloudRuntime {
       this.store.retireCloudThread(waiting.id, waiting.epoch)
       return
     }
-    if (waiting.state === 'saving' && waiting.owner_id === member.user_id
-      && this.store.retryBlockedCloudSave(waiting.id)) {
-      this.store.finishCloudControlWithMessage(input, 'ローカルに保持した作業状態の保存を再試行します。保存が完了してから再開・引き継ぎできます。')
-      return
+    if (waiting.state === 'saving') {
+      this.store.deferCloudControl(input, waiting.owner_id === member.user_id ? waiting.id : undefined)
+      return 'pending'
     }
     if (waiting.owner_id === member.user_id && waiting.reset_at && Date.parse(waiting.reset_at) > Date.now()
       && waiting.state === 'waiting') {
-      this.store.finishCloudControlWithMessage(input, 'まだ利用上限の解除前です。解除後に「続けて」と指示してください。別の担当へ引き継ぐこともできます。')
-      return
+      this.store.deferCloudControl(input)
+      return 'pending'
     }
     if (waiting.state === 'active') {
       try { await this.client.take(waiting, `${input.channel}:${input.message}`) } catch (error) {

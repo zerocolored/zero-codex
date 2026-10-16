@@ -7,6 +7,21 @@ import { releaseProcessLock, tryAcquireProcessLock } from './process-lock.ts'
 export const CLOUD_WAIT_MESSAGE = '利用上限のため待機中です。作業状態は保存しました。他のメンバーに引き継ぐ場合は、そのメンバーをメンションして「引き継いで」と言ってください。利用上限の解除後、私に「続けて」と指示して再開することもできます。'
 export const CLOUD_SAVE_FAILED_MESSAGE = '利用上限のため待機中です。クラウドへの作業状態の保存はまだ完了していません。ローカルの作業は保持しています。保存を再試行し、完了後にお知らせします。'
 export const CLOUD_MAX_BYTES = 512 * 1024 * 1024
+// Keep each JSON object below common Storage/proxy limits. The local package
+// remains unchanged; only its cloud transport is split, with a verified manifest.
+export const CLOUD_CHUNK_BYTES = 3 * 1024 * 1024
+const CLOUD_SINGLE_BYTES = 4 * 1024 * 1024
+const digestSchema = z.string().regex(/^[a-f0-9]{64}$/)
+const chunkManifestSchema = z.object({
+  zerochanCheckpoint: z.literal(1),
+  bytes: z.number().int().min(1).max(CLOUD_MAX_BYTES),
+  digest: digestSchema,
+  chunks: z.array(z.object({ digest: digestSchema,
+    bytes: z.number().int().min(1).max(CLOUD_SINGLE_BYTES + 1024),
+    decodedBytes: z.number().int().min(1).max(CLOUD_CHUNK_BYTES),
+  }).strict()).min(1).max(Math.ceil(CLOUD_MAX_BYTES / CLOUD_CHUNK_BYTES)),
+}).strict()
+const chunkSchema = z.object({ zerochanChunk: z.literal(1), data: z.string() }).strict()
 export const digestBytes = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
 
 const configSchema = z.object({
@@ -38,10 +53,49 @@ export const handoffSchema = z.object({
 })
 export type CloudHandoff = z.infer<typeof handoffSchema>
 export class CloudHandoffError extends Error {
-  constructor(readonly status: number, operation: string) {
+  constructor(readonly status: number, readonly operation: string, readonly providerCode?: string) {
     // Never put responses, tokens or signed URLs into Slack/process logs.
-    super(`cloud handoff ${operation} failed (HTTP ${status})`)
+    super(`cloud handoff ${operation} failed (HTTP ${status}${providerCode ? `; ${providerCode}` : ''})`)
   }
+}
+
+const storageErrorCodes = new Set(['EntityTooLarge', 'ResourceAlreadyExists', 'KeyAlreadyExists',
+  'NoSuchKey', 'NoSuchBucket', 'AccessDenied', 'InvalidJWT', 'InvalidMimeType'])
+
+/** Bounded classification only: never persist provider text, URLs or credentials. */
+async function responseError(response: Response, operation: string): Promise<CloudHandoffError> {
+  let code: string | undefined
+  const reader = response.body?.getReader()
+  if (reader) {
+    try {
+      const chunks: Uint8Array[] = []
+      let length = 0
+      while (true) {
+        const next = await reader.read()
+        if (next.done) break
+        length += next.value.length
+        if (length > 4096) break
+        chunks.push(next.value)
+      }
+      if (length <= 4096) {
+        const value = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        if (storageErrorCodes.has(value?.code)) code = value.code
+      }
+    } catch { /* HTTP status still identifies the failed operation. */ }
+    finally { await reader.cancel().catch(() => {}) }
+  }
+  return new CloudHandoffError(response.status, operation, code)
+}
+
+export function cloudFailureReason(error: unknown): string {
+  if (error instanceof CloudHandoffError) {
+    const stage = ['GET', 'POST', 'upload', 'download', 'authentication refresh'].includes(error.operation)
+      ? error.operation : 'request'
+    const code = error.providerCode && storageErrorCodes.has(error.providerCode) ? `:${error.providerCode}` : ''
+    return `cloud-${stage}:HTTP-${error.status}${code}`
+  }
+  return error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name)
+    ? 'cloud-timeout' : 'cloud-operation-failed'
 }
 
 /** Only member-scoped credentials; never a shared service-role/admin key. */
@@ -86,14 +140,14 @@ export class CloudHandoffClient {
     }
     throw new Error('cloud authentication refresh is busy')
   }
-  private async request(path: string, method: string, body?: string | Uint8Array): Promise<Response> {
+  private async request(path: string, method: string, body?: string | Uint8Array, operation = method): Promise<Response> {
     const config = await this.credentials()
     const response = await this.fetcher(`${config.url}${path}`, {
       method, redirect: 'error', signal: AbortSignal.timeout(60_000),
       headers: { apikey: config.publishableKey, Authorization: `Bearer ${config.accessToken}`,
         'Content-Type': 'application/json' }, body: body as BodyInit | undefined,
     })
-    if (!response.ok) { await response.body?.cancel(); throw new CloudHandoffError(response.status, method) }
+    if (!response.ok) throw await responseError(response, operation)
     return response
   }
   private async rpc(name: string, args: Record<string, unknown>): Promise<CloudHandoff> {
@@ -131,25 +185,48 @@ export class CloudHandoffClient {
   }
   async publish(h: CloudHandoff, bytes: Uint8Array, resetAt: number | null): Promise<CloudHandoff> {
     if (!bytes.length || bytes.length > CLOUD_MAX_BYTES) throw new Error('checkpoint size exceeds limit')
-    const digest = digestBytes(bytes)
-    const key = `${h.space_id}/${h.owner_id}/${h.id}/${digest}.json`
+    const prefix = `${h.space_id}/${h.owner_id}/${h.id}/`
+    let object = bytes
+    if (bytes.length > CLOUD_SINGLE_BYTES) {
+      const chunks: z.infer<typeof chunkManifestSchema>['chunks'] = []
+      for (let offset = 0; offset < bytes.length; offset += CLOUD_CHUNK_BYTES) {
+        const part = bytes.subarray(offset, offset + CLOUD_CHUNK_BYTES)
+        const encoded = Buffer.from(JSON.stringify({ zerochanChunk: 1, data: Buffer.from(part).toString('base64') }))
+        const digest = digestBytes(encoded)
+        await this.uploadVerified(`${prefix}${digest}.json`, encoded)
+        chunks.push({ digest, bytes: encoded.length, decodedBytes: part.length })
+      }
+      object = Buffer.from(JSON.stringify({ zerochanCheckpoint: 1, bytes: bytes.length, digest: digestBytes(bytes), chunks }))
+    }
+    const digest = digestBytes(object)
+    const key = `${prefix}${digest}.json`
+    await this.uploadVerified(key, object)
+    return this.rpc('zerochan_checkpoint', { p_id: h.id, p_epoch: h.epoch, p_state: 'waiting',
+      p_key: key, p_digest: digest, p_bytes: object.length,
+      p_reset: resetAt === null ? null : new Date(resetAt).toISOString() })
+  }
+
+  private async uploadVerified(key: string, bytes: Uint8Array): Promise<void> {
+    let uploadError: unknown
     try {
-      await this.request(`/storage/v1/object/zerochan-handoffs/${key}`, 'POST', bytes)
+      await this.request(`/storage/v1/object/zerochan-handoffs/${key}`, 'POST', bytes, 'upload')
     } catch (error) {
       if (!(error instanceof CloudHandoffError) || ![400, 409].includes(error.status)) throw error
-      // An upload response can be lost. Content verification, not the status
-      // code alone, makes retry idempotent.
+      uploadError = error
     }
-    const uploaded = await this.downloadKey(key, bytes.length)
-    if (digestBytes(uploaded) !== digest) throw new Error('uploaded checkpoint digest mismatch')
-    return this.rpc('zerochan_checkpoint', { p_id: h.id, p_epoch: h.epoch, p_state: 'waiting',
-      p_key: key, p_digest: digest, p_bytes: bytes.length,
-      p_reset: resetAt === null ? null : new Date(resetAt).toISOString() })
+    try {
+      const uploaded = await this.downloadKey(key, bytes.length)
+      if (digestBytes(uploaded) !== digestBytes(bytes)) throw new Error('uploaded checkpoint digest mismatch')
+    } catch (error) {
+      // A duplicate/lost response is success only after exact readback. A
+      // secondary missing-object error must never hide the original rejection.
+      throw uploadError ?? error
+    }
   }
   private async downloadKey(key: string, expected: number): Promise<Uint8Array> {
     if (!/^[a-f0-9-]+\/[a-f0-9-]+\/[a-f0-9-]+\/[a-f0-9]{64}\.json$/.test(key)
-      || expected < 1 || expected > CLOUD_MAX_BYTES) throw new Error('invalid checkpoint reference')
-    const response = await this.request(`/storage/v1/object/authenticated/zerochan-handoffs/${key}`, 'GET')
+      || !Number.isSafeInteger(expected) || expected < 1 || expected > CLOUD_MAX_BYTES) throw new Error('invalid checkpoint reference')
+    const response = await this.request(`/storage/v1/object/authenticated/zerochan-handoffs/${key}`, 'GET', undefined, 'download')
     const reader = response.body?.getReader()
     if (!reader) throw new Error('checkpoint body missing')
     const chunks: Uint8Array[] = []
@@ -170,6 +247,31 @@ export class CloudHandoffClient {
     if (!h.checkpoint_key || !h.checkpoint_digest || !h.checkpoint_bytes) throw new Error('checkpoint not ready')
     const bytes = await this.downloadKey(h.checkpoint_key, h.checkpoint_bytes)
     if (digestBytes(bytes) !== h.checkpoint_digest) throw new Error('checkpoint digest mismatch')
+    // Legacy checkpoints stay readable, including previously published large JSON.
+    if (bytes.length <= 64 * 1024 && Buffer.from(bytes.subarray(0, 24)).toString('utf8').startsWith('{"zerochanCheckpoint":')) {
+      const candidate = JSON.parse(Buffer.from(bytes).toString('utf8'))
+      if (candidate?.zerochanCheckpoint !== undefined) {
+        const manifest = chunkManifestSchema.parse(candidate)
+        if (manifest.chunks.reduce((sum, part) => sum + part.decodedBytes, 0) !== manifest.bytes) {
+          throw new Error('checkpoint manifest size mismatch')
+        }
+        const prefix = h.checkpoint_key.slice(0, h.checkpoint_key.lastIndexOf('/') + 1)
+        const result = Buffer.alloc(manifest.bytes)
+        let offset = 0
+        for (const part of manifest.chunks) {
+          const encoded = await this.downloadKey(`${prefix}${part.digest}.json`, part.bytes)
+          if (digestBytes(encoded) !== part.digest) throw new Error('checkpoint chunk digest mismatch')
+          const chunk = chunkSchema.parse(JSON.parse(Buffer.from(encoded).toString('utf8')))
+          const decoded = Buffer.from(chunk.data, 'base64')
+          if (decoded.length !== part.decodedBytes || decoded.toString('base64') !== chunk.data) {
+            throw new Error('checkpoint chunk size or encoding mismatch')
+          }
+          decoded.copy(result, offset); offset += decoded.length
+        }
+        if (digestBytes(result) !== manifest.digest) throw new Error('checkpoint assembled digest mismatch')
+        return result
+      }
+    }
     return bytes
   }
   take(h: CloudHandoff, eventId: string): Promise<CloudHandoff> {
