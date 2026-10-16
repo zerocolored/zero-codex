@@ -5,6 +5,19 @@ import { join } from 'path'
 import { createHash } from 'crypto'
 import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, claudeStartupFailure, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
+import { claudeBlockedPermission } from './claude-response-diagnostic.ts'
+
+test('working-directory permission is recognized after terminal line wrapping', () => {
+  const dialog = ['Read outside the working directories', 'Read(/synthetic/inbox/image.png)',
+    'Allow this read outside the working directories?',
+    '❯ 1. Yes, and keep allowing any reads outside the working directories',
+    '2. No, and block reads outside the working directories from now on',
+    'Esc to cancel · Tab to amend'].join('\n')
+  expect(claudeBlockedPermission(dialog)).toBe(true)
+  expect(claudeBlockedPermission(dialog.replaceAll('working directories', 'working\n  directories')
+    .replace('allowing any reads', 'allowing\n  any reads'))).toBe(true)
+  expect(claudeBlockedPermission(dialog.replace('Esc to cancel', ''))).toBe(false)
+})
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })

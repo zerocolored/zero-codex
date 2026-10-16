@@ -35,6 +35,8 @@ import { buildCodexChildEnvironment } from './codex-executor.ts'
 import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, type AdvisorFailure } from './advisor-availability.ts'
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
+import { prepareClaudeAdvisorInput } from './claude-advisor-input.ts'
+import { claudeBlockedPermission } from './claude-response-diagnostic.ts'
 import { connectGrokChrome, driveGrokChrome, type GrokChromeControl } from './grok-oauth-chrome.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
@@ -44,7 +46,7 @@ export { GROK_REVIEW_TIMEOUT_MS, GROK_OAUTH_TIMEOUT_MS } from './advisor-timeout
 import { waitForDirectExit } from './subprocess-exit-wait.ts'
 import { startProcessPolling } from './supervisor-watch.ts'
 import { observeProcessGeneration, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
-import { retryAdvisorConnection } from './advisor-connection-retry.ts'
+import { AdvisorConnectionDeadlineError, retryAdvisorConnection } from './advisor-connection-retry.ts'
 export { claudeSubscriptionStatusIsReady } from './claude-auth-status.ts'
 import {
   readPinnedHerdrRuntime,
@@ -2126,6 +2128,8 @@ async function main(): Promise<void> {
     let diagnosticSnapshot: import('./claude-response-diagnostic.ts').ClaudeSnapshotDiagnostic | undefined
     let diagnosticSendCode: ClaudeSendCode | undefined
     let diagnosticSendStatus: 'accepted' | 'rejected' | 'transport-error' | 'unconfirmed' = 'unconfirmed'
+    const diagnosticStartedAt = Date.now()
+    let acquisitionStartedAt: number | undefined
     let startupCode: ClaudeFailureDiagnostic['startupCode']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
@@ -2142,6 +2146,10 @@ async function main(): Promise<void> {
         snapshot: diagnosticSnapshot,
         sendCode: diagnosticSendCode,
         sendStatus: diagnosticSendStatus,
+        timing: { startedAt: diagnosticStartedAt, acquisitionStartedAt,
+          elapsedMs: Date.now() - diagnosticStartedAt,
+          acquisitionElapsedMs: acquisitionStartedAt === undefined ? undefined : Date.now() - acquisitionStartedAt,
+          acquisitionLimitMs: CLAUDE_REVIEW_TIMEOUT_MS },
       })
     }
     const claudeProjectRoot = projectLayout.kind === 'multi-repo-workspace'
@@ -2271,10 +2279,12 @@ async function main(): Promise<void> {
             reason: 'GUI artifact preparation failed; Claude continued as a read-only design advisor.' }
         }
       }
-      const prompt = advisorPrompt(reviewContext, input, phase, round, evidence, uiWorkspace)
+      const preparedInput = prepareClaudeAdvisorInput(stateDir, requestDir, input,
+        continuationInput?.entries.flatMap(entry => entry.attachments))
+      const prompt = preparedInput.rewriteText(advisorPrompt(reviewContext, preparedInput.input, phase, round, evidence, uiWorkspace)
         + (continuationInput && continuationInput.digest !== input.digest
           ? `\n中断した元の相談の続行です。新しい依頼をレビュー済みとは扱わないでください。\n最新追記が対象の変更・取消・権限の制限を含む場合は、元の対象を調査せず、その変更をprimaryへ返してください。\n最新入力revision: ${continuationInput.revision} / digest: ${continuationInput.digest}\n最新入力(JSON): ${JSON.stringify(safeInput(continuationInput.transcript, 'continuation transcript', MAX_TRANSCRIPT_CHARS))}`
-          : '')
+          : ''))
       writeFileSync(join(requestDir, 'prompt'), prompt, { flag: 'wx', mode: 0o600 })
       writeFileSync(join(requestDir, CLAUDE_ANSWER_FILE), '', { flag: 'wx', mode: 0o600 })
       const helper = resolveFifthAdvisorHelper()
@@ -2360,7 +2370,8 @@ async function main(): Promise<void> {
         }
         failureStage = 'acquisition'
         if (sendOutcome.stateChangeSeq !== undefined) target.stateChangeSeq = sendOutcome.stateChangeSeq
-        const acquisitionDeadline = Date.now() + CLAUDE_REVIEW_TIMEOUT_MS
+        acquisitionStartedAt = Date.now()
+        const acquisitionDeadline = acquisitionStartedAt + CLAUDE_REVIEW_TIMEOUT_MS
         const settling = new ClaudeResponseSettling()
         const blockedSettling = new ClaudeResponseSettling()
         const startSettling = new ClaudeResponseSettling(CLAUDE_START_CONFIRMATION_MS)
@@ -2382,7 +2393,8 @@ async function main(): Promise<void> {
             // Continue tracking the exact occupant and one-time marker instead.
             while (true) {
               roundSignal?.throwIfAborted()
-              if (Date.now() >= acquisitionDeadline) throw new Error('Claude response acquisition deadline exceeded')
+              if (Date.now() >= acquisitionDeadline) throw new AdvisorFailureError(
+                { advisor: 'claude', cause: 'timeout' }, 'Claude response acquisition deadline exceeded')
               await Bun.sleep(2_000)
               roundSignal?.throwIfAborted()
               const current = unwrapAgent(await herdrJson(
@@ -2404,10 +2416,12 @@ async function main(): Promise<void> {
                 if (snapshot?.read.outcome === 'state-changed' || observed?.status !== 'blocked') {
                   blockedSettling.reset(); continue
                 }
-                const progress = createHash('sha256').update(snapshot?.transcript ?? JSON.stringify(snapshot?.read.failure)).digest('hex')
-                if (!blockedSettling.exhausted(`${observed.sequence}:${progress}`, Date.now())) continue
-                failure = { advisor: 'claude', cause: 'response' }
-                diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+                const permission = snapshot?.transcript !== undefined && claudeBlockedPermission(snapshot.transcript)
+                const progress = permission ? 'working-directory-permission'
+                  : createHash('sha256').update(snapshot?.transcript ?? JSON.stringify(snapshot?.read.failure)).digest('hex')
+                if (!blockedSettling.exhausted(permission ? progress : `${observed.sequence}:${progress}`, Date.now())) continue
+                failure = { advisor: 'claude', cause: permission ? 'permission' : 'response' }
+                diagnosticFailure = { stage: 'acquisition', cause: failure.cause }
                 reason = snapshot?.transcript === undefined
                   ? 'Claude response blocked; terminal observation unavailable; no input was sent'
                   : 'Claude response acquisition stopped at a stable blocked interactive state; no input was sent'
@@ -2546,6 +2560,9 @@ async function main(): Promise<void> {
       }
       reason = String(error)
       if (error instanceof AdvisorFailureError) failure = error.failure
+      if (error instanceof AdvisorConnectionDeadlineError || error instanceof ClaudeReadError) {
+        failure = { advisor: 'claude', cause: diagnosticOperation === 'authentication' ? 'auth-check' : 'connection' }
+      }
       failure ??= classifyAdvisorFailure('claude', reason)
       diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause,
         operation: failureStage === 'acquisition' ? 'acquisition' : diagnosticOperation,

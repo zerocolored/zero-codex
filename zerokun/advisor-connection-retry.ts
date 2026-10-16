@@ -1,4 +1,8 @@
 /** Retry observations only. Never wrap prompt delivery or external mutations. */
+export class AdvisorConnectionDeadlineError extends Error {
+  constructor() { super('advisor connection retry budget exhausted') }
+}
+
 export async function retryAdvisorConnection<T>(options: {
   read: () => Promise<T>
   retryable: (error: unknown) => boolean
@@ -12,14 +16,14 @@ export async function retryAdvisorConnection<T>(options: {
   const deadline = now() + (options.timeoutMs ?? 120_000)
   for (let attempt = 0; ; attempt++) {
     options.signal?.throwIfAborted()
-    if (now() >= deadline) throw new Error('advisor connection deadline exceeded')
+    if (now() >= deadline) throw new AdvisorConnectionDeadlineError()
     try { return await options.read() }
     catch (error) {
       options.signal?.throwIfAborted()
       if (!options.retryable(error)) throw error
       options.onRetry?.(error, attempt + 1)
       const remaining = deadline - now()
-      if (remaining <= 0) throw error
+      if (remaining <= 0) throw new AdvisorConnectionDeadlineError()
       const delay = Math.min(remaining, 30_000, 1_000 * 2 ** Math.min(attempt, 5))
       if (options.wait) await options.wait(delay)
       else await new Promise<void>((resolve, reject) => {
