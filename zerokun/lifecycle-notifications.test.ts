@@ -5,6 +5,8 @@ import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import {
   JobStore,
+  readerActionBanner,
+  READER_ACTION_BANNER,
   SLACK_QUEUE_WAIT_MESSAGE,
   SLACK_QUEUED_START_MESSAGE,
   SLACK_RATE_LIMIT_WAIT_MESSAGE,
@@ -1466,7 +1468,7 @@ describe('durable lifecycle notifications', () => {
     await flushTerminalNotifications(store, notifier, () => {}, 1)
     await Bun.sleep(2)
     await flushTerminalNotifications(store, notifier, () => {}, 1)
-    expect(posts).toEqual(['できました。'])
+    expect(posts).toEqual([`${READER_ACTION_BANNER.done}\n\n<@${job.userId}> できました。`])
     expect(reactionAttempts).toBe(2)
     expect(store.terminalNotificationCount()).toBe(0)
   })
@@ -1508,4 +1510,13 @@ describe('durable lifecycle notifications', () => {
     expect(store.terminalNotificationCount()).toBe(0)
     store.close()
   })
+})
+
+test('terminal limits request resumption and do not promise an unscheduled retry', () => {
+  for (const status of ['budgetLimited', 'usageLimited']) {
+    expect(readerActionBanner(status)).toContain('再開を依頼')
+    expect(readerActionBanner(status)).not.toContain('自動')
+  }
+  expect(READER_ACTION_BANNER.failed).toContain('同じスレッド')
+  expect(SLACK_RATE_LIMIT_WAIT_MESSAGE).toContain('自動で再開')
 })

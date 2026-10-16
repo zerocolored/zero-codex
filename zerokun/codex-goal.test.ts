@@ -40,6 +40,20 @@ test('malformed goal is not treated as completed', async () => {
   await expect(readTaskGoal(session, 'root')).rejects.toThrow('invalid task goal')
 })
 
+test('blocked goal must lead the Slack reply with one concrete ask', () => {
+  // ブロック報告が「何を調べたか」から始まると、読む人には何をしてほしいのか
+  // 分からない情報の羅列になる。2026-09-28 のオーナー指摘:
+  // 「やってほしいことがあるのかないのか分からない。ただの情報しか垂れ流して
+  // いないからノイズでしかない」。冒頭1行に依頼を置かせる。
+  const objective = taskGoalObjective('job-1')
+  expect(objective).toContain('お願い: <who> が <what> してください')
+  // 誰に・何を・どこで、を具体名で書かせる。
+  expect(objective).toContain('Name the person or role')
+  // 調査内容や内部記録を先頭に置かせない。
+  expect(objective).toContain('Do not open with what you investigated')
+  // 依頼が無いときも、その旨を同じ1行目で言わせる（黙って情報だけ出させない）。
+  expect(objective).toContain('If you truly need nothing from the reader')
+})
 test('completed parent collects its existing advisor round without launching a replacement', async () => {
   const goal = { objective: 'task', status: 'complete' as const }, session = fixture(goal)
   const result = await retainGoalForAdvisors(session, 'root', 'job', goal,

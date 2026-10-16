@@ -2759,7 +2759,7 @@ describe('production App Server executor', () => {
           expect(delivered[0]).toContain('保持して待機しました')
           if (goalStatus !== 'complete') {
             expect(delivered[0]).toContain(answer)
-            expect(delivered[0]).toContain('未完了・待機中')
+            expect(delivered[0]).toContain(goalStatus === 'paused' ? '🙋 要判断' : '⏸️ 待ち')
           }
           const rpc = readFileSync(rpcLog, 'utf8').trim().split('\n').map(line => JSON.parse(line))
           expect(rpc.filter(row => row.method === 'turn/start')).toHaveLength(1)

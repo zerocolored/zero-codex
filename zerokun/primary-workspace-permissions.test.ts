@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, linkSync, lstatSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { buildCodexChildEnvironment, buildCodexDeveloperInstructions, buildCodexPermissionOverrides } from './codex-executor.ts'
@@ -7,8 +7,8 @@ import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.
 import type { JobRecord } from './job-runner.ts'
 import { registerSlackApp } from './slack-app-registry.ts'
 
-function fixture() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-primary-permissions-')))
+function fixture(prefix = 'zero-primary-permissions-') {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)))
   const repo = join(root, 'repo'); mkdirSync(repo)
   const state = prepareManagedStateRoot(join(root, 'state'))
   const scratch = ensureManagedDirectory(state, join(state, 'scratch'))
@@ -304,3 +304,39 @@ test('primary network delegation does not enable networking or approvals for rea
     }
   } finally { rmSync(f.root, {recursive:true, force:true}) }
 })
+
+for (const link of [symlinkSync, linkSync]) {
+  test(`preload publication replaces a ${link.name} leaf without overwriting its referent`, () => {
+    const f = fixture()
+    try {
+      const sentinel = join(f.root, 'outside')
+      writeFileSync(sentinel, 'keep')
+      for (const name of ['.zerokun-dns-fallback.cjs', '.zerokun-sandbox-diagnostics.cjs']) {
+        const path = join(f.scratch, name)
+        rmSync(path, { force: true })
+        link(sentinel, path)
+        f.overrides(true)
+        expect(readFileSync(sentinel, 'utf8')).toBe('keep')
+        expect(lstatSync(path).isSymbolicLink()).toBe(false)
+        expect(lstatSync(path).nlink).toBe(1)
+        expect(readFileSync(path, 'utf8')).not.toBe('keep')
+      }
+      expect(() => f.overrides(true)).not.toThrow()
+    } finally { rmSync(f.root, { recursive: true, force: true }) }
+  })
+}
+
+for (const prefix of ['zero preload spaces-', 'zero preload "quoted"-']) {
+  test(`Node starts with both preloads in a normal ${prefix} path`, () => {
+    const f = fixture(prefix)
+    try {
+      const config = Bun.TOML.parse(f.overrides(true).join('\n')) as any
+      const options = config.shell_environment_policy.set.NODE_OPTIONS
+      const result = Bun.spawnSync(['node', '-e', 'process.stdout.write("preload-ok")'], {
+        env: { ...process.env, NODE_OPTIONS: options }, stdout: 'pipe', stderr: 'pipe',
+      })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+      expect(result.stdout.toString()).toBe('preload-ok')
+    } finally { rmSync(f.root, { recursive: true, force: true }) }
+  })
+}

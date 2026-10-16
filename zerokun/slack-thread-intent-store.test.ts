@@ -90,11 +90,11 @@ describe('durable Slack thread reply intent ledger', () => {
     const processing = stage(store, '1789000201.000001', '1789000200.000001')
     const now = Date.now()
     const deadline = now + 15 * 60_000
-    store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)
+    expect(store.claimSlackThreadReplyIntent(failure.idempotencyKey, now)?.status).toBe('processing')
     store.deferSlackThreadReplyIntent(failure.idempotencyKey, 'thread intent classifier exited 1', deadline, true)
-    store.claimSlackThreadReplyIntent(context.idempotencyKey, now)
+    expect(store.claimSlackThreadReplyIntent(context.idempotencyKey, now)?.status).toBe('processing')
     store.deferSlackThreadReplyIntent(context.idempotencyKey, 'Slack context rate limited', deadline)
-    expect(store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)).not.toBeNull()
+    expect(store.claimSlackThreadReplyIntent(processing.idempotencyKey, now, 15 * 60_000)?.leaseExpiresAt).toBe(deadline)
     store.close()
 
     const beforeOpen = Date.now()
