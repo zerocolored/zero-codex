@@ -346,6 +346,14 @@ export interface LiveControlTarget {
 export type SlackThreadReplyIntentStatus =
   | 'pending' | 'processing' | 'addressed' | 'ignored'
 
+export interface SlackThreadFailureReaction {
+  idempotencyKey: string
+  chatId: string
+  messageId: string
+  desired: number
+  revision: number
+}
+
 export interface SlackThreadReplyIntentRecord {
   idempotencyKey: string
   chatId: string
@@ -1284,6 +1292,15 @@ CREATE TABLE IF NOT EXISTS slack_thread_reply_intents (
 );
 CREATE INDEX IF NOT EXISTS idx_slack_thread_reply_intents_ready
   ON slack_thread_reply_intents(status, not_before, created_at);
+-- Separate outbox: ignored/delivered intents still need reaction cleanup.
+CREATE TABLE IF NOT EXISTS slack_thread_failure_reactions (
+  idempotency_key TEXT PRIMARY KEY,
+  desired INTEGER NOT NULL CHECK (desired IN (0, 1)),
+  revision INTEGER NOT NULL DEFAULT 1,
+  not_before INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_slack_thread_failure_reactions_due
+  ON slack_thread_failure_reactions(not_before);
 CREATE TABLE IF NOT EXISTS migration_ledger (
   name TEXT PRIMARY KEY,
   completed_at INTEGER NOT NULL
@@ -5531,6 +5548,14 @@ export class JobStore {
          WHERE idempotency_key = ? AND status = 'processing'`,
         [decision, decidedAt, key],
       )
+      // Only failures we recorded own an x reaction. A normal ignored message
+      // must never issue add/remove calls (nor interfere with unrelated reactions).
+      this.db.run(
+        `UPDATE slack_thread_failure_reactions
+         SET desired = 0, revision = revision + 1, not_before = 0
+         WHERE idempotency_key = ? AND desired = 1`,
+        [key],
+      )
       if (decision === 'ignored') {
         this.db.run(
           `INSERT INTO delivery_tombstones (idempotency_key, write_enabled, completed_at)
@@ -5561,19 +5586,70 @@ export class JobStore {
     idempotencyKey: string,
     error: string,
     notBefore: number,
+    classifierFailed = false,
   ): boolean {
     const key = requireText(idempotencyKey, 'thread intent idempotencyKey')
     if (!Number.isSafeInteger(notBefore) || notBefore <= Date.now()) {
       throw new Error('thread intent retry time is invalid')
     }
     const message = error.replace(/[\r\n]+/g, ' ').slice(0, 512) || 'classifier failed'
-    return retrySqlite(() => this.db.run(
-      `UPDATE slack_thread_reply_intents
-       SET status = CASE WHEN status = 'processing' THEN 'pending' ELSE status END,
-           not_before = ?, lease_expires_at = NULL, last_error = ?
-       WHERE idempotency_key = ? AND status IN ('pending', 'processing', 'addressed')`,
-      [notBefore, message, key],
-    ).changes === 1)
+    const defer = this.db.transaction(() => {
+      const changed = this.db.run(
+        `UPDATE slack_thread_reply_intents
+         SET status = CASE WHEN status = 'processing' THEN 'pending' ELSE status END,
+             not_before = ?, lease_expires_at = NULL, last_error = ?
+         WHERE idempotency_key = ? AND status IN ('pending', 'processing', 'addressed')`,
+        [notBefore, message, key],
+      ).changes === 1
+      if (changed && classifierFailed) {
+        this.db.run(
+          `INSERT OR IGNORE INTO slack_thread_failure_reactions
+             (idempotency_key, desired, revision, not_before)
+           SELECT idempotency_key, 1, 1, 0 FROM slack_thread_reply_intents
+           WHERE idempotency_key = ? AND status = 'pending'`,
+          [key],
+        )
+      }
+      return changed
+    })
+    return retrySqlite(() => defer.immediate())
+  }
+
+  listDueSlackThreadFailureReactions(now = Date.now()): SlackThreadFailureReaction[] {
+    return retrySqlite(() => this.db.query<SlackThreadFailureReaction, [number]>(
+      `SELECT reaction.idempotency_key AS idempotencyKey, intent.chat_id AS chatId,
+              intent.message_id AS messageId, reaction.desired, reaction.revision
+       FROM slack_thread_failure_reactions AS reaction
+       JOIN slack_thread_reply_intents AS intent USING (idempotency_key)
+       WHERE reaction.not_before <= ?
+       ORDER BY reaction.not_before, intent.created_at LIMIT 16`,
+    ).all(now))
+  }
+
+  settleSlackThreadFailureReaction(reaction: SlackThreadFailureReaction): void {
+    retrySqlite(() => {
+      if (reaction.desired) {
+        this.db.run(
+          `UPDATE slack_thread_failure_reactions SET not_before = NULL
+           WHERE idempotency_key = ? AND revision = ? AND desired = 1`,
+          [reaction.idempotencyKey, reaction.revision],
+        )
+      } else {
+        this.db.run(
+          `DELETE FROM slack_thread_failure_reactions
+           WHERE idempotency_key = ? AND revision = ? AND desired = 0`,
+          [reaction.idempotencyKey, reaction.revision],
+        )
+      }
+    })
+  }
+
+  deferSlackThreadFailureReaction(reaction: SlackThreadFailureReaction, notBefore: number): void {
+    retrySqlite(() => this.db.run(
+      `UPDATE slack_thread_failure_reactions SET not_before = ?
+       WHERE idempotency_key = ? AND revision = ?`,
+      [notBefore, reaction.idempotencyKey, reaction.revision],
+    ))
   }
 
   recordDeliveryTombstone(idempotencyKey: string, completedAt = Date.now()): void {
@@ -12776,14 +12852,18 @@ export class JobStore {
       // Keep these compact rows after job/result GC instead of re-resolving it.
       const threads = 0
       const tombstones = this.db.run(
-        'DELETE FROM delivery_tombstones WHERE completed_at < ?',
+        `DELETE FROM delivery_tombstones WHERE completed_at < ?
+           AND NOT EXISTS (SELECT 1 FROM slack_thread_failure_reactions AS reaction
+             WHERE reaction.idempotency_key = delivery_tombstones.idempotency_key)`,
         [tombstoneCutoff],
       ).changes + this.db.run(
         'DELETE FROM update_request_ledger WHERE created_at < ?',
         [tombstoneCutoff],
       ).changes + this.db.run(
         `DELETE FROM slack_thread_reply_intents
-         WHERE decided_at IS NOT NULL AND decided_at < ?`,
+         WHERE decided_at IS NOT NULL AND decided_at < ?
+           AND NOT EXISTS (SELECT 1 FROM slack_thread_failure_reactions AS reaction
+             WHERE reaction.idempotency_key = slack_thread_reply_intents.idempotency_key)`,
         [tombstoneCutoff],
       ).changes
       const liveJobs = this.db.query<{ id: string; attachments_json: string }, []>(
