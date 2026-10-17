@@ -687,6 +687,11 @@ async function admitSlackChannelThreadReply(input: {
     if (!(error instanceof SlackChannelRouteRequiredError) && !(error instanceof SlackProjectUnavailableError)) throw error
   }
   if (cloudRuntime && explicitlyAddressedHandoff(input.text, botUserId)) return 'addressed'
+  // An explicit resume of our own thread must not depend on the same model
+  // account whose usage limit stopped that task. Authorization still uses gate.
+  if (handoffControl(normalizeSlackInboundText(input.text, botUserId, false)) === 'continue'
+    && jobStore.getThread(input.channelId, input.threadTs) !== null
+    && jobStore.hasLocalRateLimitWait(input.channelId, input.threadTs)) return 'addressed'
   if (input.channelId.startsWith('D') || input.threadTs === input.messageTs) {
     return 'addressed'
   }
@@ -1498,7 +1503,15 @@ function deliver(
       }
       return true
     }
-    const cloudAction = cloudRuntime ? handoffControl(text) : null
+    // A local paused task takes precedence over an unrelated cloud record in
+    // this Slack thread. The transaction records both the command and reply.
+    const continuation = handoffControl(text)
+    if (continuation === 'continue' && (!fileIds || fileIds.length === 0)) {
+      const resumed = jobStore.resumeLocalRateLimitedJob({ chatId, threadTs: resolvedThreadTs,
+        messageId: messageTs, repoPath: resolveUnclaimedRepoPath(chatId, resolvedThreadTs), writeEnabled })
+      if (resumed !== null) { rememberDelivered(key); return true }
+    }
+    const cloudAction = cloudRuntime ? continuation : null
     if (cloudAction || (writeEnabled && isExplicitUpdateRequest(text))) {
       assertSlackProjectAdmission(resolveUnclaimedRepoPath(chatId, resolvedThreadTs), messageTs)
     }

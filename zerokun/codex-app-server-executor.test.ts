@@ -5711,7 +5711,7 @@ describe('production App Server executor', () => {
       turnId: 'turn-before-account-switch',
       requestId: 601,
     })
-    const resumeAt = Date.now() - 1
+    const resumeAt = Date.now() + 3_600_000
     value.store.finishAppServerTurn({
       jobId: value.job.id,
       epoch: value.job.controlEpoch,
@@ -5726,6 +5726,10 @@ describe('production App Server executor', () => {
     value.store.requeueAt(
       value.job.id, resumeAt, 'account switch fixture', missingThread, 'rate-limit',
     )
+    expect(value.store.claimNext('still-waiting')).toBeNull()
+    expect(value.store.resumeLocalRateLimitedJob({ chatId: value.job.chatId,
+      threadTs: value.job.threadTs, messageId: `${(Date.now() + 1) / 1000}`,
+      repoPath: value.job.repoPath, writeEnabled: true })).toBe('resumed')
     const retried = value.store.claimNext('account-switch-worker', 20, Date.now())!
     expect(retried).toMatchObject({
       attempts: 2,
