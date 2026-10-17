@@ -1,5 +1,6 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE, STORAGE_FAILURE_MESSAGE } from './storage-failure.ts'
+import { handoffControl } from './handoff-control.ts'
 import { legacyTransportThrottle, throttleRetryDelay, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitReason } from './codex-rate-limit.ts'
 import { isPrimaryCore, type PrimaryCore, type JobRuntime } from './primary-core.ts'
 import { migratePrimaryCoreRuntime } from './primary-core-migration.ts'
@@ -1297,6 +1298,14 @@ CREATE TABLE IF NOT EXISTS update_request_ledger (
   idempotency_key TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS job_rate_limit_resume_overrides (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  terminal_json TEXT,
+  attempt INTEGER NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  requested_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS delivery_tombstones (
   idempotency_key TEXT PRIMARY KEY,
   write_enabled INTEGER NOT NULL DEFAULT 0,
@@ -4474,6 +4483,8 @@ export function requireSafeDatabasePath(dbPath: string): void {
   }
 }
 
+class LocalResumeAdmissionError extends Error {}
+
 export class JobStore {
   private readonly db: Database
   readonly nativeConfirmations: NativeConfirmationStore
@@ -5979,6 +5990,126 @@ export class JobStore {
       return boundJobId === null ? 'staged' as const : 'bound' as const
     })
     return retrySqlite(() => stage.immediate())
+  }
+
+  private localRateLimitResumeTarget(chatId: string, threadTs: string): JobRow | null {
+    const row = this.db.query<JobRow, [string, string]>(
+      'SELECT * FROM jobs WHERE chat_id=? AND thread_ts=? ORDER BY seq DESC LIMIT 1',
+    ).get(chatId, threadTs)
+    return row?.runtime === 'codex' && row.status === 'queued' && row.workflow === 'work'
+      && this.cloudHandoff(row.id) === null
+      && (row.not_before !== null || row.rate_limit_terminal_json !== null) ? row : null
+  }
+
+  hasLocalRateLimitWait(chatId: string, threadTs: string): boolean {
+    if (this.localRateLimitResumeTarget(chatId, threadTs)) return true
+    // A terminal receipt is durable before the worker finishes cleanup. Admit
+    // the resume without the classifier here; only requeue may release it.
+    const row = this.db.query<JobRow, [string, string]>(
+      'SELECT * FROM jobs WHERE chat_id=? AND thread_ts=? ORDER BY seq DESC LIMIT 1',
+    ).get(chatId, threadTs)
+    if (!row || row.runtime !== 'codex' || row.workflow !== 'work' || row.status !== 'running'
+      || this.cloudHandoff(row.id) !== null) return false
+    const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
+    return receipt !== null && receipt.jobId === row.id && receipt.attempt === row.attempts
+      && receipt.controlEpoch === row.control_epoch && this.hasObservedTurnSource(receipt)
+  }
+
+  /** A host resume command continues a terminal turn; it never replays its effects. */
+  resumeLocalRateLimitedJob(input: {
+    chatId: string; threadTs: string; messageId: string; repoPath: string; writeEnabled: boolean
+  }): 'resumed' | 'duplicate' | 'blocked' | null {
+    const key = `${input.chatId}:${input.messageId}`
+    return retrySqlite(() => this.db.transaction(() => {
+      const legacy = this.db.query<JobInterjectionRow, [string]>(
+        "SELECT * FROM job_interjections WHERE idempotency_key=? AND status='ready'",
+      ).get(key)
+      const inbound = this.db.query<InboundDeliveryRow, [string]>(
+        "SELECT * FROM inbound_deliveries WHERE idempotency_key=? AND status='processing'",
+      ).get(key)
+      const admitted = inbound && inbound.chat_id === input.chatId && inbound.thread_ts === input.threadTs
+        && inbound.repo_path === input.repoPath && (inbound.write_enabled === 1) === input.writeEnabled
+        && handoffControl(inbound.text) === 'continue' && JSON.parse(inbound.file_ids_json).length === 0
+      if (this.db.query<{ present: number }, [string]>(
+        'SELECT 1 AS present FROM delivery_tombstones WHERE idempotency_key=?',
+      ).get(key) || (this.hasDurableEvent(key) && !legacy && !admitted)) return 'duplicate' as const
+      // Do not resurrect an older task behind a newer task in the same thread.
+      const row = this.localRateLimitResumeTarget(input.chatId, input.threadTs)
+      if (!row || row.repo_path !== input.repoPath) return null
+      try {
+        assertSlackProjectAdmission(input.repoPath, input.messageId)
+      } catch {
+        // Only project admission failures are isolated during recovery. Database
+        // and notification failures must still roll back and reach the caller.
+        throw new LocalResumeAdmissionError('Project admission refused the saved resume request')
+      }
+      const receipt = parseCodexRateLimitTerminalReceipt(row.rate_limit_terminal_json)
+      const initial = this.db.query<{ status: string; control_epoch: number }, [string, number]>(
+        'SELECT status,control_epoch FROM job_initial_dispatches WHERE job_id=? AND attempt=?',
+      ).get(row.id, row.attempts)
+      const terminal = receipt !== null && receipt.jobId === row.id
+        && receipt.attempt <= row.attempts && receipt.controlEpoch === row.control_epoch
+        && receipt.threadId === row.session_id && this.hasObservedTurnSource(receipt)
+        && this.db.query<{ present: number }, [string, number]>(
+          'SELECT 1 AS present FROM codex_session_protocols WHERE session_id=? AND protocol_version=?',
+        ).get(receipt.threadId, CODEX_SESSION_PROTOCOL_VERSION) !== null
+      const undelivered = row.rate_limit_terminal_json === null
+        && initial?.control_epoch === row.control_epoch
+        && ['prepared', 'rejected'].includes(initial.status)
+        && !this.controlMayHaveBeenDelivered(row.id)
+      const safe = (terminal || undelivered)
+        && (row.write_enabled === 0 || input.writeEnabled)
+        && row.cancel_requested_at === null && row.terminal_outcome === null
+        && row.ui_approval_request_id === null && row.executor_pid === null
+        && row.active_turn_id === null && row.pending_session_id === null && row.pending_result === null
+        && (!legacy || (legacy.job_id === row.id && legacy.control_epoch === row.control_epoch
+          && handoffControl(legacy.task) === 'continue' && parseAttachments(legacy.attachments_json).length === 0))
+        && Number(input.messageId) * 1000 >= (receipt?.recordedAt ?? row.created_at)
+      this.recordDeliveryTombstone(key)
+      const now = Date.now()
+      if (legacy) this.db.run(`UPDATE job_interjections SET status='superseded',last_error='handled as host resume control'
+        WHERE id=? AND status='ready'`, [legacy.id])
+      if (safe) {
+        // Keep the terminal receipt, session, revision and prior effects intact.
+        // claimNext starts a fresh App Server with the current login.
+        this.db.run('UPDATE jobs SET not_before=NULL WHERE id=?', [row.id])
+        this.db.run(`INSERT OR REPLACE INTO job_rate_limit_resume_overrides
+          (job_id,terminal_json,attempt,control_epoch,requested_at) VALUES (?,?,?,?,?)`,
+        [row.id, row.rate_limit_terminal_json, row.attempts, row.control_epoch, now])
+        this.db.run(`UPDATE status_notifications SET superseded_at=COALESCE(superseded_at,?)
+          WHERE job_id=? AND kind='rate-limited' AND delivered_at IS NULL`, [now, row.id])
+      }
+      this.stageStatusNotificationRow({ idempotencyKey: `local-resume:${key}`, jobId: null,
+        chatId: input.chatId, threadTs: input.threadTs, kind: 'rate-limited', createdAt: now,
+        payload: safe
+          ? '再開依頼を受け付けました。現在のログイン状態で、保存済みの作業から再試行します。'
+          : '再開依頼を受け付けましたが、実行権限または前回の停止状態を確認できないため再開していません。作業は保持しています。' })
+      return safe ? 'resumed' as const : 'blocked' as const
+    }).immediate())
+  }
+
+  /** Upgrade old resume requests that were incorrectly parked as questions. */
+  recoverQueuedRateLimitResumes(): number {
+    const rows = this.db.query<{ chat_id: string; thread_ts: string; message_id: string;
+      repo_path: string; write_enabled: number; task: string; attachments_json: string }, []>(
+      `SELECT i.chat_id,i.thread_ts,i.message_id,j.repo_path,i.write_enabled,i.task,i.attachments_json
+       FROM job_interjections i JOIN jobs j ON j.id=i.job_id
+       WHERE i.status='ready' AND j.status='queued' AND j.runtime='codex'
+         AND j.not_before IS NOT NULL ORDER BY i.seq`,
+    ).all()
+    let resumed = 0
+    for (const row of rows) {
+      if (handoffControl(row.task) !== 'continue' || parseAttachments(row.attachments_json).length) continue
+      try {
+        if (this.resumeLocalRateLimitedJob({ chatId: row.chat_id, threadTs: row.thread_ts,
+          messageId: row.message_id, repoPath: row.repo_path, writeEnabled: row.write_enabled === 1 }) === 'resumed') resumed++
+      } catch (error) {
+        // A disconnected or invalid project configuration must not stop
+        // recovery of unrelated projects. Keep this request and its wait intact.
+        if (!(error instanceof LocalResumeAdmissionError)) throw error
+      }
+    }
+    return resumed
   }
 
   hasDurableEvent(idempotencyKey: string): boolean {
@@ -7489,6 +7620,14 @@ export class JobStore {
     expected: LiveControlTarget,
     input: Omit<LiveControlInput, 'kind'>,
   ): 'staged' | 'duplicate' | 'closed' {
+    if (handoffControl(input.task) === 'continue' && !input.attachments?.length) {
+      const current = this.liveControlTarget(input.chatId, input.threadTs)
+      if (current?.jobId === expected.jobId && current.epoch === expected.epoch) {
+        const resumed = this.resumeLocalRateLimitedJob({ chatId: input.chatId, threadTs: input.threadTs,
+          messageId: input.messageId, repoPath: expected.repoPath, writeEnabled: input.writeEnabled === true })
+        if (resumed !== null) return resumed === 'duplicate' ? 'duplicate' : 'staged'
+      }
+    }
     let target: LiveControlTarget | null = expected
     for (let attempt = 0; attempt < 2 && target; attempt += 1) {
       const disposition = target.awaitingUiApproval || this.auditSetupWaiting(target.jobId)
@@ -13863,6 +14002,9 @@ export class JobStore {
     if (changes !== 1) {
       throw new Error(`job ${id} cannot be safely deferred after initial App Server delivery`)
     }
+    // A resume can arrive after the terminal receipt but before this worker
+    // finishes cleanup. Consume that parked command now, not at the old reset.
+    this.recoverQueuedRateLimitResumes()
   }
 
   reconcileInterjectionsBeforeRecovery(): {
@@ -13941,13 +14083,30 @@ export class JobStore {
         requeued += 1
       } else if (this.carriedRateLimitTerminalForUndeliveredAttempt(job.id)) {
         const receipt = this.carriedRateLimitTerminalForUndeliveredAttempt(job.id)!
+        // A user resume survives a crash after claim but before delivery. Bind
+        // the override to the exact terminal so a later quota cannot inherit it.
+        const requested = this.db.query<{ requested_at: number }, [string]>(
+          `SELECT r.requested_at FROM job_rate_limit_resume_overrides r JOIN jobs j ON j.id=r.job_id
+           WHERE r.job_id=? AND r.terminal_json=j.rate_limit_terminal_json`,
+        ).get(job.id)
         this.requeueAt(
           job.id,
-          receipt.resumeAt,
+          requested?.requested_at ?? receipt.resumeAt,
           'daemon restarted before a carried rate-limit continuation was delivered',
           receipt.threadId,
           receipt.reason,
         )
+        requeued += 1
+      } else if (job.rateLimitRecovery === null && this.db.query<{ present: number }, [string, number, number]>(
+        `SELECT 1 AS present FROM job_rate_limit_resume_overrides
+         WHERE job_id=? AND terminal_json IS NULL AND control_epoch=? AND attempt<?`,
+      ).get(job.id, job.controlEpoch, job.attempts)
+        && this.initialTurnDispatchIsSafeToRetry(job.id)
+        && !this.controlMayHaveBeenDelivered(job.id)) {
+        // The accepted retry and this interrupted attempt both have proof of
+        // no delivery; preserve the user's resume without replaying any turn.
+        this.requeueAt(job.id, Date.now(), 'daemon restarted before an explicit resume was delivered',
+          job.sessionId ?? undefined)
         requeued += 1
       } else if (job.workflow === 'security-audit') {
         this.db.run(`UPDATE jobs SET status='queued', worker_id=NULL, executor_pid=NULL,
@@ -14002,6 +14161,7 @@ export class JobStore {
         requeued += 1
       }
     }
+    this.recoverQueuedRateLimitResumes()
     return { requeued, failedWrites, failedUncertain }
   }
 

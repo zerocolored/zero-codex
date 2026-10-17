@@ -10,6 +10,18 @@ const threadIntentSource = readFileSync(
 )
 
 describe('Slack bridge resilience wiring', () => {
+  test('explicit owned-thread resume bypasses model classification and reaches local recovery before cloud routing', () => {
+    const admission = server.slice(server.indexOf('async function admitSlackChannelThreadReply('), server.indexOf('function settleAddressedThreadReplyWithoutDelivery('))
+    expect(admission.indexOf("handoffControl(normalizeSlackInboundText(input.text, botUserId, false)) === 'continue'"))
+      .toBeLessThan(admission.indexOf('threadIntentRunner'))
+    expect(admission).toContain('jobStore.getThread(input.channelId, input.threadTs) !== null')
+    expect(admission).toContain('jobStore.hasLocalRateLimitWait(input.channelId, input.threadTs)')
+    const delivery = server.slice(server.indexOf('function deliver('))
+    const local = delivery.indexOf('jobStore.resumeLocalRateLimitedJob(')
+    expect(local).toBeGreaterThan(0)
+    expect(local).toBeLessThan(delivery.indexOf('cloudRuntime.client.find('))
+    expect(delivery).toContain('(!fileIds || fileIds.length === 0)')
+  })
   test('Bot tokenとApp tokenのApp ID一致をSocket接続前に検証する', () => {
     const verify = server.lastIndexOf('await verifySlackAppTokenPair(')
     const start = server.lastIndexOf('await slackApp.start()')
