@@ -4842,6 +4842,27 @@ export class JobStore {
     )
   }
 
+  answerNativeConfirmation(input: Parameters<NativeConfirmationStore['answer']>[0]): boolean | null {
+    return this.db.transaction(() => {
+      const key = `${input.chatId}:${input.messageId}`
+      if (this.db.query('SELECT 1 FROM delivery_tombstones WHERE idempotency_key=?').get(key)) return true
+      if (this.hasDurableEvent(key) || this.getSlackThreadReplyIntent(key)?.status === 'ignored') return null
+      // A code-free event predating the displayed prompt belongs to ordinary
+      // thread routing. Do not consume it merely because a newer upload waits.
+      if (!input.code && !this.nativeConfirmations.hasPendingForThread(
+        input.chatId, input.threadTs, Date.now(), input.messageId)) return null
+      const answered = this.nativeConfirmations.answer(input)
+      this.stageStatusNotificationRow({ idempotencyKey: `native-confirmation-answer:${key}`, jobId: null,
+        chatId: input.chatId, threadTs: input.threadTs, kind: 'closed-control', createdAt: Date.now(),
+        payload: answered
+          ? input.decision === 'accept' ? 'アップロードの許可を受け付けました。同じ処理を続けます。'
+            : 'アップロードのキャンセルを受け付けました。この送信は行いません。'
+          : 'この返事ではアップロードを許可・キャンセルできませんでした。依頼したご本人が、返答待ちの確認と同じスレッドで「今回だけ許可」または「キャンセル」と返信してください。番号の入力は不要です。' })
+      this.recordDeliveryTombstone(key)
+      return answered
+    }).immediate()
+  }
+
   private stageStatusNotificationRow(input: {
     idempotencyKey: string
     jobId: string | null
@@ -12128,7 +12149,11 @@ export class JobStore {
         `SELECT payload FROM commentary_notifications
          WHERE job_id = ? AND attempt = ? ORDER BY seq DESC LIMIT 1`,
       ).get(jobId, attempt)
-      if (!throttleNotice && previous?.payload === payload) {
+      // Separate native requests can ask about the same destination. They must
+      // each be delivered even when their user-facing text is identical.
+      const nativeConfirmation = this.db.query('SELECT 1 FROM native_confirmations WHERE source_key=? AND job_id=?')
+        .get(sourceKey, jobId)
+      if (!throttleNotice && !nativeConfirmation && previous?.payload === payload) {
         // Persist the new source identity even when its public body is
         // suppressed. Otherwise an App Server replay after an intervening
         // message could resurrect this old commentary out of order.

@@ -108,7 +108,7 @@ test('integration authorization distinguishes product tests, host delivery and m
     expect(write).toContain('Codex native Auto-review handles eligible permission requests')
     expect(write).toContain('not a pending user dialog')
     expect(write).toContain('Other native MCP elicitation requests are answered with action=cancel')
-    expect(write).toContain('exact reply containing the host-issued confirmation code')
+    expect(write).toContain('The requesting user replies 今回だけ許可 or キャンセル without a code.')
     expect(write).toContain('does not mean the user declined, and does not approve the operation')
     expect(write).toContain('a generic Slack reply can answer an unsupported native confirmation')
     expect(write).not.toContain('Do not construct direct Slack API')
