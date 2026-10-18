@@ -672,10 +672,20 @@ async function admitSlackChannelThreadReply(input: {
   budgetLane?: SlackBudgetLane
 }): Promise<ThreadReplyAdmission> {
   if (SLACK_BOT_ID_RE.test(input.userId) && !mentionsBot(input.text, botUserId)) return 'ignored'
-  // Host-issued confirmation commands address the host directly. Their user,
-  // thread, lease and native-process binding are checked in deliver(), never
-  // decided by the audience classifier or interpreted as a model instruction.
-  if (parseNativeConfirmationAnswer(normalizeSlackInboundText(input.text, botUserId, false))) return 'addressed'
+  // Preserve already-settled audience/event decisions before host commands.
+  const priorConfirmationAdmission = settledThreadReplyAdmission(`${input.channelId}:${input.messageTs}`)
+  if (priorConfirmationAdmission === 'ignored' || priorConfirmationAdmission === 'handled') return priorConfirmationAdmission
+  // Host confirmation commands resolve against the delivered request before
+  // any async classifier; they never become model input when claimed.
+  const confirmation = parseNativeConfirmationAnswer(normalizeSlackInboundText(input.text, botUserId, false))
+  if (confirmation) {
+    // Finish this host command here, before an async audience decision or a
+    // second routing check can turn a now-closed confirmation into model input.
+    const answered = jobStore.answerNativeConfirmation({ ...confirmation, chatId: input.channelId,
+      threadTs: input.threadTs, userId: input.userId, messageId: input.messageTs,
+      writeEnabled: resolveInboundWriteEnabled(input.channelId, input.userId, loadAccess().writeAllowFrom) })
+    if (answered !== null) return 'handled'
+  }
   if (isSlackProjectStop(input.text, botUserId, input.channelId.startsWith('D'))) return 'addressed'
   try {
     assertSlackProjectAdmission(resolveUnclaimedRepoPath(input.channelId, input.threadTs), input.messageTs)
@@ -1490,18 +1500,11 @@ function deliver(
     const writeEnabled = resolveInboundWriteEnabled(chatId, userId, access.writeAllowFrom)
     const confirmation = parseNativeConfirmationAnswer(normalizeSlackInboundText(text, botUserId, chatId.startsWith('D')))
     if (confirmation) {
-      const answered = jobStore.nativeConfirmations.answer({ ...confirmation, chatId,
+      // The decision, visible acknowledgement and deduplication commit together.
+      // A reply never becomes a new model task, including an incorrect legacy code.
+      const answered = jobStore.answerNativeConfirmation({ ...confirmation, chatId,
         threadTs: resolvedThreadTs, userId, messageId: messageTs, writeEnabled })
-      // A confirmation reply is never queued as a new task or used to steer the
-      // model. The runner holding the original stdin consumes it once.
-      jobStore.recordDeliveryTombstone(key)
-      rememberDelivered(key)
-      if (!answered) {
-        await slackApp!.client.chat.postEphemeral({ channel: chatId, thread_ts: resolvedThreadTs,
-          user: userId, text: 'この確認には回答できません。依頼したご本人が、現在有効な確認番号を使って返信してください。',
-        }).catch(() => {})
-      }
-      return true
+      if (answered !== null) { rememberDelivered(key); return true }
     }
     // A local paused task takes precedence over an unrelated cloud record in
     // this Slack thread. The transaction records both the command and reply.

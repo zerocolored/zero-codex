@@ -88,10 +88,14 @@ test('only the native browser empty upload form is relayed with a sanitized orig
   }
 })
 
-test('ordinary replies, quotes and missing confirmation codes never approve', () => {
-  for (const text of ['続けて', '許可', '今回だけ許可', '> 今回だけ許可 abcdef123456', '今回だけ許可 abcdef123456\n続けて', '今回だけ許可 old']) {
+test('only explicit upload replies parse; no user-entered code is required', () => {
+  for (const text of ['続けて', '> 今回だけ許可 abcdef123456', '今回だけ許可 abcdef123456\n続けて', '今回だけ許可 old']) {
     expect(parseNativeConfirmationAnswer(text)).toBeNull()
   }
+  expect(parseNativeConfirmationAnswer('今回だけ許可')).toEqual({ decision: 'accept' })
+  expect(parseNativeConfirmationAnswer('許可')).toEqual({ decision: 'accept' })
+  expect(parseNativeConfirmationAnswer('キャンセル')).toEqual({ decision: 'decline' })
+  expect(parseNativeConfirmationAnswer('今回だけ許可  abcdef123456')).toEqual({ code: 'abcdef123456', decision: 'accept' })
   expect(parseNativeConfirmationAnswer('今回だけ許可 abcdef123456')).toEqual({ code: 'abcdef123456', decision: 'accept' })
   expect(parseNativeConfirmationAnswer('キャンセル abcdef123456')).toEqual({ code: 'abcdef123456', decision: 'decline' })
 })
@@ -145,8 +149,8 @@ test.each(['accept', 'decline'] as const)('outbox → exact Slack reply → same
       expect(event.text).not.toContain('untrusted')
       f.publish(event)
       const message = f.deliver()
-      const code = /今回だけ許可 ([a-f0-9]{12})/.exec(message.payload)![1]!
-      expect(f.store.nativeConfirmations.answer({ ...f.answer, code, decision })).toBe(true)
+      expect(message.payload).not.toMatch(/今回だけ許可 [a-f0-9]{12}/)
+      expect(f.store.answerNativeConfirmation({ ...f.answer, decision })).toBe(true)
       return true
     },
   })).resolves.toBe(decision)
@@ -180,8 +184,8 @@ test.each(['http://127.0.0.1', 'http://localhost', 'https://example.test', 'http
         expect(event.text).toContain(origin)
         f.publish(event)
         const notification = f.deliver()
-        const code = /今回だけ許可 ([a-f0-9]{12})/.exec(notification.payload)![1]!
-        expect(f.store.nativeConfirmations.answer({ ...f.answer, code })).toBe(true)
+        expect(notification.payload).toContain('今回だけ許可')
+        expect(f.store.nativeConfirmations.answer(f.answer)).toBe(true)
         return true
       },
     })).toBe('accept')
@@ -200,7 +204,7 @@ test('missing destination text still cannot solicit an ambiguous approval', asyn
   expect(published).toBe(false)
 })
 
-test('the public destination and code survive the real notifier formatting and second redaction', async () => {
+test('the actual notifier marks upload confirmation as a decision with no code entry', async () => {
   const f = fixture(), controller = new AbortController()
   let payload = ''
   await awaitNativeConfirmation({ store: f.store.nativeConfirmations, binding: f.binding,
@@ -214,7 +218,111 @@ test('the public destination and code survive the real notifier formatting and s
   await notifier.progress(f.job, `💬 ${payload}`)
   expect(sent).toHaveLength(1)
   expect(sent[0]).toContain(f.binding.origin)
-  const code = /今回だけ許可 ([a-f0-9]{12})/.exec(payload)![1]!
-  expect(sent[0]).toContain(`今回だけ許可 ${code}`)
-  expect(sent[0]).toContain(`キャンセル ${code}`)
+  expect(sent[0]).toContain('🙋 要判断')
+  expect(sent[0]).toContain(`<@${f.job.userId}>`)
+  expect(sent[0]).not.toContain('対応不要')
+  expect(sent[0]).not.toMatch(/今回だけ許可 [a-f0-9]{12}/)
+})
+
+
+test('code-free approval requires delivery and rejects an older Slack event', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' })
+  expect(n.answer(f.answer)).toBe(false)
+  f.deliver()
+  expect(n.answer({ ...f.answer, messageId: '1000000000.000100' })).toBe(false)
+  expect(n.answer(f.answer)).toBe(true)
+  expect(n.poll(row)).toBe('accept')
+})
+
+test('a code-free reply cannot choose between two live requests', () => {
+  const f = fixture(), n = f.store.nativeConfirmations
+  for (let requestId = 0; requestId < 2; requestId++) {
+    const row = n.create({ ...f.binding, requestId })!
+    f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  }
+  expect(n.answer(f.answer)).toBe(false)
+})
+
+test('replayed approval cannot approve the next native request', () => {
+  const f = fixture(), n = f.store.nativeConfirmations
+  const row = n.create(f.binding)!; f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  expect(f.store.answerNativeConfirmation(f.answer)).toBe(true)
+  expect(n.poll(row)).toBe('accept')
+  const next = n.create({ ...f.binding, requestId: 1 })!
+  f.publish({ sourceKey: next.sourceKey, text: 'お願い: another upload' }); f.deliver()
+  expect(f.store.answerNativeConfirmation(f.answer)).toBe(true)
+  expect(n.poll(next)).toBeNull()
+  expect(f.store.pendingStatusNotifications()).toHaveLength(1)
+})
+
+test('wrong old code gets a durable explanation, then a code-free retry succeeds', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  expect(f.store.answerNativeConfirmation({ ...f.answer, code: 'wrong-code' })).toBe(false)
+  expect(n.poll(row)).toBeNull()
+  expect(f.store.pendingStatusNotifications()[0]!.payload).toContain('番号の入力は不要')
+  expect(f.store.hasDurableEvent(`${f.answer.chatId}:${f.answer.messageId}`)).toBe(true)
+  expect(f.store.answerNativeConfirmation({ ...f.answer, messageId: '1800000000.000102' })).toBe(true)
+  expect(n.poll(row)).toBe('accept')
+  expect(f.store.pendingStatusNotifications()).toHaveLength(2)
+})
+
+test('outbox failure rolls back the decision and event tombstone together', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  f.db.exec("CREATE TRIGGER fail_status BEFORE INSERT ON status_notifications BEGIN SELECT RAISE(ABORT, 'fixture outbox failure'); END")
+  expect(() => f.store.answerNativeConfirmation(f.answer)).toThrow('fixture outbox failure')
+  expect(n.poll(row)).toBeNull()
+  expect(f.store.hasDurableEvent(`${f.answer.chatId}:${f.answer.messageId}`)).toBe(false)
+  f.db.exec('DROP TRIGGER fail_status')
+  expect(f.store.answerNativeConfirmation(f.answer)).toBe(true)
+})
+
+test.each(['userId', 'chatId', 'threadTs', 'writeEnabled'] as const)('code-free answer rejects wrong %s', field => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  expect(n.answer({ ...f.answer, [field]: field === 'writeEnabled' ? false : 'different' })).toBe(false)
+  expect(n.poll(row)).toBeNull()
+})
+
+
+test('a delayed reply from before prompt delivery cannot approve the new request', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  // The user replied while the prompt was still in the outbox; Slack delivers
+  // that inbound event only after the prompt delivery receipt exists.
+  const receiptTime = Number(f.answer.messageId) * 1000 + 1000
+  f.db.run('UPDATE commentary_notifications SET delivered_at=? WHERE source_key=?', [receiptTime, row.sourceKey])
+  expect(f.store.answerNativeConfirmation(f.answer)).toBeNull()
+  expect(f.store.hasDurableEvent(`${f.answer.chatId}:${f.answer.messageId}`)).toBe(false)
+  expect(f.store.pendingStatusNotifications()).toHaveLength(0)
+  expect(n.poll(row)).toBeNull()
+  expect(f.store.answerNativeConfirmation({ ...f.answer, messageId: '1800000002.000100' })).toBe(true)
+  expect(n.poll(row)).toBe('accept')
+})
+
+
+test('a crashed request lease cannot permanently intercept normal thread replies', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, now = Date.now()
+  n.create(f.binding, now)
+  expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs, now)).toBe(true)
+  expect(n.hasPendingForThread(f.job.chatId, 'another-thread', now)).toBe(false)
+  expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs, now + 30_001)).toBe(false)
+  f.db.run("UPDATE jobs SET status='completed' WHERE id=?", [f.job.id])
+  expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs, now)).toBe(false)
+})
+
+
+test('an older ordinary reply and an already queued event are not consumed by a new confirmation', () => {
+  const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
+  f.publish({ sourceKey: row.sourceKey, text: 'お願い: upload' }); f.deliver()
+  const old = { ...f.answer, messageId: '1000000000.000100', decision: 'decline' as const }
+  expect(f.store.answerNativeConfirmation(old)).toBeNull()
+  expect(f.store.hasDurableEvent(`${old.chatId}:${old.messageId}`)).toBe(false)
+  const messageId = '1800000001.000100'
+  f.store.stageInboundDelivery({ ...f.answer, messageId, repoPath: f.job.repoPath, text: '許可', fileIds: [] })
+  expect(f.store.answerNativeConfirmation({ ...f.answer, messageId })).toBeNull()
+  expect(f.store.pendingStatusNotifications()).toHaveLength(0)
+  expect(n.poll(row)).toBeNull()
 })

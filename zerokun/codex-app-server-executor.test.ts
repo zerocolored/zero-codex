@@ -3261,8 +3261,8 @@ describe('production App Server executor', () => {
               value.store.stageCommentaryNotification(value.job.id, value.job.attempts, event.sourceKey, `💬 ${event.text}`)
               const notice = value.store.pendingCommentaryNotifications()[0]!
               value.store.markCommentaryNotificationDelivered(notice.id)
-              const line = event.text.split('\n').find(line => line.startsWith('今回だけ許可 '))!
-              expect(value.store.nativeConfirmations.answer({ ...parseNativeConfirmationAnswer(line)!,
+              const line = event.text.split('\n').find(line => line === '今回だけ許可')!
+              expect(value.store.answerNativeConfirmation({ ...parseNativeConfirmationAnswer(line)!,
                 chatId: value.job.chatId, threadTs: value.job.threadTs, userId: value.job.userId,
                 messageId: '1800000000.000200', writeEnabled: scenario.write })).toBe(true)
               return true

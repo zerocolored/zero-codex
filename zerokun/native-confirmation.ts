@@ -62,9 +62,9 @@ export function browserUploadConfirmation(params: Record<string, unknown>): Nati
   } catch { return null }
 }
 
-export function parseNativeConfirmationAnswer(text: string): { code: string; decision: NativeConfirmationDecision } | null {
-  const match = /^(今回だけ許可|キャンセル) ([a-f0-9]{12})$/.exec(text.trim())
-  return match ? { code: match[2]!, decision: match[1] === '今回だけ許可' ? 'accept' : 'decline' } : null
+export function parseNativeConfirmationAnswer(text: string): { code?: string; decision: NativeConfirmationDecision } | null {
+  const match = /^(今回だけ許可|許可|キャンセル)(?:[ \t　]+([a-f0-9]{12}))?$/.exec(text.trim())
+  return match ? { ...(match[2] ? { code: match[2] } : {}), decision: match[1] === 'キャンセル' ? 'decline' : 'accept' } : null
 }
 
 type Binding = NativeConfirmation & { jobId: string; epoch: number; executorNonce: string; requestId: number | string }
@@ -103,25 +103,48 @@ export class NativeConfirmationStore {
     return { ...binding, code, sourceKey }
   }
 
-  /** An exact reply from the requesting user is an answer, never an ordinary new Codex task. */
-  answer(input: { code: string; decision: NativeConfirmationDecision; chatId: string; threadTs: string;
-    userId: string; messageId: string; writeEnabled: boolean }, now = Date.now()): boolean {
-    if (!input.writeEnabled) return false
-    const result = this.db.run(`UPDATE native_confirmations SET decision=?,answer_message_id=?
-      WHERE code=? AND status='pending' AND decision IS NULL AND expires_at>?
-      AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=native_confirmations.job_id
-        AND j.chat_id=? AND j.thread_ts=? AND j.user_id=? AND j.status='running'
-        AND j.write_enabled=1 AND j.cancel_requested_at IS NULL
-        AND j.control_epoch=native_confirmations.epoch AND j.executor_nonce=native_confirmations.executor_nonce
-        AND j.active_thread_id=native_confirmations.thread_id AND j.active_turn_id=native_confirmations.turn_id)
-      AND EXISTS (SELECT 1 FROM commentary_notifications c WHERE c.source_key=native_confirmations.source_key
-        AND c.suppressed_at IS NULL)`, [input.decision, input.messageId, input.code, now,
-      input.chatId, input.threadTs, input.userId])
-    if (result.changes === 1) return true
+  hasPendingForThread(chatId: string, threadTs: string, now = Date.now(), messageId?: string): boolean {
+    if (messageId !== undefined && !/^\d+\.\d{6}$/.test(messageId)) return false
+    const messageMs = messageId === undefined ? null : Number(messageId) * 1000
     return Boolean(this.db.query(`SELECT 1 FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
-      WHERE n.code=? AND n.answer_message_id=? AND n.decision=? AND j.chat_id=? AND j.thread_ts=? AND j.user_id=?`).get(
-      input.code, input.messageId, input.decision, input.chatId, input.threadTs, input.userId,
-    ))
+      WHERE j.chat_id=? AND j.thread_ts=? AND n.status='pending' AND n.expires_at>?
+        AND j.status='running' AND j.cancel_requested_at IS NULL
+        AND j.control_epoch=n.epoch AND j.executor_nonce=n.executor_nonce
+        AND j.active_thread_id=n.thread_id AND j.active_turn_id=n.turn_id
+        AND (? IS NULL OR (n.created_at<=? AND EXISTS (SELECT 1 FROM commentary_notifications c
+          WHERE c.source_key=n.source_key AND c.suppressed_at IS NULL AND c.delivered_at<=?)))
+        LIMIT 1`).get(chatId, threadTs, now, messageMs, messageMs, messageMs))
+  }
+
+  /** Resolve an explicit reply to one delivered, live request; identifiers stay internal. */
+  answer(input: { code?: string; decision: NativeConfirmationDecision; chatId: string; threadTs: string;
+    userId: string; messageId: string; writeEnabled: boolean }, now = Date.now()): boolean {
+    if (!input.writeEnabled || !/^\d+\.\d{6}$/.test(input.messageId)) return false
+    return this.db.transaction(() => {
+      // Replay must resolve its original decision before considering any newer request.
+      const prior = this.db.query<{ code: string; decision: string }, [string, string, string, string]>(
+        `SELECT n.code,n.decision FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
+         WHERE n.answer_message_id=? AND j.chat_id=? AND j.thread_ts=? AND j.user_id=?`,
+      ).get(input.messageId, input.chatId, input.threadTs, input.userId)
+      if (prior) return prior.decision === input.decision && (!input.code || prior.code === input.code)
+      const candidates = this.db.query<{ code: string }, [number, string, string, string, number, string | null, number, string | null, string | null]>(
+        `SELECT n.code FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
+         JOIN commentary_notifications c ON c.source_key=n.source_key
+         WHERE n.status='pending' AND n.decision IS NULL AND n.expires_at>?
+           AND j.chat_id=? AND j.thread_ts=? AND j.user_id=? AND j.status='running'
+           AND j.write_enabled=1 AND j.cancel_requested_at IS NULL
+           AND j.control_epoch=n.epoch AND j.executor_nonce=n.executor_nonce
+           AND j.active_thread_id=n.thread_id AND j.active_turn_id=n.turn_id
+           AND n.created_at<=? AND c.suppressed_at IS NULL
+           AND (? IS NOT NULL OR (c.delivered_at IS NOT NULL AND c.delivered_at<=?))
+           AND (? IS NULL OR n.code=?) LIMIT 2`,
+      ).all(now, input.chatId, input.threadTs, input.userId, Number(input.messageId) * 1000,
+        input.code ?? null, Number(input.messageId) * 1000, input.code ?? null, input.code ?? null)
+      if (candidates.length !== 1) return false
+      return this.db.run(`UPDATE native_confirmations SET decision=?,answer_message_id=?
+        WHERE code=? AND status='pending' AND decision IS NULL`,
+      [input.decision, input.messageId, candidates[0]!.code]).changes === 1
+    }).immediate()
   }
 
   poll(row: Row, now = Date.now()): NativeConfirmationDecision | null {
@@ -168,10 +191,10 @@ export async function awaitNativeConfirmation(options: {
   if (!row) return 'cancel'
   try {
     const text = options.prepareText([
-      `ブラウザが、この依頼で使うファイルを ${row.origin} へアップロードする確認を求めています。`,
+      `お願い: この依頼のファイルを ${row.origin} へアップロードしてよいか確認してください。`,
       '依頼したご本人が、このスレッドで次のどちらかを返信してください。',
-      `今回だけ許可 ${row.code}`,
-      `キャンセル ${row.code}`,
+      '今回だけ許可',
+      'キャンセル',
       '回答後は同じ処理を続けます。この確認だけへの回答で、常時許可にはしません。',
     ].join('\n'))
     // An approval must display its exact destination. This is a delivery
