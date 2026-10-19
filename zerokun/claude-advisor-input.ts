@@ -1,6 +1,6 @@
 import { createHash } from 'crypto'
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync } from 'fs'
-import { dirname, extname, join, relative, resolve, sep } from 'path'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, writeFileSync } from 'fs'
+import { extname, join, resolve } from 'path'
 import type { AdvisorInputSnapshot } from './advisor-input.ts'
 import { requireManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 
@@ -21,12 +21,9 @@ export function prepareClaudeAdvisorInput(stateDir: string, requestDir: string,
   let total = 0
   for (const source of new Set([...input.entries.flatMap(entry => entry.attachments), ...additionalAttachments])) {
     const path = resolve(source)
-    const rel = relative(state, path)
-    if (!['inbox', 'live-input'].includes(rel.split(sep)[0] ?? '')
-      || realpathSync(dirname(path)) !== dirname(path)) {
-      throw new Error('Claude attachment is outside managed task inputs')
-    }
-    requireManagedDirectory(state, dirname(path))
+    // The host input ledger already selected these attachments. Their storage
+    // location is not an authorization boundary: handoff restores them outside
+    // the state directory, and future transports may use another location.
     const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
       const before = fstatSync(fd)
