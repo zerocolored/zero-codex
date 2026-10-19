@@ -101,10 +101,37 @@ test('Claude診断ログが同居しても実回答観測からSlack最終報告
   expect(result).not.toContain('未完了')
 })
 
-test('診断ログを無視しても未取得の実回答を成功に変えない', async () => {
+test.each(['unavailable', 'missing', 'started', 'disabled'] as const)('取得済みGPT回答を終了時の履歴再確認で降格しない: %s', async mode => {
   const f = fixture()
+  const observed = await f.observe(false)
+  const evidence = mode === 'disabled' ? false : mode === 'missing' ? []
+    : mode === 'started' ? observed.map(value => ({ ...value, state: 'started-no-response' as const })) : observed
+  const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, evidence)
+  expect(coverage?.phases[0]).toMatchObject({ started: 3, responsesObtained: 3, startUnconfirmed: 0 })
+  const result = enforceHostAdvisorCoverage('ログイン復旧待ちです。', coverage, 'result')
+  expect(result).toContain('起動3/3・回答3/3')
+  expect(result).toContain('ログイン復旧待ちです。')
+  expect(result).not.toContain('回答を取得できませんでした')
+})
+
+test('保存も実観測もないGPT回答は成功に変えず、後の実観測成功だけを反映する', async () => {
+  const f = fixture()
+  writeFileSync(f.journalPath, JSON.stringify({ ...f.journal,
+    native: [{ perspective: 'solution', attempted: true, adopted: false, started: false,
+      reasonDigest: 'c'.repeat(64), failure: { advisor: 'codex', cause: 'startup' } }],
+  }))
   const coverage = collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, await f.observe(false))
   expect(coverage?.phases[0]).toMatchObject({ responsesObtained: 2, startUnconfirmed: 1 })
+  expect(enforceHostAdvisorCoverage('調査結果です。', coverage, 'result')).toContain('GPT:')
+  const obtained = await f.observe(true)
+  expect(collectHostAdvisorCoverage(f.state, f.job.id, f.nonce, obtained)?.phases[0])
+    .toMatchObject({ responsesObtained: 3, startUnconfirmed: 0 })
+  for (const mismatch of [{ attemptNonce: 'd'.repeat(32) }, { inputRevision: 2 },
+    { inputDigest: 'e'.repeat(64) }, { phase: 'review' as const }, { round: 2 as const }]) {
+    expect(collectHostAdvisorCoverage(f.state, f.job.id, f.nonce,
+      obtained.map(value => ({ ...value, ...mismatch })))?.phases[0])
+      .toMatchObject({ responsesObtained: 2, startUnconfirmed: 1 })
+  }
 })
 
 test.each([false, true])('中断復旧=%sでも元の失敗原因をjournalからSlack通知まで保持する', async recoveredAfterInterruption => {

@@ -1675,11 +1675,11 @@ describe('production App Server executor', () => {
       phases: [
         {
           phase: 'investigation', inputRevision: 1,
-          total: 5, started: 1, responsesObtained: 1, startUnconfirmed: 2, unavailableBeforeStart: 2,
+          total: 5, started: 3, responsesObtained: 3, startUnconfirmed: 0, unavailableBeforeStart: 2,
         },
         {
           phase: 'review', inputRevision: 2,
-          total: 5, started: 1, responsesObtained: 1, startUnconfirmed: 2, unavailableBeforeStart: 2,
+          total: 5, started: 3, responsesObtained: 3, startUnconfirmed: 0, unavailableBeforeStart: 2,
         },
       ],
     })
@@ -1713,16 +1713,17 @@ describe('production App Server executor', () => {
       expect(coverage.phases[0]).toMatchObject({
         phase: 'investigation', started: 3, responsesObtained: 3, startUnconfirmed: 0,
       })
-      // The same two observations must not leak into the final-review revision.
+      // The final-review revision retains its own accepted answers, without
+      // needing the initial-design observations to prove them again.
       expect(coverage.phases[1]).toMatchObject({
-        phase: 'review', started: 1, responsesObtained: 1, startUnconfirmed: 2,
+        phase: 'review', started: 3, responsesObtained: 3, startUnconfirmed: 0,
       })
     }
     expect(collectHostAdvisorCoverage(state, jobId, nonce, observed.slice(1))!.phases[0])
-      .toMatchObject({ started: 2, responsesObtained: 2, startUnconfirmed: 1, unavailableBeforeStart: 2 })
+      .toMatchObject({ started: 3, responsesObtained: 3, startUnconfirmed: 0, unavailableBeforeStart: 2 })
     expect(collectHostAdvisorCoverage(state, jobId, nonce, observed.map(value => ({
       ...value, attemptNonce: 'e'.repeat(32),
-    })))!.phases[0]).toMatchObject({ started: 1, responsesObtained: 1, startUnconfirmed: 2 })
+    })))!.phases[0]).toMatchObject({ started: 3, responsesObtained: 3, startUnconfirmed: 0 })
   })
 
   test('version 9 journalはphase別3枠として集計しphase違いnativeを拒否する', () => {

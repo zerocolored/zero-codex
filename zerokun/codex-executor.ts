@@ -1894,8 +1894,9 @@ function advisorJournalPath(
 
 /**
  * Read-only, best-effort accounting for public execution claims. It derives
- * counts from validated terminal slot records and never trusts the model's
- * prose or the journal's cached aggregate.
+ * counts from validated terminal slot records, including answers accepted by
+ * the broker. Later history reads can add evidence, not erase a saved answer.
+ * Model-authored coverage prose and cached aggregates are not counted.
  */
 export function collectHostAdvisorCoverage(
   stateDirInput: string,
@@ -1974,6 +1975,11 @@ export function collectHostAdvisorCoverage(
           : validTerminalGrokAttempts(journal.grok))
         || !validTerminalClaudeAttempt(journal.claude)) continue
       const nativeState = (perspective: 'solution' | 'risk') => {
+        // The broker already received this slot's answer. A missing child in
+        // a later history snapshot is not evidence that the answer vanished.
+        const saved = (journal.native as Array<Record<string, unknown>>)
+          .find(value => value.perspective === perspective)
+        if (saved?.adopted === true) return 'response-obtained' as const
         const matches = Array.isArray(nativeEvidence) ? nativeEvidence.filter(value => (
           value.attemptNonce === attemptNonce && value.inputRevision === inputRevision
           && value.inputDigest === journal.inputDigest && value.phase === phase
@@ -7138,10 +7144,10 @@ export async function executeCodexJob(
   const claudeAdvisorLookup = (() => {
     try { return resolveClaudeExecutableLookup() } catch { return undefined }
   })()
-  // Native advisor claims originate inside the model turn. Production counts
-  // them only after a separate App Server history read proves the child
-  // threads and their complete marker-bound responses exist. Test binaries do
-  // not emulate that API unless an explicit history fixture is supplied.
+  // Native advisor answers are accepted by the broker during the model turn.
+  // A separate App Server history read can supplement missing slot evidence;
+  // it must not erase an already accepted answer. Test binaries do not emulate
+  // that API unless an explicit history fixture is supplied.
   const nativeAdvisorHistoryEnabled = testCodexBin === undefined
     || options.nativeAdvisorHistoryFixtureForTesting !== undefined
     || options.readNativeAdvisorCoverageForTesting !== undefined
