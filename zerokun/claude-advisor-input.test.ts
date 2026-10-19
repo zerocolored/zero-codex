@@ -42,12 +42,25 @@ test('同一内容を重複保存せず、追記添付も同じ専用領域へ�
   expect(result.rewriteText(second)).toBe(result.input.entries[0]!.attachments[0]!)
 })
 
-test.each(['outside', 'symlink', 'hardlink', 'directory'])('不正な添付はコピー前に拒否する: %s', kind => {
+test.each(['symlink', 'hardlink', 'directory'])('不正な添付はコピー前に拒否する: %s', kind => {
   const f = fixture()
   let source = join(f.state, 'inbox', 'unsafe')
-  if (kind === 'outside') { source = join(f.state, 'auth.json'); writeFileSync(source, 'synthetic') }
   if (kind === 'symlink') symlinkSync(f.source, source)
   if (kind === 'hardlink') linkSync(f.source, source)
   if (kind === 'directory') mkdirSync(source)
   expect(() => prepareClaudeAdvisorInput(f.state, f.request, f.input([source]))).toThrow()
+})
+
+
+test('host-recorded handoff and continuation attachments work outside the state directory', () => {
+  const f = fixture()
+  const project = realpathSync(mkdtempSync(join(tmpdir(), 'handoff-project-'))); roots.push(project)
+  const inputs = join(project, '.handoff-input', 'attachments'); mkdirSync(inputs, { recursive: true })
+  const first = join(inputs, 'original.zip'), second = join(project, 'continued.txt')
+  writeFileSync(first, 'synthetic handoff', { mode: 0o600 }); writeFileSync(second, 'synthetic continuation', { mode: 0o600 })
+  const original = f.input([first]), result = prepareClaudeAdvisorInput(f.state, f.request, original, [second])
+  expect(readFileSync(result.input.entries[0]!.attachments[0]!, 'utf8')).toBe('synthetic handoff')
+  expect(readFileSync(result.rewriteText(second), 'utf8')).toBe('synthetic continuation')
+  expect(result.input.digest).toBe(original.digest)
+  expect(original.entries[0]!.attachments).toEqual([first])
 })

@@ -6,6 +6,7 @@ import { join } from 'path'
 import { JobStore } from './job-runner.ts'
 import { ClaudeDelegations, type DelegationContext } from './claude-delegation-broker.ts'
 import { prepareClaudeJobContext } from './claude-job-context.ts'
+import { readProcessIdentity } from './process-generation.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
 import { retainGoalForDelegation } from './codex-goal.ts'
 import { PrimaryToolRuntime } from './primary-tools-broker.ts'
@@ -41,7 +42,8 @@ test('lost broker and delivered failure never replay; cancellation waits for own
  const started=runs.start(request);await Bun.sleep(5)
  const second=new ClaudeDelegations(f.context,async()=>{throw Error('no replay')})
  expect(second.start(request).status).toBe('running')
- expect(()=>runs.start({...request,key:'another'})).toThrow('existing')
+ const distinct=second.start({...request,key:'another'});expect(distinct.id).not.toBe(started.id)
+ await second.wait(distinct.id)
  expect((await runs.cancel(started.id)).status).toBe('cancelled');expect(aborted).toBe(true)
  expect(second.start(request).status).toBe('cancelled');await runs.close();await second.close()
 })
@@ -98,28 +100,52 @@ test.each(['あ'.repeat(90000),'\u0000'.repeat(90000)])('large Unicode or JSON-e
  const again=new ClaudeDelegations(f.context,async()=>{throw Error('no replay')});expect(again.start(request).result).toBe(result.result)
  await runs.close();await again.close()
 })
-test('retained owned transport blocks another key until runner recovery removes it',async()=>{
- const f=fixture(),runs=new ClaudeDelegations(f.context,async(_context,id)=>{
-  const root=join(f.context.stateDir,'claude-panes');mkdirSync(root,{mode:0o700});writeFileSync(join(root,`delegate-${id}.json`),'{}',{mode:0o600});throw Error('cleanup pending')
+test('retained receipt and failed worker do not reject a fresh key in either broker',async()=>{
+ const f=fixture(),runs=new ClaudeDelegations(f.context,async(_context,id,input)=>{
+  if(input.key!=='design')return 'fresh result'
+  const root=join(f.context.stateDir,'claude-panes');mkdirSync(root,{mode:0o700})
+  writeFileSync(join(root,`delegate-${id}.json`),'{}',{mode:0o600});throw Error('cleanup pending')
  })
  const first=runs.start(request);expect((await runs.wait(first.id)).status).toBe('failed')
+ const next=runs.start({...request,key:'same-broker-new-key'});expect((await runs.wait(next.id)).status).toBe('completed')
  const again=new ClaudeDelegations(f.context,async()=> 'recovered')
  expect(again.start(request).id).toBe(first.id)
- expect(()=>again.start({...request,key:'another'})).toThrow('cleanup')
- rmSync(join(f.context.stateDir,'claude-panes',`delegate-${first.id}.json`))
- const next=again.start({...request,key:'another'});expect((await again.wait(next.id)).status).toBe('completed')
- await expect(runs.close()).rejects.toThrow();await again.close()
+ const fresh=again.start({...request,key:'another'});expect((await again.wait(fresh.id)).status).toBe('completed')
+ expect(readFileSync(join(f.context.stateDir,'claude-panes',`delegate-${first.id}.json`),'utf8')).toBe('{}')
+ await runs.close();await again.close()
 })
 
-test('crash before finally leaves active child pointer preventing a different-key launch',async()=>{
+test('dead owner plus old active/cleanup pointers and receipt never prevent a fresh request',async()=>{
  const f=fixture(),oldId='a'.repeat(64)
  const root=join(f.context.stateDir,'delegations',f.context.job.id),panes=join(f.context.stateDir,'claude-panes')
  mkdirSync(root,{recursive:true,mode:0o700});mkdirSync(panes,{mode:0o700})
- writeFileSync(join(root,'active.json'),JSON.stringify({id:oldId}),{mode:0o600})
+ for(const name of ['active.json','cleanup.json'])writeFileSync(join(root,name),JSON.stringify({id:oldId}),{mode:0o600})
  const receipt=join(panes,`delegate-${oldId}.json`);writeFileSync(receipt,'{}',{mode:0o600})
- let called=false;const runs=new ClaudeDelegations(f.context,async()=>{called=true;return 'ok'})
- expect(()=>runs.start(request)).toThrow('cleanup');expect(called).toBe(false)
- rmSync(receipt);const started=runs.start(request);expect((await runs.wait(started.id)).status).toBe('completed');await runs.close()
+ const deadOwner={...readProcessIdentity(process.pid)!,startSec:1}
+ writeFileSync(join(root,`${oldId}.json`),JSON.stringify({id:oldId,status:'running',owner:deadOwner}),{mode:0o600})
+ expect(pendingClaudeDelegation(f.context.stateDir,f.context.job.id)).toBeNull()
+ const runs=new ClaudeDelegations(f.context,async()=> 'ok')
+ expect(runs.poll(oldId).status).toBe('interrupted')
+ const started=runs.start(request);expect((await runs.wait(started.id)).status).toBe('completed')
+ expect(readFileSync(receipt,'utf8')).toBe('{}');await runs.close()
+})
+
+test('distinct requests run concurrently across brokers; completion order and cancellation are independent',async()=>{
+ const f=fixture();const finish=new Map<string,(value:string)=>void>()
+ const worker=async(_c:unknown,_id:string,input:{key:string},signal:AbortSignal)=>new Promise<string>((resolve,reject)=>{
+  finish.set(input.key,resolve);signal.addEventListener('abort',()=>reject(Error('cancelled')),{once:true})
+ })
+ const a=new ClaudeDelegations(f.context,worker),b=new ClaudeDelegations(f.context,worker)
+ const first=a.start(request),second=b.start({...request,key:'second'}),third=a.start({...request,key:'third'})
+ await Bun.sleep(5);expect(finish.size).toBe(3)
+ finish.get('second')!('second done');await b.wait(second.id)
+ expect(pendingClaudeDelegation(f.context.stateDir,f.context.job.id)).not.toBeNull()
+ expect((await a.cancel(third.id)).status).toBe('cancelled')
+ expect(a.poll(first.id).status).toBe('running')
+ expect(pendingClaudeDelegation(f.context.stateDir,f.context.job.id)).toBe(first.id)
+ finish.get('design')!('first done');await a.wait(first.id)
+ expect(pendingClaudeDelegation(f.context.stateDir,f.context.job.id)).toBeNull()
+ await a.close();await b.close()
 })
 
 test('native parent completion remains active until the existing delegated result is collected',async()=>{
@@ -159,7 +185,7 @@ test('partial launch claim becomes interrupted while its broker stays alive',asy
  const runs=new ClaudeDelegations(f.context,async()=>{calls++;return 'never'})
  const original=safeFile.atomicWritePrivateFile
  const write=spyOn(safeFile,'atomicWritePrivateFile').mockImplementation((path,content)=>{
-  if(path.endsWith('/active.json'))throw Error('synthetic write failure')
+  if(path.endsWith('.json')&&String(content).includes('\"status\":\"running\"'))throw Error('synthetic write failure')
   return original(path,content)
  })
  try {expect(()=>runs.start(request)).toThrow('synthetic write failure')} finally {write.mockRestore()}
@@ -176,7 +202,9 @@ test('final record write failure cannot leave a reaped child running',async()=>{
  try {const first=runs.start(request);id=first.id;expect((await runs.wait(id)).status).toBe('completed')} finally {write.mockRestore()}
  expect(runs.poll(id).status).toBe('completed')
  const reopened=new ClaudeDelegations(f.context,async()=>{throw Error('must not replay')})
- expect(reopened.start(request).status).toBe('completed');await reopened.close();await expect(runs.close()).rejects.toThrow()
+ expect(reopened.start(request).status).toBe('completed')
+ const next=runs.start({...request,key:'after-record-failure'});expect((await runs.wait(next.id)).status).toBe('completed')
+ await reopened.close();await expect(runs.close()).rejects.toThrow()
 })
 test('report storage failure preserves completed child status and preview',async()=>{
  const f=fixture(),runs=new ClaudeDelegations(f.context,async()=> 'completed changes')

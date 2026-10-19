@@ -105,26 +105,13 @@ export class ClaudeDelegations {
       if (JSON.parse(saved).digest !== digest) throw Error('delegation key already used for another request')
       return this.poll(id)
     }
-    const root = dirname(path), poisonPath = join(root, 'cleanup.json'), activePath = join(root, 'active.json')
-    const assertPreviousChildRetired = () => {
-      for (const pointer of [activePath, poisonPath]) {
-        const raw = readOptionalBoundedOwnerOnlyRegularFile(pointer, 8192)
-        if (!raw) continue
-        const blockedId = JSON.parse(raw).id
-        if (!/^[a-f0-9]{64}$/.test(blockedId)) throw Error('invalid child execution record')
-        if (readOptionalBoundedOwnerOnlyRegularFile(join(this.context.stateDir, 'claude-panes', `delegate-${blockedId}.json`), 64 * 1024)) throw Error('owned Claude cleanup is pending')
-      }
-      if (this.cleanupFailure) throw Error('owned Claude cleanup is pending')
-    }
-    assertPreviousChildRetired()
-    if (this.pending.size) throw Error('finish the existing delegated worker before starting another')
-    const lockPath = join(dirname(path), 'worker.lock')
+    // Independent requests have independent workers. A previous request's
+    // receipt, cleanup outcome, or live worker must not gate a new key.
+    // Serialize only claims for this exact request to avoid duplicate delivery.
+    const lockPath = join(dirname(path), `${id}.lock`)
     const attempt = tryAcquireProcessLock(lockPath)
     if (!attempt.acquired) throw Error('delegation already owned by another broker')
-    // Recheck after acquiring: a prior broker may have written its final
-    // cleanup record between the preflight and acquisition of the job-wide lease.
-    try { assertPreviousChildRetired() } catch (error) { releaseProcessLock(lockPath, attempt.lease); throw error }
-    // Recheck under the job-wide lock, then durably claim BEFORE launching.
+    // Recheck under the request lock, then durably claim BEFORE launching.
     if (readOptionalBoundedOwnerOnlyRegularFile(path, 256 * 1024)) {
       releaseProcessLock(lockPath, attempt.lease); return this.start(request)
     }
@@ -132,7 +119,7 @@ export class ClaudeDelegations {
     const owner = readProcessIdentity(process.pid)
     if (!owner) { releaseProcessLock(lockPath, attempt.lease); throw Error('broker owner unavailable') }
     const save = () => atomicWritePrivateFile(path, JSON.stringify({ ...result, digest, owner }))
-    try { save(); atomicWritePrivateFile(activePath, JSON.stringify({ id })) } catch (error) {
+    try { save() } catch (error) {
       result.status = 'interrupted'
       this.settled.set(id, { ...result, digest, owner })
       try { save() } catch {}
@@ -165,9 +152,6 @@ export class ClaudeDelegations {
       finally {
         this.settled.set(id, { ...result, digest, owner })
         try {
-          if (readOptionalBoundedOwnerOnlyRegularFile(join(this.context.stateDir, 'claude-panes', `delegate-${id}.json`), 64 * 1024)) {
-            atomicWritePrivateFile(poisonPath, JSON.stringify({ id })); this.cleanupFailure ??= new DelegationCleanupPendingError()
-          }
           save()
         } catch (error) { this.cleanupFailure = error }
         releaseProcessLock(lockPath, attempt.lease)
