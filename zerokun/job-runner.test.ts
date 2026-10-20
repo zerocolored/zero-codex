@@ -8198,14 +8198,14 @@ describe('single FIFO worker', () => {
     } finally { peer.close(); store.close() }
   })
 
-  test('monitor消失復旧はqueued/running jobを二重処理できないterminal失敗へ固定する', () => {
+  test('monitor消失復旧はrunningだけを失敗にしqueuedの継続判断を変更しない', () => {
     const store = makeStore()
     const running = store.enqueue(input({ messageId: 'lost-running' })).job
     expect(store.claimNext('serial-worker')?.id).toBe(running.id)
     const queued = store.enqueue(input({ messageId: 'lost-queued' })).job
 
     expect(store.failAfterMonitorLoss(running.id, 'monitor lost running')).toBe(true)
-    expect(store.failAfterMonitorLoss(queued.id, 'monitor lost queued')).toBe(true)
+    expect(store.failAfterMonitorLoss(queued.id, 'monitor lost queued')).toBe(false)
     expect(store.failAfterMonitorLoss(running.id, 'duplicate')).toBe(false)
     expect(store.get(running.id)).toMatchObject({
       status: 'failed',
@@ -8214,9 +8214,9 @@ describe('single FIFO worker', () => {
       lastError: 'monitor lost running',
     })
     expect(store.get(queued.id)).toMatchObject({
-      status: 'failed',
+      status: 'queued',
       workerId: null,
-      lastError: 'monitor lost queued',
+      lastError: null,
     })
     expect(store.pendingTerminalNotifications().map(notification => ({
       jobId: notification.jobId,
@@ -8224,7 +8224,6 @@ describe('single FIFO worker', () => {
       payload: notification.payload,
     }))).toEqual([
       { jobId: running.id, kind: 'failed', payload: 'monitor lost running' },
-      { jobId: queued.id, kind: 'failed', payload: 'monitor lost queued' },
     ])
     store.close()
   })

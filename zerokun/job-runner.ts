@@ -11124,6 +11124,16 @@ export class JobStore {
     )).changes === 1
   }
 
+  releaseQueuedMonitorObligation(id: string): boolean {
+    // Queued is already the scheduler's durable decision that this request
+    // may continue. Losing its display must not revoke that decision.
+    return retrySqlite(() => this.db.run(
+      `UPDATE jobs SET monitor_state = 0
+       WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'queued'`,
+      [id],
+    )).changes === 1
+  }
+
   retireMonitorObligation(id: string): void {
     retrySqlite(() => this.db.run(
       `UPDATE jobs SET monitor_state = 0
@@ -11645,7 +11655,7 @@ export class JobStore {
              ui_approval_request_id = NULL,
              terminal_outcome = 'failed',
              last_error = ?, finished_at = ?
-         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status IN ('queued', 'running')`,
+         WHERE id = ? AND runtime IN ('codex', 'claude-code') AND status = 'running'`,
         [error, finishedAt, id],
       )
       if (updated.changes === 0) return false
@@ -16884,6 +16894,48 @@ export async function reconcileAdvisorsWithMonitorHealthBarrier(
   await verify()
 }
 
+export function recoverMissingMonitorAfterExecutorsStopped(
+  store: JobStore,
+  dir: string,
+  log: (message: string) => void,
+  jobId: string,
+  status: JobStatus | 'missing',
+  state: 'preparing' | 'required' | 'lost-staged',
+): 'terminalized' | 'unarmed' | 'staged-result' | 'queued-preserved' {
+  if (state === 'preparing') {
+    if (!store.releaseUnarmedMonitorPreparation(jobId)) {
+      throw new HerdrJobMonitorPendingError(
+        `could not release unarmed monitor preparation for ${jobId}`,
+      )
+    }
+    return 'unarmed'
+  }
+  if (state === 'lost-staged') return 'staged-result'
+  if (store.hasStagedExecution(jobId)) {
+    if (!store.markMonitorLostAfterStagedResult(jobId)) {
+      throw new HerdrJobMonitorPendingError(
+        `could not preserve staged result after monitor loss for ${jobId}`,
+      )
+    }
+    log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
+    return 'staged-result'
+  }
+  if (status === 'queued') {
+    if (!store.releaseQueuedMonitorObligation(jobId)) {
+      throw new HerdrJobMonitorPendingError(`queued monitor recovery changed state for ${jobId}`)
+    }
+    log(`preserved queued job ${jobId} after losing its Herdr monitor`)
+    return 'queued-preserved'
+  }
+  if (status === 'running'
+    && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE, dir)) {
+    log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
+    return 'terminalized'
+  }
+  store.retireMonitorObligation(jobId)
+  return 'terminalized'
+}
+
 /** Losing a display must never cancel an independently running Codex task. */
 export function markMonitorUnavailable(
   guard: { unavailable?: boolean },
@@ -18699,43 +18751,7 @@ async function runCli(): Promise<void> {
         jobId: string,
         status: JobStatus | 'missing',
         state: 'preparing' | 'required' | 'lost-staged',
-      ): 'terminalized' | 'unarmed' | 'staged-result' => {
-        if (state === 'preparing') {
-          if (!store.releaseUnarmedMonitorPreparation(jobId)) {
-            throw new HerdrJobMonitorPendingError(
-              `could not release unarmed monitor preparation for ${jobId}`,
-            )
-          }
-          return 'unarmed'
-        }
-        if (state === 'lost-staged') return 'staged-result'
-        if (store.hasStagedExecution(jobId)) {
-          if (!store.markMonitorLostAfterStagedResult(jobId)) {
-            throw new HerdrJobMonitorPendingError(
-              `could not preserve staged result after monitor loss for ${jobId}`,
-            )
-          }
-          log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
-          return 'staged-result'
-        }
-        if (status === 'queued' && store.auditSetupIsParked(jobId)) {
-          store.retireMonitorObligation(jobId)
-          log(`retired ${jobId} monitor after entering audit setup wait`)
-          return 'unarmed'
-        }
-        if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
-          store.retireMonitorObligation(jobId)
-          log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-          return 'unarmed'
-        }
-        if ((status === 'queued' || status === 'running')
-          && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE, dir)) {
-          log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
-          return 'terminalized'
-        }
-        store.retireMonitorObligation(jobId)
-        return 'terminalized'
-      }
+      ) => recoverMissingMonitorAfterExecutorsStopped(store, dir, log, jobId, status, state)
       const { journaled, completed } = await recoverExecutionCheckpointBeforeAdvisorCleanup(
         store,
         dir,
@@ -18894,43 +18910,7 @@ async function runCli(): Promise<void> {
       jobId: string,
       status: JobStatus | 'missing',
       state: 'preparing' | 'required' | 'lost-staged',
-    ): 'terminalized' | 'unarmed' | 'staged-result' => {
-      if (state === 'preparing') {
-        if (!store.releaseUnarmedMonitorPreparation(jobId)) {
-          throw new HerdrJobMonitorPendingError(
-            `could not release unarmed monitor preparation for ${jobId}`,
-          )
-        }
-        return 'unarmed'
-      }
-      if (state === 'lost-staged') return 'staged-result'
-      if (store.hasStagedExecution(jobId)) {
-        if (!store.markMonitorLostAfterStagedResult(jobId)) {
-          throw new HerdrJobMonitorPendingError(
-            `could not preserve staged result after monitor loss for ${jobId}`,
-          )
-        }
-        log(`preserved staged result for ${jobId} after proving its Herdr monitor was lost`)
-        return 'staged-result'
-      }
-      if (status === 'queued' && store.auditSetupIsParked(jobId)) {
-        store.retireMonitorObligation(jobId)
-        log(`retired ${jobId} monitor after entering audit setup wait`)
-        return 'unarmed'
-      }
-      if (status === 'queued' && store.uiApprovalIsWaiting(jobId)) {
-        store.retireMonitorObligation(jobId)
-        log(`retired ${jobId} monitor after entering UI/UX approval wait`)
-        return 'unarmed'
-      }
-      if ((status === 'queued' || status === 'running')
-        && store.failAfterMonitorLoss(jobId, MONITOR_LOSS_RECOVERY_MESSAGE, dir)) {
-        log(`failed ${jobId} after proving its Herdr monitor was lost and executors stopped`)
-        return 'terminalized'
-      }
-      store.retireMonitorObligation(jobId)
-      return 'terminalized'
-    }
+    ) => recoverMissingMonitorAfterExecutorsStopped(store, dir, log, jobId, status, state)
     const { journaled, completed: staged } = await recoverExecutionCheckpointBeforeAdvisorCleanup(
       store,
       dir,

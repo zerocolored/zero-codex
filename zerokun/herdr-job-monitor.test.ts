@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createHash } from 'crypto'
-import { JobStore, type JobRecord } from './job-runner.ts'
+import { JobStore, recoverMissingMonitorAfterExecutorsStopped, type JobRecord } from './job-runner.ts'
 import type { HerdrRuntimeIdentity } from './herdr-runtime.ts'
 import {
   appendHerdrJobMonitorChunk,
@@ -42,6 +42,7 @@ import {
 import { processStartKey, readProcessIdentity, type ProcessIdentity } from './process-generation.ts'
 import { completeUtf8PrefixLength } from './herdr-job-monitor-view.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
+import { readAdvisorInputSnapshot } from './advisor-input.ts'
 
 const directories: string[] = []
 
@@ -2454,3 +2455,135 @@ test('audit monitor retirement preserves cancellation and rejects ordinary activ
     expect(store.claimNext('cancel')?.cancelRequestedAt).not.toBeNull()
   } finally {store.close()}
 })
+
+for (const mode of ['fresh', 'deferred', 'after-release-crash', 'new-server', 'list-error'] as const) {
+  test(`queued monitor loss preserves the request and resumes once: ${mode}`, async () => {
+    const state = fixtureDirectory()
+    const path = join(state, 'jobs.sqlite3')
+    let store = new JobStore(path)
+    const control = new FakeControl()
+    const queued = store.enqueue({ chatId: 'C1', threadTs: '1.1', messageId: '1.1',
+      userId: 'U1', repoPath: state, task: 'continue existing work', writeEnabled: true }).job
+    const running = store.claimNext('worker')!
+    store.beginMonitorPreparation(running.id, 'worker')
+    await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: store.get(queued.id)!, control,
+      beforeFirstHerdrMutation: () => store.commitMonitorRequired(queued.id, 'worker') })
+    appendHerdrJobMonitorStatus(state, queued.id, 'saved before monitor loss')
+    const resumeAt = Date.now() + 60_000
+    if (mode === 'fresh') {
+      expect(store.releaseUnstartedClaim(queued.id, 'worker', 'preparation retry')).toBe(true)
+    } else {
+      const snapshot = readAdvisorInputSnapshot(state, queued.id)
+      const nonce = '9'.repeat(32)
+      const threadId = 'thread-monitor-continuation'
+      store.beginInitialTurnDispatch({ jobId: queued.id, attempt: running.attempts,
+        epoch: running.controlEpoch, executorNonce: nonce, threadId, requestId: 91,
+        inputRevision: snapshot.revision, inputDigest: snapshot.digest })
+      store.acknowledgeInitialTurnDispatch({ jobId: queued.id, workerId: 'worker',
+        attempt: running.attempts, epoch: running.controlEpoch, executorNonce: nonce,
+        threadId, turnId: 'turn-before-monitor-loss', requestId: 91 })
+      store.finishAppServerTurn({ jobId: queued.id, epoch: running.controlEpoch,
+        executorNonce: nonce, threadId, turnId: 'turn-before-monitor-loss', retainInput: true,
+        rateLimitResumeAt: resumeAt, rateLimitReason: 'rate-limit', rateLimitSafeToReplay: false })
+      store.requeueAt(queued.id, resumeAt, 'terminal rate limit', threadId)
+    }
+    const before = store.get(queued.id)!
+    control.tabs.splice(0)
+    control.panes.splice(0)
+    control.generationStatus = 'dead'
+    control.process!.foregroundProcesses = []
+    const reconcile = () => reconcileHerdrJobMonitors({ stateDir: state,
+      runtime: mode === 'new-server' ? { ...runtime(), socketInode: runtime().socketInode + 1 } : runtime(),
+      control, getJob: id => store.get(id), listMonitorObligations: () => store.monitorObligations(),
+      recoverMissingBindingAfterExecutorsStopped: (id, status, monitorState) =>
+        recoverMissingMonitorAfterExecutorsStopped(store, state, () => {}, id, status, monitorState),
+      onMonitorRetired: id => store.retireMonitorObligation(id) })
+    try {
+      if (mode === 'after-release-crash') {
+        expect(recoverMissingMonitorAfterExecutorsStopped(store, state, () => {}, queued.id,
+          'queued', 'required')).toBe('queued-preserved')
+        store.close()
+        store = new JobStore(path)
+      }
+      if (mode === 'list-error') {
+        const list = control.listTabs.bind(control)
+        control.listTabs = async () => { throw Object.assign(new Error('disk I/O error'), { code: 'EIO' }) }
+        await expect(reconcile()).rejects.toThrow('disk I/O error')
+        expect(store.get(queued.id)).toEqual(before)
+        expect(store.pendingTerminalNotifications()).toEqual([])
+        control.listTabs = list
+      }
+      expect((await reconcile()).closed).toBe(1)
+      expect(store.get(queued.id)).toEqual({ ...before, monitorState: 'none' })
+      expect(store.pendingTerminalNotifications()).toEqual([])
+      expect(existsSync(join(state, 'job-monitors-detached', queued.id, 'manifest.json'))).toBe(true)
+      expect(existsSync(join(state, 'job-monitors', queued.id))).toBe(false)
+      expect(control.closeCalls).toBe(0)
+      await reconcile()
+      if (mode !== 'fresh') expect(store.claimNext('early')).toBeNull()
+      const resumed = store.claimNext('resume', undefined, resumeAt + 1)!
+      expect(resumed.id).toBe(queued.id)
+      expect(resumed.sessionId).toBe(before.sessionId)
+      expect(store.claimNext('duplicate', undefined, resumeAt + 1)).toBeNull()
+      store.beginMonitorPreparation(queued.id, 'resume')
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: store.get(queued.id)!,
+        control: new FakeControl(), beforeFirstHerdrMutation: () => store.commitMonitorRequired(queued.id, 'resume') })
+      expect(store.get(queued.id)?.monitorState).toBe('required')
+    } finally { store.close() }
+  })
+}
+
+for (const newServer of [false, true]) for (const crashAfterRelease of [false, true]) {
+  test(`queued monitor creation failure retires an unstarted viewer: newServer=${newServer} crash=${crashAfterRelease}`, async () => {
+    const state = fixtureDirectory()
+    const store = new JobStore(join(state, 'jobs.sqlite3'))
+    const control = new FakeControl()
+    try {
+      const job = store.enqueue({ chatId: 'C1', threadTs: '1.1', messageId: '1.1',
+        userId: 'U1', repoPath: state, task: 'continue', writeEnabled: true }).job
+      store.claimNext('worker')
+      store.beginMonitorPreparation(job.id, 'worker')
+      control.failCreateBeforeDelivery = true
+      await expect(openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: store.get(job.id)!, control,
+        beforeFirstHerdrMutation: () => store.commitMonitorRequired(job.id, 'worker') }))
+        .rejects.toThrow('create failed before delivery')
+      expect(store.get(job.id)?.monitorState).toBe('required')
+      expect(store.releaseUnstartedClaim(job.id, 'worker', 'monitor preparation pending')).toBe(true)
+      const before = store.get(job.id)!
+      if (crashAfterRelease) store.releaseQueuedMonitorObligation(job.id)
+      const reconcile = () => reconcileHerdrJobMonitors({ stateDir: state,
+        runtime: newServer ? { ...runtime(), socketInode: runtime().socketInode + 1 } : runtime(), control,
+        getJob: id => store.get(id), listMonitorObligations: () => store.monitorObligations(),
+        recoverMissingBindingAfterExecutorsStopped: (id, status, monitorState) =>
+          recoverMissingMonitorAfterExecutorsStopped(store, state, () => {}, id, status, monitorState),
+        onMonitorRetired: id => store.retireMonitorObligation(id) })
+      if (newServer) {
+        const beforeProof = store.get(job.id)
+        const list = control.listTabs.bind(control)
+        control.listTabs = async () => { throw new Error('transport unavailable') }
+        await expect(reconcile()).rejects.toThrow('transport unavailable')
+        expect(store.get(job.id)).toEqual(beforeProof)
+        control.listTabs = list
+        control.tabs.push({ tabId: 'foreign:t1', workspaceId: 'foreign',
+          label: monitorTabLabel(state, job.seq), paneCount: 1 })
+        await expect(reconcile()).rejects.toThrow()
+        expect(store.get(job.id)).toEqual(beforeProof)
+        expect(control.closeCalls).toBe(0)
+        control.tabs.splice(0)
+      }
+      expect((await reconcile()).closed).toBe(1)
+      expect(store.get(job.id)).toEqual({ ...before, monitorState: 'none' })
+      expect(existsSync(join(state, 'job-monitors-detached', job.id, 'manifest.json'))).toBe(true)
+      expect(existsSync(join(state, 'job-monitors', job.id))).toBe(false)
+      await reconcile()
+      expect(store.pendingTerminalNotifications()).toEqual([])
+      expect(control.closeCalls).toBe(0)
+      expect(store.claimNext('resume')?.id).toBe(job.id)
+      expect(store.claimNext('duplicate')).toBeNull()
+      store.beginMonitorPreparation(job.id, 'resume')
+      await openHerdrJobMonitor({ stateDir: state, runtime: runtime(), job: store.get(job.id)!,
+        control: new FakeControl(), beforeFirstHerdrMutation: () => store.commitMonitorRequired(job.id, 'resume') })
+      expect(store.get(job.id)?.monitorState).toBe('required')
+    } finally { store.close() }
+  })
+}

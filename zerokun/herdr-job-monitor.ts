@@ -735,6 +735,8 @@ export function archiveStoppedHerdrMonitor(input: {
   stateDir: string
   jobId: string
   status: JobStatus
+  /** Caller has proved no matching pane/tab exists across all workspaces. */
+  bindingAbsenceProven?: boolean
   processStatus?: (process: ProcessIdentity) => 'alive' | 'dead' | 'unknown'
 }): boolean {
   if (input.status === 'running') return false
@@ -747,9 +749,15 @@ export function archiveStoppedHerdrMonitor(input: {
     try { requireManagedDirectory(stateDir, destination); return true } catch { return false }
   }
   const manifest = readMonitorManifest(stateDir, input.jobId)
-  if (!manifest || !manifest.viewerProcess) return false
-  const status = (input.processStatus ?? (process => observeProcessGeneration(process).status))(manifest.viewerProcess)
-  if (status !== 'dead') return false
+  if (!manifest) return false
+  if (manifest.viewerProcess) {
+    const status = (input.processStatus ?? (process => observeProcessGeneration(process).status))(manifest.viewerProcess)
+    if (status !== 'dead') return false
+  } else if (!input.bindingAbsenceProven) {
+    // A viewer may never have started. Only the reconciliation path that
+    // proved global binding absence can retire this incomplete generation.
+    return false
+  }
   // A parked job may resume and lose another viewer on a later restart.
   // Preserve earlier generations instead of blocking on their archive.
   try {
@@ -2245,7 +2253,7 @@ export async function reconcileHerdrJobMonitors(input: {
     jobId: string,
     status: JobStatus | 'missing',
     state: 'preparing' | 'required' | 'lost-staged',
-  ) => 'terminalized' | 'unarmed' | 'staged-result'
+  ) => 'terminalized' | 'unarmed' | 'staged-result' | 'queued-preserved'
   /** Durable queued initialization wait; never inferred from monitor files. */
   isAuditSetupParked?: (jobId: string) => boolean
   onMonitorRetired?: (jobId: string) => Promise<void> | void
@@ -2278,7 +2286,7 @@ export async function reconcileHerdrJobMonitors(input: {
     jobId: string,
     status: JobStatus | 'missing',
     state: 'preparing' | 'required' | 'lost-staged',
-  ): 'terminalized' | 'unarmed' | 'staged-result' => {
+  ): 'terminalized' | 'unarmed' | 'staged-result' | 'queued-preserved' => {
     const disposition = input.recoverMissingBindingAfterExecutorsStopped?.(
       jobId, status, state,
     )
@@ -2298,6 +2306,12 @@ export async function reconcileHerdrJobMonitors(input: {
     if (disposition === 'unarmed' && current !== undefined) {
       throw new HerdrJobMonitorPendingError(
         `monitor preparation recovery did not remove obligation for ${jobId}`,
+      )
+    }
+    if (disposition === 'queued-preserved'
+      && (recoveredStatus !== 'queued' || current !== undefined)) {
+      throw new HerdrJobMonitorPendingError(
+        `monitor loss recovery did not preserve queued job ${jobId}`,
       )
     }
     if (disposition === 'staged-result' && current?.state !== 'lost-staged') {
@@ -2441,10 +2455,14 @@ export async function reconcileHerdrJobMonitors(input: {
       // Herdr can restore tab IDs after restarting while the recorded viewer
       // is gone. Those IDs no longer authorize a close/run on the new server.
       // Startup has already reconciled executors before providing this callback.
-      if (!input.recoverMissingBindingAfterExecutorsStopped || !manifest.viewerProcess
-        || control.processGenerationStatus(manifest.viewerProcess) !== 'dead') {
+      if (!input.recoverMissingBindingAfterExecutorsStopped
+        || (manifest.viewerProcess && control.processGenerationStatus(manifest.viewerProcess) !== 'dead')) {
         throw new HerdrJobMonitorPendingError(`previous Herdr monitor is not stopped for ${name}`)
       }
+      // Creation can fail before a viewer is recorded, followed by a Herdr
+      // restart. Do not strand that queued request; prove absence before
+      // retiring its incomplete monitor without touching restored panes.
+      if (!manifest.viewerProcess) await proveManifestBindingAbsent(manifest, directory, control)
       const status = input.getJob(name)?.status ?? 'missing'
       const disposition = recoverObligation(name, status, obligations().get(name)?.state ?? 'required')
       if (disposition === 'staged-result') {
@@ -2456,6 +2474,7 @@ export async function reconcileHerdrJobMonitors(input: {
       // retried without losing its obligation or replaying unfinished work.
       if (!archiveStoppedHerdrMonitor({
         stateDir, jobId: name, status: input.getJob(name)?.status ?? 'failed',
+        bindingAbsenceProven: !manifest.viewerProcess,
         processStatus: process => control.processGenerationStatus(process),
       })) throw new HerdrJobMonitorPendingError(`could not archive previous Herdr monitor for ${name}`)
       await input.onMonitorRetired?.(name)
@@ -2530,7 +2549,7 @@ export async function reconcileHerdrJobMonitors(input: {
         // This callback is intentionally available only to the runner's
         // startup/recover-interrupted path after tracked Codex and advisor
         // processes were terminated. Prove global absence and viewer death;
-        // never recreate a tab because that would hide an unobserved interval.
+        // preserve the old feeds before a queued request gets a new monitor.
         await proveManifestBindingAbsent(manifest, directory, control)
         await waitForViewerStopped(manifest.viewerProcess, control)
         if (manifest.phase === 'close-intent') {
@@ -2560,11 +2579,12 @@ export async function reconcileHerdrJobMonitors(input: {
             `staged execution remains blocked after losing its Herdr monitor: ${name}`,
           )
         }
-        if (disposition === 'terminalized') {
-          // The work cannot be safely replayed, but a dead display must not
-          // block every later job/update. Preserve all feeds and receipts.
+        if (disposition === 'terminalized' || disposition === 'queued-preserved') {
+          // Preserve prior feeds and receipts, including a queued request's
+          // previous monitor generation before the scheduler resumes it.
           if (!archiveStoppedHerdrMonitor({
             stateDir, jobId: name, status: input.getJob(name)?.status ?? 'failed',
+            bindingAbsenceProven: true,
             processStatus: process => control.processGenerationStatus(process),
           })) throw new HerdrJobMonitorPendingError(`could not archive lost monitor for ${name}`)
           await input.onMonitorRetired?.(name)
