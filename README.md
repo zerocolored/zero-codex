@@ -88,10 +88,11 @@ Slack bot
   失敗tabは次のFIFO jobを妨げず、確認後に利用者が閉じると管理stateも次回照合時に回収されます。
   viewerのprocess世代・argv・cwd・heartbeatを実行前からclose直前まで監視し、terminalへの最終出力の
   drain完了も確認します。create/run/closeの応答や監視状態が曖昧な場合はIDを推測・操作せず、
-  後続jobを開始しないfail-closed動作になります。実行中の監視tabを人が閉じた場合も同様に停止し、
-  次回起動や`recover-interrupted`でも自動failed化・監視tab再作成は行いません。最終出力を
-  表示した証拠を失ったjobとdurable monitor faultを保持してFIFOを止めるため、監視tabを手動で閉じないで
-  ください。Slackへの通知配送だけはFIFOと独立して再試行します。
+  その監視への操作を保留します。実行中の監視tabを失っても、処理は保存ログとともに継続します。
+  次回起動や`recover-interrupted`で監視の消失とviewer停止を確認した場合、すでにqueuedへ
+  延期された依頼はsession・再開時刻・順番を維持し、旧監視ログを退避して次の実行時に監視を作り直します。
+  runningのまま中断した処理や保存済み結果には、既存の実行復旧規則を適用します。
+  Slackへの通知配送はFIFOと独立して再試行します。
 - `project_doc_max_bytes=262144`をruntime側で固定し、global→projectの`AGENTS.md`をjobごとに読み直します。
   App Server handshakeで存在するglobal／projectのowner-owned regular `AGENTS.md`が実際の
   `instructionSources`に含まれることを物理pathで照合し、同名の無関係fileでは代替しません。
