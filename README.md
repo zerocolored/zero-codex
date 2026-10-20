@@ -171,6 +171,8 @@ advisorはprojectの`AGENTS.md`が利用を求める場合にprimary Codexが呼
 `gpt-6-astra` / reasoning `high`のsolution analyst 1枠、最終reviewは
 `gpt-6-astra` / reasoning `medium`のrisk reviewer 1枠を通常のsub-agentとして起動し、各roundで
 Grok 1枠とfresh Claude Fable 5.1 1枠を`zerokun_advisors`経由で起動します。
+画面設計では、説明文を読ませず直感的に理解できる導線を優先し、不可欠な説明はイラスト・図解・アニメーションで示す方針を毎回渡します。
+この方針はFableの画面案、通常の設計相談、主担当による代替案・実装・最終レビューに共通です。必要な操作ラベル、判断情報、アクセシビリティは保持します。
 最終review第1回の必須指摘をprimary Codexが実際に採用し、task所有の修正差分を作った場合だけ、同じ3枠を
 freshにした第2回でその差分と直接の回帰だけを確認します。軽微な指摘、advisorの欠員、空の修正差分では
 第2回を起動せず、第3回はありません。transportはreview roundを独自に要求せず、各枠を
