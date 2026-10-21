@@ -119,3 +119,20 @@ test('result success requires is_error false; child output and interruption are 
   expect(claudeResult({ ...base, parent_tool_use_id: 'child' })).toBeNull()
   expect(claudeResult({ type: 'system', subtype: 'session_state_changed', state: 'idle' })).toBeNull()
 })
+
+
+test.each(['claude-fable-5-1', 'claude-opus-5-5', 'claude-future-9-2'])('explicit requested model %s accepts its root init and result while rejecting model drift',async model=>{
+ const f=fixture({expectedModel:model})
+ f.emit({type:'system',subtype:'init',session_id:f.id,model})
+ await f.session.nextEvent();expect(f.session.model).toBe(model)
+ f.emit({type:'result',session_id:f.id,subtype:'success',is_error:false,result:'requested worker done'})
+ expect(claudeResult((await f.session.nextEvent())!)).toEqual({kind:'success',text:'requested worker done'})
+ f.emit({type:'system',subtype:'init',session_id:f.id,model:'claude-other-9-1'})
+ await expect(f.session.nextEvent()).rejects.toThrow('model changed')
+})
+
+test('explicit Fable binding rejects a substituted Opus startup',async()=>{
+ const f=fixture({expectedModel:'claude-fable-5-1'})
+ f.emit({type:'system',subtype:'init',session_id:f.id,model:'claude-opus-5-5'})
+ await expect(f.session.nextEvent()).rejects.toThrow('model changed')
+})

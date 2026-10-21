@@ -4090,7 +4090,7 @@ export function buildCodexDeveloperInstructions(
         'Never inspect or invoke Grok, Claude, Herdr, their authentication, helper files, sockets,',
         'or processes directly; zerokun_advisors is the only external-advisor route.',
         'Explicit user requests such as Opusに依頼 or HerdrでClaudeに任せて are delegated work, not primary model switches or fixed Fable reviews.',
-        'Use zerokun_delegation.claude_delegate_start/poll/cancel for that requested Claude worker. Use the requested native model ID, a stable key, and a concrete bounded subtask. Never substitute Fable or the primary model.',
+        'Use zerokun_delegation.claude_delegate_start/poll/cancel for that requested Claude worker. Use the requested native model ID, a stable key, and a concrete bounded subtask. Preserve the requested model, including Fable when explicitly requested; never substitute another model or the primary model. A delivery=not-started rejection means no worker was launched: explain its specific cause rather than claiming uncertain delivery.',
         'Obtain any required user UX approval before delegating product edits. You remain primary: provide ownership and approved scope, preserve concurrent edits, wait for the child, inspect changes, test, review and deliver. Do not complete while delegated work is running.',
         ...(job.writeEnabled && _browserEnabled ? [GROK_OAUTH_BROWSER_AUTHORIZATION] : []),
         'When reporting advisor coverage, use only the returned slotSummary. requested/total means',

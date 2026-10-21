@@ -267,7 +267,9 @@ export class ClaudeControlSession {
       return
     }
     if (claudeRootEvent(event) && event.type === 'system' && event.subtype === 'init') {
-      if (typeof event.model !== 'string' || !/^claude-opus-[a-zA-Z0-9.-]+$/.test(event.model)) {
+      // An explicitly bound delegated model may be any native Claude family.
+      // Unbound primary sessions retain their existing Opus selection contract.
+      if (typeof event.model !== 'string' || (!this.options.expectedModel && !/^claude-opus-[a-zA-Z0-9.-]+$/.test(event.model))) {
         throw new ClaudeProtocolError('Claude primary did not select an Opus model')
       }
       if ((this.model !== null && event.model !== this.model)
