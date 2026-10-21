@@ -2002,6 +2002,9 @@ export function collectHostAdvisorCoverage(
         inputRevision,
         finishedAt: Number(journal.finishedAt),
         ...summary,
+        claudeQuotaFallback: (journal.claude as Record<string, unknown>)?.model === 'claude-opus-5-5'
+          && (journal.claude as Record<string, unknown>)?.fallbackFrom === 'claude-fable-5-1'
+          && (journal.claude as Record<string, unknown>)?.fallbackReason === 'fable-quota',
         failures: summary.slots.filter(slot => slot.state !== 'response-obtained').map(slot => {
           const advisor: AdvisorFailure['advisor'] = slot.slot.includes('claude') ? 'claude'
             : slot.slot.includes('grok') ? 'grok' : 'codex'

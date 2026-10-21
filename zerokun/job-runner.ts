@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { CLAUDE_QUOTA_FALLBACK_NOTICE } from './claude-quota-fallback.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE, STORAGE_FAILURE_MESSAGE } from './storage-failure.ts'
 import { handoffControl } from './handoff-control.ts'
 import { legacyTransportThrottle, throttleRetryDelay, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitReason } from './codex-rate-limit.ts'
@@ -14305,6 +14306,7 @@ export interface HostAdvisorCoverage {
     startUnconfirmed: number
     unavailableBeforeStart: number
     slots: Array<{ slot: string, state: HostAdvisorSlotState }>
+    claudeQuotaFallback?: boolean
     failures?: AdvisorFailure[]
   }>
 }
@@ -16616,6 +16618,11 @@ function stripModelAuthoredAdvisorCoverage(
       removed = true
       return ''
     }
+    if (validHostClaudeFallbackNotice(paragraph.trim())) {
+      if (preserveHostCoverageLine) return paragraph
+      removed = true
+      return ''
+    }
     const clauses = (paragraph.match(/.*?(?:[。！？!?]|\.(?=[ \t\r\n]|$)|\r?\n|$)/gs) ?? [paragraph])
       .filter(clause => clause.length > 0)
     const coverageContext = clauses.some(advisorCoverageClause)
@@ -16655,6 +16662,21 @@ function validHostAdvisorNotice(text: string): boolean {
     return match !== null && (PUBLIC_ADVISOR_FAILURE_MESSAGES.has(match[1]!)
       || Object.values(ADVISOR_NAMES).some(name => match[1] === `${name}: 回答を取得しました。`))
   })
+}
+
+function validHostClaudeFallbackNotice(text: string): boolean {
+  const lines = text.split(/\r?\n/)
+  return lines.length >= 1 && lines.length <= 3 && lines.every(line => {
+    const match = /^(?:初期設計|最終レビュー第[12]回) — (.+)$/u.exec(line)
+    return match?.[1] === CLAUDE_QUOTA_FALLBACK_NOTICE
+  })
+}
+
+function hostClaudeFallbackNotice(coverage: HostAdvisorCoverage): string {
+  const lines = [...coverage.phases].sort((a, b) => a.finishedAt - b.finishedAt)
+    .filter(phase => phase.claudeQuotaFallback)
+    .map(phase => `${advisorPhaseLabel(phase)} — ${CLAUDE_QUOTA_FALLBACK_NOTICE}`)
+  return lines.length ? lines.join('\n') + '\n\n' : ''
 }
 
 function hostAdvisorFailureNotice(coverage: HostAdvisorCoverage): string {
@@ -16707,7 +16729,7 @@ export function enforceHostAdvisorCoverage(
   const stripped = stripModelAuthoredAdvisorCoverage(text, purpose === 'delivery')
   if (purpose !== 'result') return stripped.text
   if (coverage?.phases.length) {
-    const notice = hostAdvisorFailureNotice(coverage)
+    const notice = hostClaudeFallbackNotice(coverage) + hostAdvisorFailureNotice(coverage)
     return stripped.text
       ? `${notice}${stripped.text}\n\n${hostAdvisorCoverageLine(coverage)}`
       : `${notice}${hostAdvisorCoverageLine(coverage)}`

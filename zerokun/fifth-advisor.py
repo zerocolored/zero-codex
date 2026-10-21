@@ -87,6 +87,7 @@ CLAUDE_REQUIRED_ARGUMENT_SEQUENCE = (
     "--disable-slash-commands",
 )
 CLAUDE_MODEL = "claude-fable-5-1"
+CLAUDE_ADVISOR_MODELS = (CLAUDE_MODEL, "claude-opus-5-5")
 CLAUDE_MODEL_ARGUMENT = f"--model={CLAUDE_MODEL}"
 CLAUDE_ARGUMENTS = (*CLAUDE_REQUIRED_ARGUMENT_SEQUENCE, CLAUDE_MODEL_ARGUMENT)
 CLAUDE_OBSERVED_ARGUMENT_FORMS = (
@@ -246,10 +247,10 @@ def _same_owned_process_identity(
         observed.get(key) == recorded.get(key)
         for key in OWNED_PROCESS_IDENTITY_KEYS
     ) and _valid_claude_invocation(
-        observed.get("argv"), observed.get("argv0"), observed.get("executable"), observed.get("answer_directory"), observed.get("ui_artifacts")
+        observed.get("argv"), observed.get("argv0"), observed.get("executable"), observed.get("answer_directory"), observed.get("ui_artifacts"), observed.get("model", CLAUDE_MODEL)
     ) and _valid_claude_invocation(
-        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable"), recorded.get("answer_directory"), recorded.get("ui_artifacts")
-    ) and observed.get("answer_directory") == recorded.get("answer_directory") and observed.get("ui_artifacts") == recorded.get("ui_artifacts")
+        recorded.get("argv"), recorded.get("argv0"), recorded.get("executable"), recorded.get("answer_directory"), recorded.get("ui_artifacts"), recorded.get("model", CLAUDE_MODEL)
+    ) and observed.get("model", CLAUDE_MODEL) == recorded.get("model", CLAUDE_MODEL) and observed.get("answer_directory") == recorded.get("answer_directory") and observed.get("ui_artifacts") == recorded.get("ui_artifacts")
 
 
 def _valid_executable_metadata(value: object, *, kinds: Tuple[str, ...]) -> bool:
@@ -313,6 +314,7 @@ def _valid_claude_invocation(
     executable: object,
     answer_directory: object = None,
     ui_artifacts: object = None,
+    model: str = CLAUDE_MODEL,
 ) -> bool:
     if not isinstance(argv, list) or not argv or not all(
         isinstance(value, str) for value in argv
@@ -343,10 +345,12 @@ def _valid_claude_invocation(
         ):
             return False
         arguments = argv[2:]
-    return _valid_claude_option_arguments(arguments, answer_directory, ui_artifacts)
+    return _valid_claude_option_arguments(arguments, answer_directory, ui_artifacts, model)
 
 
-def _valid_claude_option_arguments(arguments: List[str], answer_directory: object = None, ui_artifacts: object = None) -> bool:
+def _valid_claude_option_arguments(arguments: List[str], answer_directory: object = None, ui_artifacts: object = None, model: str = CLAUDE_MODEL) -> bool:
+    if model not in CLAUDE_ADVISOR_MODELS:
+        return False
     if ui_artifacts is not None:
         if not isinstance(ui_artifacts, dict) or not isinstance(ui_artifacts.get("root"), str) or answer_directory is None:
             return False
@@ -372,9 +376,9 @@ def _valid_claude_option_arguments(arguments: List[str], answer_directory: objec
         return False
     model_index, model_argument = model_selectors[0]
     if model_argument == "--model":
-        if model_index + 1 >= len(arguments) or arguments[model_index + 1] != CLAUDE_MODEL:
+        if model_index + 1 >= len(arguments) or arguments[model_index + 1] != model:
             return False
-    elif model_argument != CLAUDE_MODEL_ARGUMENT:
+    elif model_argument != "--model=" + model:
         return False
     observed_required = set()
     index = 0
@@ -460,6 +464,7 @@ def _parse_args() -> argparse.Namespace:
         child.add_argument("--project-root", required=True)
         child.add_argument("--request-dir", required=True)
         if command == "open":
+            child.add_argument("--model", choices=CLAUDE_ADVISOR_MODELS, default=CLAUDE_MODEL)
             child.add_argument("--answer-file", action="store_true")
             child.add_argument("--ui-artifacts", action="store_true")
     send = subparsers.add_parser("send")
@@ -2053,7 +2058,7 @@ def _process_receipt(
         process
         for process in inventory["processes"]
         if _valid_claude_invocation(
-            process["argv"], process["argv0"], executable, workspace.get("answer_directory"), workspace.get("ui_artifacts")
+            process["argv"], process["argv0"], executable, workspace.get("answer_directory"), workspace.get("ui_artifacts"), workspace.get("model", CLAUDE_MODEL)
         )
     ]
     if len(claude_matches) != 1:
@@ -2071,6 +2076,7 @@ def _process_receipt(
         "argv": matched["argv"],
         "argv0": matched["argv0"],
         "executable": executable,
+        **({"model": workspace["model"]} if "model" in workspace else {}),
         **({"answer_directory": workspace["answer_directory"]} if "answer_directory" in workspace else {}),
         **({"ui_artifacts": workspace["ui_artifacts"]} if "ui_artifacts" in workspace else {}),
     }
@@ -2502,6 +2508,10 @@ def _validate_session_intent(intent: Dict[str, object]) -> None:
         "caller",
         "baseline_workspace_ids",
     }
+    if "model" in intent:
+        intent_keys.add("model")
+    if intent.get("model", CLAUDE_MODEL) not in CLAUDE_ADVISOR_MODELS:
+        raise UnsafeRequest("ephemeral Claude model is invalid")
     caller = intent.get("caller")
     baseline_values = intent.get("baseline_workspace_ids")
     nonce = intent.get("nonce")
@@ -2555,6 +2565,9 @@ def _validate_workspace_receipt(
         "terminal_id",
     }
     recorded_keys = frozenset(workspace)
+    if workspace.get("model", CLAUDE_MODEL) != intent.get("model", CLAUDE_MODEL):
+        raise UnsafeRequest("ephemeral Claude model binding changed")
+    recorded_keys = recorded_keys - {"model"}
     if "ui_artifacts" in recorded_keys:
         ui = workspace["ui_artifacts"]
         if not isinstance(ui, dict) or not isinstance(ui.get("root"), str) or not os.path.isabs(ui["root"]) or "answer_directory" not in recorded_keys:
@@ -3900,7 +3913,9 @@ def _open_command(args: argparse.Namespace) -> int:
         os.close(root_descriptor)
 
 
-def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optional[str] = None, ui_artifacts: Optional[Dict[str, object]] = None) -> List[str]:
+def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optional[str] = None, ui_artifacts: Optional[Dict[str, object]] = None, model: str = CLAUDE_MODEL) -> List[str]:
+    if model not in CLAUDE_ADVISOR_MODELS:
+        raise UnsafeRequest("unsupported Claude advisor model")
     return [
         "agent",
         "start",
@@ -3912,7 +3927,7 @@ def _claude_start_command(agent_name: str, pane_id: str, answer_directory: Optio
         "--timeout",
         str(CLAUDE_START_TIMEOUT_MS),
         "--",
-        *CLAUDE_ARGUMENTS,
+        *CLAUDE_REQUIRED_ARGUMENT_SEQUENCE, "--model=" + model,
         *(["--add-dir=" + answer_directory] if answer_directory is not None else []),
         *(["--add-dir=" + str(ui_artifacts["root"])] if ui_artifacts is not None else []),
     ]
@@ -4129,6 +4144,7 @@ def _open_ephemeral_workspace(
     root: Path,
     root_metadata: os.stat_result,
 ) -> int:
+    model = getattr(args, "model", CLAUDE_MODEL)
     answer_directory = None
     ui_artifacts = None
     if getattr(args, "ui_artifacts", False) and not getattr(args, "answer_file", False):
@@ -4155,6 +4171,7 @@ def _open_ephemeral_workspace(
     label = f"fifth-advisor-{nonce}"
     agent_name = f"fifth-{nonce[:20]}"
     intent: Dict[str, object] = {
+        "model": model,
         "version": EPHEMERAL_SESSION_VERSION,
         "nonce": nonce,
         "label": label,
@@ -4220,6 +4237,7 @@ def _open_ephemeral_workspace(
         if workspace_id in baseline or workspace_info.get("label") != label:
             raise UnsafeRequest("Herdr created a workspace with unexpected identity")
         workspace_receipt = {
+            "model": model,
             "version": EPHEMERAL_SESSION_VERSION,
             "start_state_protocol": AGENT_START_STATE_PROTOCOL,
             "nonce": nonce,
@@ -4297,7 +4315,7 @@ def _open_ephemeral_workspace(
         launch_executable = _claude_executable_identity()
         start_attempted = True
         started = _run_herdr(
-            _claude_start_command(agent_name, str(pane_id), answer_directory, ui_artifacts),
+            _claude_start_command(agent_name, str(pane_id), answer_directory, ui_artifacts, model),
             timeout=CLAUDE_START_PROCESS_TIMEOUT_SECONDS,
         )
         _require_open_root_identity(
@@ -4357,6 +4375,7 @@ def _open_ephemeral_workspace(
                 "argv": processes["argv"],
                 "argv0": processes["argv0"],
                 "executable": processes["executable"],
+                "model": model,
                 **({"answer_directory": answer_directory} if answer_directory is not None else {}),
                 **({"ui_artifacts": ui_artifacts} if ui_artifacts is not None else {}),
             },
@@ -4650,12 +4669,15 @@ def _owned_target(
         "argv0",
         "executable",
     }
+    if "model" in workspace:
+        expected_agent_keys.add("model")
     if "answer_directory" in workspace:
         expected_agent_keys.add("answer_directory")
     if "ui_artifacts" in workspace:
         expected_agent_keys.add("ui_artifacts")
     if (
         set(agent_receipt) != expected_agent_keys
+        or agent_receipt.get("model", CLAUDE_MODEL) != workspace.get("model", CLAUDE_MODEL)
         or agent_receipt.get("answer_directory") != workspace.get("answer_directory")
         or agent_receipt.get("ui_artifacts") != workspace.get("ui_artifacts")
         or agent_receipt.get("version") != EPHEMERAL_SESSION_VERSION
@@ -4676,6 +4698,7 @@ def _owned_target(
             agent_receipt.get("executable"),
             workspace.get("answer_directory"),
             workspace.get("ui_artifacts"),
+            workspace.get("model", CLAUDE_MODEL),
         )
     ):
         raise UnsafeRequest("ephemeral Claude receipt is invalid")

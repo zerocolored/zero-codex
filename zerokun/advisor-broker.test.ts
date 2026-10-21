@@ -267,6 +267,10 @@ if len(args) >= 3 and args[:2] == ["agent", "start"]:
         with open(os.path.join(state["project"], ".env.audit-fixture"), "w") as handle:
             handle.write("synthetic concurrent startup metadata")
     state["claude_args"] = args[args.index("--") + 1:]
+    if state.get("opus_success") and "--model=claude-opus-5-5" in state["claude_args"]:
+        state.pop("response_capture", None)
+        state.pop("blocked_screen", None)
+        state["blocked"] = False
     child = subprocess.Popen(
         [claude, *state["claude_args"]],
         stdin=subprocess.DEVNULL,
@@ -521,7 +525,7 @@ async function brokerFixture(options: {
           if (typeof stateValue.blocked_screen === 'string' && typeof stateValue.capture_marker === 'string'
             && typeof deliveredPrompt === 'string') {
             const marker = deliveredPrompt.split('\n').findLast(line => line.startsWith('REQUEST_MARKER='))!
-            stateValue.blocked_screen = stateValue.blocked_screen.replaceAll(stateValue.capture_marker, marker)
+            stateValue.blocked_screen = stateValue.blocked_screen.replace(/REQUEST_MARKER=[A-F0-9]{32}/g, marker)
           }
           stateValue.agent_status = 'blocked'
           stateValue.read_error = options.claudeReadError ?? false
@@ -1884,7 +1888,39 @@ print('review complete')
     } finally { await fixture.close() }
   }, 160_000)
 
-  test.each(['done', 'blocked'] as const)('Fable quota in a stable %s turn preserves its cause, other answers and one-time cleanup', async status => {
+  test.each(['done'] as const)('Fable quota in a stable %s turn switches once and adopts the Opus answer', async status => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: false })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
+      const capture = ['❯ Read and carry out my task instructions in "/synthetic/instruction.md".', marker,
+        "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+        '     /usage-credits to finish what you’re working on.', '✻ Baked for 0s · done 17:53', '────', '❯'].join('\n')
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      Object.assign(state, { opus_success: true, response_capture: capture, capture_marker: marker, blocked_screen: capture })
+      writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ allAdopted: true,
+        claude: { adopted: true, promptMayHaveBeenDelivered: true, cleanupVerified: true,
+          model: 'claude-opus-5-5', fallbackFrom: 'claude-fable-5-1' },
+        slotSummary: { responsesObtained: 3 } })
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const directory = join(fixture.journalRoot, revision)
+      const diagnostics = readdirSync(directory).filter(name => name.startsWith('claude-response-'))
+        .map(name => JSON.parse(readFileSync(join(directory, name), 'utf8')))
+      expect(diagnostics.some(value => value.failure?.cause === 'rate-limit')).toBe(true)
+      expect(diagnostics.some(value => value.failure === undefined)).toBe(true)
+      const coverage = collectHostAdvisorCoverage(fixture.state, fixture.jobId, fixture.nonce, true)
+      expect(coverage?.phases[0]?.claudeQuotaFallback).toBe(true)
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload.claude).toMatchObject({ adopted: true, model: 'claude-opus-5-5' })
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ prompt_count: 2, close_count: 2, owned: false })
+    } finally { await fixture.close() }
+  }, 45_000)
+
+  test.each(['done', 'blocked'] as const)('Fable quota in a stable %s turn switches once and preserves both failures', async status => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: status === 'blocked' })
     try {
       const path = fixture.externalEvidence!.fakeHerdrState
@@ -1899,7 +1935,7 @@ print('review complete')
       expect(first.result.isError).not.toBe(true)
       expect(first.payload).toMatchObject({ allAdopted: false,
         claude: { adopted: false, promptMayHaveBeenDelivered: true, cleanupVerified: true,
-          failure: { advisor: 'claude', cause: 'rate-limit' } },
+          failure: { advisor: 'claude', cause: 'rate-limit' }, model: 'claude-opus-5-5', fallbackFrom: 'claude-fable-5-1' },
         slotSummary: { responsesObtained: 2 } })
       const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
       const directory = join(fixture.journalRoot, revision)
@@ -1909,7 +1945,7 @@ print('review complete')
       await fixture.restart()
       const replay = await fixture.call('investigation', 'revision-two')
       expect(replay.payload.claude).toMatchObject({ failure: { cause: 'rate-limit' } })
-      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ prompt_count: 1, close_count: 1, owned: false })
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ prompt_count: 2, close_count: 2, owned: false })
     } finally { await fixture.close() }
   }, 45_000)
 

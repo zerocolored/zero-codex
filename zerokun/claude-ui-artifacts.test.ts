@@ -53,6 +53,7 @@ test('GUI prompt permits Fable sample/capture while ordinary advice remains read
   expect(advisorPrompt(context, input, 'investigation', 1, 'evidence', workspace)).toContain('prototype/index.html')
   expect(advisorPrompt(context, input, 'investigation', 1, 'evidence', workspace)).not.toContain('すべてのfile writeを行わない')
   expect(advisorPrompt(context, input, 'review', 1, 'evidence')).toContain('すべてのfile writeを行わない')
+  expect(advisorPrompt(context, input, 'investigation', 1, 'evidence', workspace, 'claude-opus-5-5')).toContain('Claude Opus 5.5')
   expect(claudeUiProposalSchema.safeParse({ comparison: 'test', beforeKind: 'actual' }).success).toBe(false)
   expect(claudeUiProposalSchema.safeParse({ comparison: 'test', beforeKind: 'actual', beforeImage: '../private.png' }).success).toBe(false)
 })
@@ -65,6 +66,11 @@ test.skipIf(process.platform !== 'darwin')('collects a decoded fixed-size PNG wi
   expect(readFileSync(result.afterPath).subarray(1, 4).toString()).toBe('PNG')
   expect(result.afterPath.startsWith(input.stateDir)).toBe(true)
   expect(result.prototypePath.startsWith(input.stateDir)).toBe(false)
+})
+
+test.skipIf(process.platform !== 'darwin')('Opus artifact provenance reports the actual model', async () => {
+  const input = await fixture(); png(input.workspace)
+  expect(collectClaudeUiArtifacts({ ...input, model: 'claude-opus-5-5' }).producer).toBe('claude-opus-5-5')
 })
 
 test.skipIf(process.platform !== 'darwin')('rejects malformed images, mismatched geometry and symlink outputs', async () => {

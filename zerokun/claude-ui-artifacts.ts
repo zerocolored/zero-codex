@@ -1,3 +1,4 @@
+import { FABLE_ADVISOR_MODEL, type ClaudeAdvisorModel } from './claude-quota-fallback.ts'
 import { createHash, randomUUID } from 'crypto'
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
@@ -103,9 +104,9 @@ export async function createClaudeUiWorkspace(input: {
   }
 }
 
-export function claudeUiInstructions(workspace: ClaudeUiWorkspace): string {
+export function claudeUiInstructions(workspace: ClaudeUiWorkspace, model: ClaudeAdvisorModel = FABLE_ADVISOR_MODEL): string {
   return [
-    'GUI初期設計のUIデザイン、frontend-only sample、After画像はClaude Fable 5.1が担当してください。',
+    `GUI初期設計のUIデザイン、frontend-only sample、After画像は${model === FABLE_ADVISOR_MODEL ? 'Claude Fable 5.1' : 'Claude Opus 5.5'}が担当してください。`,
     `Host-owned artifact root: ${JSON.stringify(workspace.root)}`,
     'input/comparison.json と、存在する場合は input/before.png が比較契約です。入力は変更しないでください。',
     'prototype、evidence、runtimeだけにtask-directedな書込みを許可します。通常のtool-managed runtimeは利用できます。',
@@ -123,7 +124,7 @@ export function claudeUiInstructions(workspace: ClaudeUiWorkspace): string {
 
 /** Keep the isolated prototype for the hearing; return only a decoded, sealed image. */
 export function collectClaudeUiArtifacts(input: {
-  workspace: ClaudeUiWorkspace; stateDir: string; jobId: string
+  workspace: ClaudeUiWorkspace; stateDir: string; jobId: string; model?: ClaudeAdvisorModel
 }) {
   const { workspace } = input
   const st = lstatSync(workspace.root)
@@ -148,7 +149,7 @@ export function collectClaudeUiArtifacts(input: {
   const afterPath = join(outbox, `fable-after-${randomUUID()}.png`)
   writeFileSync(afterPath, sanitized, { flag: 'wx', mode: 0o600 })
   return {
-    status: 'produced' as const, producer: 'claude-fable-5-1' as const,
+    status: 'produced' as const, producer: input.model ?? FABLE_ADVISOR_MODEL,
     prototypePath: samplePath, prototypeSha256: digest(sample), afterPath, afterSha256: digest(sanitized),
     width: workspace.width, height: workspace.height, isolatedRoot: workspace.root,
     rootIdentity: { dev: workspace.dev, ino: workspace.ino },
