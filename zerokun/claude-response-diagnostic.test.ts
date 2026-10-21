@@ -5,7 +5,7 @@ import { join } from 'path'
 import { createHash } from 'crypto'
 import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, claudeStartupFailure, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
-import { claudeBlockedPermission } from './claude-response-diagnostic.ts'
+import { claudeBlockedPermission, claudeRequestRateLimited } from './claude-response-diagnostic.ts'
 
 test('working-directory permission is recognized after terminal line wrapping', () => {
   const dialog = ['Read outside the working directories', 'Read(/synthetic/inbox/image.png)',
@@ -29,6 +29,41 @@ function fixture() {
 }
 const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
 const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
+
+const fableLimit = "⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."
+const rejectedRequest = (message = fableLimit) => [
+  '❯ Read and carry out my task instructions in "/synthetic/instruction.md".',
+  marker, message, '/usage-credits to finish what you’re working on.',
+  '✻ Baked for 0s · done 17:53', '────', '❯', '────',
+].join('\n')
+
+test('native Fable quota rejection is bound to the current echoed request across terminal formatting', () => {
+  for (const transcript of [
+    rejectedRequest(),
+    rejectedRequest().replaceAll('\n', '\r\n').replaceAll(' ', '\u00a0'),
+    rejectedRequest().replace(fableLimit, `\u001b[31m${fableLimit}\u001b[0m`),
+    rejectedRequest().replace('Fable limit', 'Fable\n  limit'),
+    rejectedRequest().replace(marker, `${marker.slice(0, 23)}\n  ${marker.slice(23)}`),
+    rejectedRequest('⎿ You’ve reached your weekly limit. Resets tomorrow.'),
+    rejectedRequest('⎿ You have hit your limit. Run /usage-credits.'),
+  ]) expect(claudeRequestRateLimited(transcript, marker)).toBe(true)
+})
+
+test('quota prose, quotes, stale turns and valid responses do not become current native failures', () => {
+  for (const transcript of [
+    `${fableLimit}\n${rejectedRequest('⏺ ordinary incomplete answer')}`,
+    rejectedRequest(`⏺ Diagnostic example:\n${fableLimit}`),
+    rejectedRequest(`> ${fableLimit}`),
+    rejectedRequest(`\`\`\`text\n${fableLimit}\n\`\`\``),
+    rejectedRequest('⏺ Read(example.log)\n' + fableLimit),
+    rejectedRequest('⎿ File could not be read'),
+    rejectedRequest().replace(marker, 'REQUEST_MARKER=' + 'F'.repeat(32)),
+    rejectedRequest() + '\n' + marker,
+    rejectedRequest().replace('❯ Read', 'quoted Read'),
+    `❯ Explain ${fableLimit}\n${marker}\n⏺ Done`,
+  ]) expect(claudeRequestRateLimited(transcript, marker)).toBe(false)
+  expect(claudeRequestRateLimited(rejectedRequest(), '')).toBe(false)
+})
 
 test('startup diagnostics survive cleanup without terminal text or arbitrary error content', () => {
   const code = parseClaudeStartupDiagnostic('other output\n' + JSON.stringify({

@@ -518,6 +518,11 @@ async function brokerFixture(options: {
         stateValue.prompt_count = Number(stateValue.prompt_count ?? 0) + 1
         stateValue.answer_missing = Number(stateValue.prompt_count) <= (options.claudeFailures ?? 0)
         if (options.claudeBlocked) {
+          if (typeof stateValue.blocked_screen === 'string' && typeof stateValue.capture_marker === 'string'
+            && typeof deliveredPrompt === 'string') {
+            const marker = deliveredPrompt.split('\n').findLast(line => line.startsWith('REQUEST_MARKER='))!
+            stateValue.blocked_screen = stateValue.blocked_screen.replaceAll(stateValue.capture_marker, marker)
+          }
           stateValue.agent_status = 'blocked'
           stateValue.read_error = options.claudeReadError ?? false
           if (options.claudeBlockedRecovers) setTimeout(() => {
@@ -1878,6 +1883,35 @@ print('review complete')
       expect(JSON.parse(readFileSync(fixture.externalEvidence!.fakeHerdrState, 'utf8')).prompt_count).toBe(1)
     } finally { await fixture.close() }
   }, 160_000)
+
+  test.each(['done', 'blocked'] as const)('Fable quota in a stable %s turn preserves its cause, other answers and one-time cleanup', async status => {
+    const fixture = await brokerFixture({ externalSuccess: true, claudeBlocked: status === 'blocked' })
+    try {
+      const path = fixture.externalEvidence!.fakeHerdrState
+      const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
+      const capture = ['❯ Read and carry out my task instructions in "/synthetic/instruction.md".', marker,
+        "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+        '     /usage-credits to finish what you’re working on.', '✻ Baked for 0s · done 17:53', '────', '❯'].join('\n')
+      const state = JSON.parse(readFileSync(path, 'utf8'))
+      Object.assign(state, { response_capture: capture, capture_marker: marker, blocked_screen: capture })
+      writeFileSync(path, JSON.stringify(state), { mode: 0o600 })
+      const first = await fixture.call('investigation', 'revision-two')
+      expect(first.result.isError).not.toBe(true)
+      expect(first.payload).toMatchObject({ allAdopted: false,
+        claude: { adopted: false, promptMayHaveBeenDelivered: true, cleanupVerified: true,
+          failure: { advisor: 'claude', cause: 'rate-limit' } },
+        slotSummary: { responsesObtained: 2 } })
+      const revision = `revision-${fixture.revisionTwo.revision}-${fixture.revisionTwo.digest.slice(0, 16)}`
+      const directory = join(fixture.journalRoot, revision)
+      const diagnosticName = readdirSync(directory).find(name => name.startsWith('claude-response-'))!
+      expect(JSON.parse(readFileSync(join(directory, diagnosticName), 'utf8')).failure)
+        .toMatchObject({ stage: 'acquisition', cause: 'rate-limit' })
+      await fixture.restart()
+      const replay = await fixture.call('investigation', 'revision-two')
+      expect(replay.payload.claude).toMatchObject({ failure: { cause: 'rate-limit' } })
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ prompt_count: 1, close_count: 1, owned: false })
+    } finally { await fixture.close() }
+  }, 45_000)
 
   test('Claude送信後の回答不足は再送せずGrok回答と診断を保存する', async () => {
     const fixture = await brokerFixture({ externalSuccess: true, claudeFailures: 2 })
