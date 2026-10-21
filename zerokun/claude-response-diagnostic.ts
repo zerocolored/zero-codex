@@ -10,8 +10,8 @@ import type { AdvisorFailure } from './advisor-availability.ts'
  * Call only after complete-answer acquisition and stable owned-state checks.
  * Quoted diagnostics in prompts, answers or previous turns are not failures.
  */
-export function claudeRequestRateLimited(transcript: string, marker: string): boolean {
-  if (!/^REQUEST_MARKER=[A-F0-9]{32}$/.test(marker)) return false
+export function claudeRequestQuota(transcript: string, marker: string): 'fable' | 'other' | undefined {
+  if (!/^REQUEST_MARKER=[A-F0-9]{32}$/.test(marker)) return undefined
   const lines = stripVTControlCharacters(transcript).split(/\r?\n/).map(line => line.trim())
   const markers: Array<{ start: number; end: number }> = []
   for (let start = 0; start < lines.length; start++) {
@@ -22,13 +22,19 @@ export function claudeRequestRateLimited(transcript: string, marker: string): bo
       if (value === marker) { markers.push({ start, end }); break }
     }
   }
-  if (markers.length !== 1) return false
+  if (markers.length !== 1) return undefined
   const echo = markers[0]!
-  if (!lines.slice(0, echo.start).some(line => /^❯\s*\S/.test(line))) return false
+  if (!lines.slice(0, echo.start).some(line => /^❯\s*\S/.test(line))) return undefined
   const rejection = lines.slice(echo.end + 1).join(' ').trim()
   // The native error glyph, first-output position and current marker distinguish
   // a rejected request from model prose (⏺), tool output and quoted examples.
-  return /^⎿\s*(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+(?:[\p{L}\p{N}._-]+\s+){0,8}limit\b/iu.test(rejection)
+  if (/^⎿\s*(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+(?:[\p{L}\p{N}._-]+\s+){0,8}limit\b/iu.test(rejection)) {
+    return /^⎿\s*(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+Fable\s+limit\b/iu.test(rejection) ? 'fable' : 'other'
+  }
+}
+
+export function claudeRequestRateLimited(transcript: string, marker: string): boolean {
+  return claudeRequestQuota(transcript, marker) !== undefined
 }
 
 /** Recognize the active working-directory permission dialog, not quoted history.

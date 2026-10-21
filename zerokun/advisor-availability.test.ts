@@ -140,3 +140,22 @@ test('pane確認timeoutをモデル回答の時間切れと通知しない', () 
   expect(failure.cause).toBe('connection')
   expect(advisorFailureMessage(failure)).not.toContain('回答取得が制限時間を超えました')
 })
+
+
+test.each([true, false])('Fable to Opus switch is host-reported and retained on delivery (answer=%s)', adopted => {
+  const coverage: HostAdvisorCoverage = { version: 1, phases: [{
+    phase: 'investigation', round: 1, inputRevision: 1, finishedAt: 1,
+    total: 3, started: 3, responsesObtained: adopted ? 3 : 2, startedNoResponse: adopted ? 0 : 1,
+    startUnconfirmed: 0, unavailableBeforeStart: 0, claudeQuotaFallback: true,
+    slots: [{ slot: 'claude', state: adopted ? 'response-obtained' : 'started-no-response' }],
+    failures: adopted ? [] : [{ advisor: 'claude', cause: 'rate-limit' }],
+  }] }
+  const message = 'Fable の利用上限のため Opus 5.5 に切り替えました。'
+  const result = enforceHostAdvisorCoverage('本文。', coverage, 'result')
+  expect(result).toContain(message)
+  expect(result.includes('一部の独立レビュー回答を取得できませんでした')).toBe(!adopted)
+  const delivered = enforceHostAdvisorCoverage(result, undefined, 'delivery')
+  expect(delivered).toContain(message)
+  expect(enforceHostAdvisorCoverage(delivered, undefined, 'progress')).not.toContain(message)
+  expect(enforceHostAdvisorCoverage(delivered, coverage, 'result').split(message)).toHaveLength(2)
+})

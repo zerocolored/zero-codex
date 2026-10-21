@@ -299,6 +299,17 @@ class ShellReadyTests(unittest.TestCase):
         command = self.m['_claude_start_command']('owned', 'w1:p1', directory)
         self.assertEqual(command[-1], '--add-dir=' + directory)
 
+    def test_opus_model_is_bound_for_launch_and_validation(self):
+        validate = self.m['_valid_claude_option_arguments']
+        opus = 'claude-opus-5-5'
+        args = list(self.m['CLAUDE_REQUIRED_ARGUMENT_SEQUENCE']) + ['--model=' + opus]
+        self.assertTrue(validate(args, model=opus))
+        self.assertTrue(validate(args[:-1] + ['--model', opus], model=opus))
+        self.assertFalse(validate(args))
+        self.assertFalse(validate(list(self.m['CLAUDE_ARGUMENTS']), model=opus))
+        self.assertFalse(validate(args + ['--model=' + opus], model=opus))
+        self.assertIn('--model=' + opus, self.m['_claude_start_command']('owned', 'w1:p1', model=opus))
+
 
 class RunningExecutableTests(unittest.TestCase):
     def test_self_update_keeps_running_identity_but_replacement_or_bad_argv_fails(self):
