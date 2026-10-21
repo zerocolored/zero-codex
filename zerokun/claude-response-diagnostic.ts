@@ -5,6 +5,7 @@ import { stripVTControlCharacters } from 'node:util'
 import { ensureManagedDirectory, requireManagedStateRoot } from './managed-path.ts'
 import { atomicWritePrivateFile } from './safe-file.ts'
 import type { AdvisorFailure } from './advisor-availability.ts'
+import { claudeQuotaScope } from './claude-quota-fallback.ts'
 
 /** Classify a native rejection immediately after this request's prompt echo.
  * Call only after complete-answer acquisition and stable owned-state checks.
@@ -28,9 +29,7 @@ export function claudeRequestQuota(transcript: string, marker: string): 'fable' 
   const rejection = lines.slice(echo.end + 1).join(' ').trim()
   // The native error glyph, first-output position and current marker distinguish
   // a rejected request from model prose (⏺), tool output and quoted examples.
-  if (/^⎿\s*(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+(?:[\p{L}\p{N}._-]+\s+){0,8}limit\b/iu.test(rejection)) {
-    return /^⎿\s*(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+Fable\s+limit\b/iu.test(rejection) ? 'fable' : 'other'
-  }
+  if (rejection.startsWith('⎿')) return claudeQuotaScope(rejection.slice(1))
 }
 
 export function claudeRequestRateLimited(transcript: string, marker: string): boolean {

@@ -5,6 +5,21 @@ export const OPUS_ADVISOR_MODEL = 'claude-opus-5-5' as const
 export type ClaudeAdvisorModel = typeof FABLE_ADVISOR_MODEL | typeof OPUS_ADVISOR_MODEL
 export const CLAUDE_QUOTA_FALLBACK_NOTICE = 'Fable の利用上限のため Opus 5.5 に切り替えました。'
 
+/** Only a native rejection may be passed here, never arbitrary model prose. */
+export function claudeQuotaScope(message: string): 'fable' | 'other' | undefined {
+  const text = message.trim()
+  if (/^(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+(?:[\p{L}\p{N}._-]+\s+){0,8}limit\b/iu.test(text)) {
+    return /^(?:you['’]ve|you have)\s+(?:reached|hit)\s+your\s+Fable\s+limit\b/iu.test(text) ? 'fable' : 'other'
+  }
+}
+
+export function canFallbackFromClaudeQuota(input: {
+  model: string; quotaScope?: string; cleanupVerified: boolean; retrySafe: boolean
+}): boolean {
+  return input.model === FABLE_ADVISOR_MODEL && input.quotaScope === 'fable'
+    && input.cleanupVerified && input.retrySafe
+}
+
 /** The round lock owns this file. Claim durably before starting any Opus process.
  * An interrupted claimed attempt is never replayed: delivery may have happened.
  * Other advisors and the primary task retain their usual continuation policy.
@@ -27,8 +42,10 @@ export async function withClaudeQuotaFallback(options: {
       fableAttempt: saved.fableAttempt }
   }
   const fable = await options.run(FABLE_ADVISOR_MODEL)
-  if (fable.adopted === true || fable.quotaScope !== 'fable'
-    || fable.cleanupVerified !== true || fable.containmentVerified !== true) return fable
+  if (!canFallbackFromClaudeQuota({ model: FABLE_ADVISOR_MODEL,
+    quotaScope: typeof fable.quotaScope === 'string' ? fable.quotaScope : undefined,
+    cleanupVerified: fable.cleanupVerified === true,
+    retrySafe: fable.adopted !== true && fable.containmentVerified === true })) return fable
   atomicWritePrivateFile(options.path, JSON.stringify({ version: 1, status: 'claimed', fableAttempt: fable }))
   options.retire(fable)
   const opus = await options.run(OPUS_ADVISOR_MODEL)

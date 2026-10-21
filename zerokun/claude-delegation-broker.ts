@@ -3,66 +3,25 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { Database } from 'bun:sqlite'
-import { createHash, randomUUID } from 'crypto'
+import { createHash } from 'crypto'
 import { dirname, join } from 'path'
-import type { JobRecord } from './job-runner.ts'
+import { JobStore, type JobRecord } from './job-runner.ts'
 import { liveControlInputDir } from './live-control.ts'
 import { requireManagedDirectory, requireManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
 import { atomicWritePrivateFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import { readProcessIdentity, observeProcessGeneration } from './process-generation.ts'
 import { tryAcquireProcessLock, releaseProcessLock } from './process-lock.ts'
-import { prepareClaudeJobContext } from './claude-job-context.ts'
-import { assertClaudeMainlineReady } from './claude-mainline-runtime.ts'
-import { ClaudeControlSession, claudeResult } from './claude-control-session.ts'
+import { runClaudeDelegation, ClaudeDelegationError, delegationFailure, type DelegationFailure } from './claude-delegation-attempt.ts'
+import { canFallbackFromClaudeQuota, OPUS_ADVISOR_MODEL, CLAUDE_QUOTA_FALLBACK_NOTICE } from './claude-quota-fallback.ts'
 import { readPinnedHerdrRuntime, environmentForPinnedHerdrRuntime, verifyHerdrRuntimeIdentityAsync } from './herdr-runtime.ts'
-import { openClaudeHerdrTransport } from './claude-herdr-transport.ts'
 
 export interface DelegationContext { version: 1; stateDir: string; job: JobRecord }
 interface Request { key: string; model: string; prompt: string }
-interface Result { id: string; model: string; status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; result?: string; truncated?: boolean; resultPath?: string; artifactDir?: string; reportError?: string }
+interface Result { id: string; model: string; requestedModel?: string; fallbackFrom?: string; fallbackReason?: 'fable-quota'; fallbackNotice?: string; failure?: DelegationFailure; attempts?: Array<{ model: string; failure: DelegationFailure }>;  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; result?: string; truncated?: boolean; resultPath?: string; artifactDir?: string; reportError?: string }
 type Run = (context: DelegationContext, id: string, request: Request, signal: AbortSignal) => Promise<string>
 
-/** Separate child identity, goal, receipt and session. Parent dispatch/model and
- * the fixed three-advisor ledger are never consumed by an explicit delegation. */
-export const runClaudeDelegation: Run = async (context, id, request, signal) => {
-  const job = { ...context.job, id: `delegate-${id}`, task: request.prompt, runtime: 'claude-code' as const,
-    sessionId: null }
-  const executable = assertClaudeMainlineReady(job.repoPath)
-  const prepared = prepareClaudeJobContext(job, context.stateDir, { model: request.model, parentJobId: context.job.id })
-  let transport: Awaited<ReturnType<typeof openClaudeHerdrTransport>> | undefined
-  let session: ClaudeControlSession | undefined
-  try {
-    signal.throwIfAborted()
-    const sessionId = randomUUID()
-    transport = await openClaudeHerdrTransport({ stateDir: context.stateDir, jobId: job.id,
-      sequence: job.seq, cwd: prepared.jobRepo, executable,
-      arguments: prepared.argumentsFor(sessionId, false), signal,
-      fingerprint: { allow: prepared.fingerprint.allow.path, deny: prepared.fingerprint.deny.path } })
-    session = new ClaudeControlSession(transport.input, transport.output, sessionId, { expectedModel: request.model })
-    const closeOnAbort = () => { void transport?.close().catch(() => {}) }
-    signal.addEventListener('abort', closeOnAbort, { once: true })
-    try {
-      await session.initialize(); signal.throwIfAborted()
-      await session.sendUser({ messageId: randomUUID(), content: request.prompt })
-      while (true) {
-        signal.throwIfAborted()
-        const event = await session.nextEvent(200)
-        const result = event && claudeResult(event)
-        if (!result) continue
-        if (result.kind !== 'success' || session.model !== request.model) throw Error('delegated Claude did not complete with the requested model')
-        return result.text
-      }
-    } finally { signal.removeEventListener('abort', closeOnAbort) }
-  } finally {
-    try { await session?.endInput() } catch {}
-    try { await transport?.close() } catch { throw new DelegationCleanupPendingError() }
-    await session?.close()
-    prepared.retire()
-  }
-}
-
-class DelegationCleanupPendingError extends Error {}
+export { runClaudeDelegation } from './claude-delegation-attempt.ts'
 
 /** These failures happen before a claim or worker can exist. Never present
  * them as an uncertain delivery or disclose raw infrastructure exceptions. */
@@ -95,7 +54,9 @@ export class ClaudeDelegations {
     // runner's executor/pane recovery owns orphan cleanup after a host crash.
     if (saved.status === 'running' && !this.pending.has(id)
       && (!saved.owner || observeProcessGeneration(saved.owner).status === 'dead')) {
-      saved.status = 'interrupted'; atomicWritePrivateFile(this.path(id), JSON.stringify(saved))
+      saved.status = 'interrupted'
+      saved.failure = delegationFailure('dispatch', 'delivery-unknown')
+      atomicWritePrivateFile(this.path(id), JSON.stringify(saved))
     }
     return saved
   }
@@ -126,7 +87,7 @@ export class ClaudeDelegations {
     if (readOptionalBoundedOwnerOnlyRegularFile(path, 256 * 1024)) {
       releaseProcessLock(lockPath, attempt.lease); return this.start(request)
     }
-    const result: Result = { id, model: request.model, status: 'running' }
+    const result: Result = { id, model: request.model, requestedModel: request.model, status: 'running' }
     const owner = readProcessIdentity(process.pid)
     if (!owner) { releaseProcessLock(lockPath, attempt.lease); throw Error('broker owner unavailable') }
     const save = () => atomicWritePrivateFile(path, JSON.stringify({ ...result, digest, owner }))
@@ -139,7 +100,27 @@ export class ClaudeDelegations {
     const controller = new AbortController()
     const done = Promise.resolve().then(async () => {
       try {
-        const text = await this.run(this.context, id, request, controller.signal)
+        let text: string
+        try { text = await this.run(this.context, id, request, controller.signal) }
+        catch (error) {
+          if (!(error instanceof ClaudeDelegationError)) throw error
+          result.attempts = [{ model: request.model, failure: error.failure }]
+          if (controller.signal.aborted || !canFallbackFromClaudeQuota({ model: request.model, ...error.failure })) throw error
+          // Persist the chosen attempt before any Opus bytes can be delivered.
+          // On broker loss the existing running claim becomes interrupted, never replayed.
+          result.model = OPUS_ADVISOR_MODEL
+          result.fallbackFrom = request.model
+          result.fallbackReason = 'fable-quota'
+          result.fallbackNotice = CLAUDE_QUOTA_FALLBACK_NOTICE
+          try {
+            save()
+            const store = new JobStore(resolveZeroJobDatabasePath(this.context.stateDir))
+            try { store.stageClaudeDelegationFallbackNotification(this.context.job.id, id) }
+            finally { store.close() }
+          } catch { throw new ClaudeDelegationError(delegationFailure('persistence', 'persistence')) }
+          controller.signal.throwIfAborted()
+          text = await this.run(this.context, id, { ...request, model: OPUS_ADVISOR_MODEL }, controller.signal)
+        }
         // Worst-case JSON escaping is six bytes per UTF-16 code unit. Keep the
         // entire durable record below its 256 KiB read bound, including CJK.
         result.artifactDir = join(this.context.stateDir, 'outbox', this.context.job.id)
@@ -157,7 +138,15 @@ export class ClaudeDelegations {
         }
       }
       catch (error) {
-        if (error instanceof DelegationCleanupPendingError) this.cleanupFailure = error
+        const nativeFailure = error instanceof ClaudeDelegationError ? error.failure : undefined
+        result.failure = nativeFailure?.code === 'cleanup' ? nativeFailure
+          : controller.signal.aborted ? delegationFailure('execution', 'cancelled')
+          : nativeFailure ?? delegationFailure('execution', 'unknown')
+        if (result.failure.code === 'cleanup') this.cleanupFailure = error
+        result.attempts ??= []
+        if (!result.attempts.some(attempt => attempt.model === result.model && attempt.failure === result.failure)) {
+          result.attempts.push({ model: result.model, failure: result.failure })
+        }
         result.status = controller.signal.aborted ? 'cancelled' : 'failed'
       }
       finally {
@@ -206,7 +195,7 @@ export function createDelegationServer(runs: ClaudeDelegations) {
       return { ...reply({ status: 'unavailable', delivery: 'unknown', reason: 'Claude delegation could not be verified. Preserve the original request; do not substitute another model or repeat a delivered request.' }), isError: true }
     }
   }
-  server.registerTool('claude_delegate_start', { description: 'Explicit user-requested Claude delegation in a fresh owned Herdr tab. Codex stays primary. Use the requested exact native model ID (e.g. claude-fable-5-1 or claude-opus-5-5), stable key and subtask prompt; no model fallback. Child inherits the parent project write authorization and sandbox, with independent goal/session. Not the fixed Fable advisor. Returns immediately; poll the same id, never restart on a delayed response. Parent owns approval, integration, review and publication.',
+  server.registerTool('claude_delegate_start', { description: 'Explicit user-requested Claude delegation in a fresh owned Herdr tab. Codex stays primary. Use the requested exact native model ID (e.g. claude-fable-5-1 or claude-opus-5-5), stable key and subtask prompt. A native initial Fable-only quota rejection switches once to Opus 5.5 after cleanup; no fallback after work has started or for other failures. Report fallbackNotice and failure.reason with the actual model. Child inherits the parent project write authorization and sandbox, with independent goal/session. Not the fixed Fable advisor. Returns immediately; poll the same id, never restart on a delayed response. Parent owns approval, integration, review and publication.',
     inputSchema: { key: z.string().max(80), model: z.string().max(80), prompt: z.string().max(96 * 1024) } }, async input => guard(() => runs.start(input)))
   server.registerTool('claude_delegate_poll', { description: 'Wait for the same delegated Claude. Repeat while running. Completed is the child result, not parent task completion. Read resultPath for the full report (including when truncated) and inspect artifactDir; both are within the parent task scope. Interrupted/failed is not permission to replay its changes.',
     inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } }, async input => guard(() => runs.wait(input.id)))
