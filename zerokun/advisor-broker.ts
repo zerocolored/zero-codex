@@ -36,7 +36,7 @@ import { AdvisorFailureError, advisorFailureMessage, classifyAdvisorFailure, typ
 import { CLAUDE_ANSWER_FILE, readClaudeAnswerFile, ClaudeAnswerPendingError, ClaudeResponseSettling, MAX_ADVISOR_RESPONSE_CACHE_BYTES } from './claude-answer-file.ts'
 import { assertClaudeAuthStatus } from './claude-auth-status.ts'
 import { prepareClaudeAdvisorInput } from './claude-advisor-input.ts'
-import { claudeBlockedPermission } from './claude-response-diagnostic.ts'
+import { claudeBlockedPermission, claudeRequestRateLimited } from './claude-response-diagnostic.ts'
 import { connectGrokChrome, driveGrokChrome, type GrokChromeControl } from './grok-oauth-chrome.ts'
 import { claudeUiProposalSchema, createClaudeUiWorkspace, claudeUiInstructions, collectClaudeUiArtifacts,
   type ClaudeUiProposal, type ClaudeUiWorkspace } from './claude-ui-artifacts.ts'
@@ -2420,9 +2420,11 @@ async function main(): Promise<void> {
                 const progress = permission ? 'working-directory-permission'
                   : createHash('sha256').update(snapshot?.transcript ?? JSON.stringify(snapshot?.read.failure)).digest('hex')
                 if (!blockedSettling.exhausted(permission ? progress : `${observed.sequence}:${progress}`, Date.now())) continue
-                failure = { advisor: 'claude', cause: permission ? 'permission' : 'response' }
+                const rateLimited = snapshot?.transcript !== undefined && claudeRequestRateLimited(snapshot.transcript, marker)
+                failure = { advisor: 'claude', cause: rateLimited ? 'rate-limit' : permission ? 'permission' : 'response' }
                 diagnosticFailure = { stage: 'acquisition', cause: failure.cause }
-                reason = snapshot?.transcript === undefined
+                reason = rateLimited ? 'Claude rejected this request because its usage quota was reached'
+                  : snapshot?.transcript === undefined
                   ? 'Claude response blocked; terminal observation unavailable; no input was sent'
                   : 'Claude response acquisition stopped at a stable blocked interactive state; no input was sent'
                 persistDiagnostic()
@@ -2542,10 +2544,12 @@ async function main(): Promise<void> {
               if (!modelStartObserved) { await Bun.sleep(28_000); continue }
               const progress = createHash('sha256').update(transcript).digest('hex')
               if (!settling.exhausted(`${current.state_change_seq}:${progress}:${pendingAnswerDigest}`, Date.now())) continue
-              reason = pendingAnswerDigest ? reason
+              const rateLimited = claudeRequestRateLimited(transcript, marker)
+              reason = rateLimited ? 'Claude rejected this request because its usage quota was reached'
+                : pendingAnswerDigest ? reason
                 : 'Claude complete marked response remained unavailable after bounded settling'
-              failure = { advisor: 'claude', cause: 'response' }
-              diagnosticFailure = { stage: 'acquisition', cause: 'response' }
+              failure = { advisor: 'claude', cause: rateLimited ? 'rate-limit' : 'response' }
+              diagnosticFailure = { stage: 'acquisition', cause: failure.cause }
               persistDiagnostic()
               break
             }
