@@ -1,10 +1,12 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { afterEach, expect, test, spyOn } from 'bun:test'
 import * as safeFile from './safe-file.ts'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { JobStore } from './job-runner.ts'
-import { ClaudeDelegations, type DelegationContext } from './claude-delegation-broker.ts'
+import { ClaudeDelegations, createDelegationServer, type DelegationContext } from './claude-delegation-broker.ts'
 import { prepareClaudeJobContext } from './claude-job-context.ts'
 import { readProcessIdentity } from './process-generation.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
@@ -214,4 +216,43 @@ test('report storage failure preserves completed child status and preview',async
  expect(result.status).toBe('completed');expect(result.result).toBe('completed changes')
  expect(result.resultPath).toBeUndefined();expect(result.reportError).toContain('do not replay')
  expect(runs.start(request).status).toBe('completed');await runs.close()
+})
+
+
+test.each(['claude-fable-5-1', 'claude-opus-5-5', 'claude-future-9-2'])('requested native model %s reaches worker and argv without family filtering', async model => {
+ const f=fixture(),seen:string[]=[],runs=new ClaudeDelegations(f.context,async(_c,_id,input)=>{seen.push(input.model);return 'done'})
+ const input={...request,model},first=runs.start(input)
+ expect((await runs.wait(first.id)).status).toBe('completed')
+ const restarted=new ClaudeDelegations(f.context,async()=>{throw Error('no replay')})
+ expect(restarted.start(input).id).toBe(first.id);expect(seen).toEqual([model])
+ const prepared=prepareClaudeJobContext({...f.context.job,id:'delegate-model',runtime:'claude-code',sessionId:null},f.context.stateDir,{model,parentJobId:f.context.job.id})
+ try {const argv=prepared.argumentsFor('11111111-1111-4111-8111-111111111111',false);expect(argv[argv.indexOf('--model')+1]).toBe(model)} finally {prepared.retire()}
+ await runs.close();await restarted.close()
+})
+
+test('MCP distinguishes unsent input rejection from uncertain delivery, and accepts a corrected Fable request once',async()=>{
+ const f=fixture();let calls=0
+ const runs=new ClaudeDelegations(f.context,async()=>{calls++;return 'done'}),server=createDelegationServer(runs)
+ const client=new Client({name:'delegation-test',version:'1.0.0'}),[a,b]=InMemoryTransport.createLinkedPair()
+ await server.connect(b);await client.connect(a)
+ const call=async(input:Record<string,unknown>)=>{
+  const reply=await client.callTool({name:'claude_delegate_start',arguments:input})
+  return {error:reply.isError,value:JSON.parse((reply.content as Array<{text:string}>)[0]!.text)}
+ }
+ try {
+  for(const model of ['', 'claude-fable-5-1 --resume foreign', 'claude-fable-5-1\n', 'claude-fable-5-1\0']) {
+   const reply=await call({...request,model})
+   expect(reply.error).toBe(true);expect(reply.value.code).toBe('invalid-model');expect(reply.value.delivery).toBe('not-started')
+   expect(calls).toBe(0)
+  }
+  const badKey=await call({...request,key:'bad key'});expect(badKey.value.code).toBe('invalid-key')
+  const badPrompt=await call({...request,prompt:' '});expect(badPrompt.value.code).toBe('invalid-prompt')
+  const input={...request,model:'claude-fable-5-1'},first=await call(input)
+  expect(first.error).not.toBe(true);await runs.wait(first.value.id)
+  expect((await call(input)).value.id).toBe(first.value.id);expect(calls).toBe(1)
+  const conflict=await call({...input,model:'claude-opus-5-5'})
+  expect(conflict.error).toBe(true);expect(conflict.value.delivery).toBe('unknown');expect(conflict.value.code).toBeUndefined();expect(calls).toBe(1)
+  await runs.close()
+  expect((await call(input)).value.delivery).toBe('unknown')
+ } finally {await runs.close();await client.close();await server.close()}
 })

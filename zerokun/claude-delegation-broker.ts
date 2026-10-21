@@ -64,6 +64,12 @@ export const runClaudeDelegation: Run = async (context, id, request, signal) => 
 
 class DelegationCleanupPendingError extends Error {}
 
+/** These failures happen before a claim or worker can exist. Never present
+ * them as an uncertain delivery or disclose raw infrastructure exceptions. */
+class DelegationRequestError extends Error {
+  constructor(readonly code: string, message: string) { super(message) }
+}
+
 export class ClaudeDelegations {
   private pending = new Map<string, { controller: AbortController; done: Promise<void> }>()
   private closing = false
@@ -94,9 +100,14 @@ export class ClaudeDelegations {
     return saved
   }
   start(request: Request): Result {
-    if (this.closing || !/^[a-zA-Z0-9_-]{1,80}$/.test(request.key)
-      || !/^claude-opus-[a-zA-Z0-9.-]{1,60}$/.test(request.model)
-      || !request.prompt.trim() || Buffer.byteLength(request.prompt) > 96 * 1024) throw Error('invalid delegation request')
+    if (this.closing) throw Error('delegation broker closing')
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(request.key)) throw new DelegationRequestError('invalid-key', 'invalid delegation key; use a stable key containing letters, digits, underscores or hyphens.')
+    // Native IDs are passed as a separate argv value. Do not restrict families
+    // or versions: the installed Claude runtime decides model availability.
+    if (!/^claude-[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(request.model) || request.model.length > 80) {
+      throw new DelegationRequestError('invalid-model', 'invalid native Claude model ID; this request was not submitted.')
+    }
+    if (!request.prompt.trim() || Buffer.byteLength(request.prompt) > 96 * 1024) throw new DelegationRequestError('invalid-prompt', 'invalid delegation prompt: provide nonempty text within 96 KiB; this request was not submitted.')
     const id = createHash('sha256').update(JSON.stringify([this.context.job.id, request.key])).digest('hex')
     const path = this.path(id)
     const digest = createHash('sha256').update(JSON.stringify([request.model, request.prompt])).digest('hex')
@@ -189,9 +200,13 @@ export function createDelegationServer(runs: ClaudeDelegations) {
   const reply = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] })
   const guard = async (call: () => unknown) => {
     try { return reply(await call()) }
-    catch { return { ...reply({ status: 'unavailable', reason: 'Claude delegation could not be verified. Preserve the original request; do not substitute another model or repeat a delivered request.' }), isError: true } }
+    catch (error) {
+      if (error instanceof DelegationRequestError) return { ...reply({ status: 'unavailable', code: error.code,
+        delivery: 'not-started', reason: error.message }), isError: true }
+      return { ...reply({ status: 'unavailable', delivery: 'unknown', reason: 'Claude delegation could not be verified. Preserve the original request; do not substitute another model or repeat a delivered request.' }), isError: true }
+    }
   }
-  server.registerTool('claude_delegate_start', { description: 'Explicit user-requested Claude delegation in a fresh owned Herdr tab. Codex stays primary. Use exact native model ID (e.g. claude-opus-5-5), stable key and subtask prompt; no model fallback. Child inherits the parent project write authorization and sandbox, with independent goal/session. Not the fixed Fable advisor. Returns immediately; poll the same id, never restart on a delayed response. Parent owns approval, integration, review and publication.',
+  server.registerTool('claude_delegate_start', { description: 'Explicit user-requested Claude delegation in a fresh owned Herdr tab. Codex stays primary. Use the requested exact native model ID (e.g. claude-fable-5-1 or claude-opus-5-5), stable key and subtask prompt; no model fallback. Child inherits the parent project write authorization and sandbox, with independent goal/session. Not the fixed Fable advisor. Returns immediately; poll the same id, never restart on a delayed response. Parent owns approval, integration, review and publication.',
     inputSchema: { key: z.string().max(80), model: z.string().max(80), prompt: z.string().max(96 * 1024) } }, async input => guard(() => runs.start(input)))
   server.registerTool('claude_delegate_poll', { description: 'Wait for the same delegated Claude. Repeat while running. Completed is the child result, not parent task completion. Read resultPath for the full report (including when truncated) and inspect artifactDir; both are within the parent task scope. Interrupted/failed is not permission to replay its changes.',
     inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } }, async input => guard(() => runs.wait(input.id)))
