@@ -4864,6 +4864,15 @@ export class JobStore {
     }).immediate()
   }
 
+  stageClaudeDelegationFallbackNotification(jobId: string, delegationId: string): void {
+    if (!/^[a-f0-9]{64}$/.test(delegationId)) throw new Error('invalid delegation notification')
+    const job = this.get(jobId)
+    if (!job || job.status !== 'running' || job.cancelRequestedAt !== null) throw new Error('delegation parent is no longer running')
+    this.stageStatusNotificationRow({ idempotencyKey: `claude-delegation-fallback:${jobId}:${delegationId}`,
+      jobId: null, chatId: job.chatId, threadTs: job.threadTs, kind: 'closed-control', createdAt: Date.now(),
+      payload: 'Fable の利用上限のため Opus 5.5 に切り替えました。回答を取得してから結果をお知らせします。' })
+  }
+
   private stageStatusNotificationRow(input: {
     idempotencyKey: string
     jobId: string | null
