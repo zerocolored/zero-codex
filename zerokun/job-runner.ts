@@ -20,7 +20,7 @@ import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
 import { NativeConfirmationStore, awaitNativeConfirmation } from './native-confirmation.ts'
-import { fleetReplyForDelivery } from './fleet-query.ts'
+import { fleetReplyForDelivery, fleetContextText } from './fleet-query.ts'
 import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
 import { startFleetRunnerPulse } from './fleet-runtime.ts'
@@ -7022,9 +7022,12 @@ export class JobStore {
   }
 
   fleetTriageContext(chat: string, thread: string, repo: string): string {
-    const jobs=this.db.query<{task:string},[string,string,string]>("SELECT task FROM jobs WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY seq DESC LIMIT 4").all(chat,thread,repo)
+    const jobs=this.db.query<{task:string;workflow:string;status:string;terminalOutcome:string|null},[string,string,string]>("SELECT task,workflow,status,terminal_outcome AS terminalOutcome FROM jobs WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY seq DESC LIMIT 4").all(chat,thread,repo)
     const queries=this.db.query<{input:string,route:string},[string,string,string]>("SELECT input,route FROM fleet_queries WHERE chat_id=? AND thread_ts=? AND repo_path=? ORDER BY created_at DESC LIMIT 4").all(chat,thread,repo)
-    return JSON.stringify({recentTasks:jobs,recentQueries:queries}).slice(-20000)
+    return JSON.stringify({
+      recentTasks:jobs.map(job=>({...job,task:fleetContextText(job.task,1200)})),
+      recentQueries:queries.map(query=>({...query,input:fleetContextText(query.input,600)})),
+    })
   }
 
   auditSetupWaiting(jobId: string): boolean {

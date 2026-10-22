@@ -1,7 +1,7 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
 import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
 import { fleetProject } from './zerokun/fleet-project.ts'
-import { classifyFleetRequest, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
+import { classifyFleetRequest, fleetRoutingContext, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
 /**
  * Standalone Slack gateway for Codex.
  *
@@ -1272,8 +1272,9 @@ async function drainInboundDeliveries(): Promise<void> {
             if (!setupReply && !handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
               let route=jobStore.fleetQueryRoute(inbound.idempotencyKey)
               if(!route) {
-                const context=jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson
-                  ?? jobStore.fleetTriageContext(inbound.chatId,inbound.threadTs,inbound.repoPath)
+                const context=fleetRoutingContext(
+                  jobStore.getSlackThreadReplyIntent(inbound.idempotencyKey)?.snapshotJson,
+                  jobStore.fleetTriageContext(inbound.chatId,inbound.threadTs,inbound.repoPath))
                 route=await classifyFleetRequest(inbound.text,context)
                 jobStore.stageFleetRoute(inbound,route,fleetProject(inbound.repoPath)?.key??null)
               }
