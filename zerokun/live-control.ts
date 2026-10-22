@@ -1,3 +1,4 @@
+import { MAX_SLACK_ATTACHMENT_BYTES as MAX_ATTACHMENT_BYTES } from './slack-attachment-limits.ts'
 import {
   chmodSync,
   constants,
@@ -14,7 +15,6 @@ import {
   requireManagedStateRoot,
 } from './managed-path.ts'
 
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 function safeComponent(value: string, label: string): string {
   const normalized = value.replace(/[^A-Za-z0-9._-]/g, '_')

@@ -1,3 +1,4 @@
+import { MAX_SLACK_ATTACHMENT_BYTES as MAX_ATTACHMENT_BYTES } from './slack-attachment-limits.ts'
 import { createHash } from 'crypto'
 import {
   closeSync,
@@ -15,7 +16,6 @@ import { basename, dirname, join, resolve } from 'path'
 import type { IncomingMessage } from 'http'
 import type { InboundDownloadedFile } from './job-runner.ts'
 
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const HASH_CHUNK_BYTES = 64 * 1024
 
 /** A deterministic cache binding/integrity failure, never a transient host I/O error. */

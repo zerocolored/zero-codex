@@ -92,7 +92,7 @@ Git repositoryでなくてもmulti-repository workspaceとして起動できま�
 state dir の `jobs.sqlite3` に、認可済み Slack event を transaction で保存します。
 
 1. gateway が route と write 権限を決め、Slack event metadataを`inbound_deliveries`へ先に保存する。
-2. 添付をdeadline・50MB上限付きでdownloadし、`jobs` と `slack_threads` を同じtransactionで保存する。
+2. 添付を10分deadline・1ファイル500MB上限付きでdownload（初回スレッド読込は合計1GBまで）し、`jobs` と `slack_threads` を同じtransactionで保存する。
 3. 添付取得が5回失敗したeventはfailed jobとterminal通知へ退避し、後続eventのFIFOを進める。
 4. runner が `runtime=codex` の先頭1件だけ claim する。
 5. 同じHerdr workspaceへ非フォーカスの監視tabを作り、viewerの

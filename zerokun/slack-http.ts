@@ -8,6 +8,12 @@ export function slackHttpTimeoutMs(value = process.env.ZEROKUN_SLACK_HTTP_TIMEOU
   return Number.isFinite(parsed) && parsed >= 100 ? parsed : DEFAULT_SLACK_HTTP_TIMEOUT_MS
 }
 
+/** Incoming large files get their own finite deadline; control/API calls stay short. */
+export function slackAttachmentTimeoutMs(value = process.env.ZEROKUN_SLACK_ATTACHMENT_TIMEOUT_MS): number {
+  const parsed = Math.floor(Number(value))
+  return Number.isFinite(parsed) && parsed >= 100 ? parsed : 10 * 60_000
+}
+
 // A started delivery has at most target, byte transfer and finalization calls.
 // The launcher must not kill it before those network deadlines can settle.
 export function slackDeliveryShutdownGraceMs(): number {

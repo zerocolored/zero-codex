@@ -1,3 +1,4 @@
+import { MAX_SLACK_THREAD_ATTACHMENT_BYTES, SLACK_THREAD_ATTACHMENT_LIMIT_LABEL } from './slack-attachment-limits.ts'
 import {
   mentionsBot,
   slackSenderId,
@@ -9,7 +10,7 @@ import { normalizeSlackInboundText } from './live-control.ts'
 export const MAX_INITIAL_THREAD_CONTEXT_MESSAGES = 200
 export const MAX_INITIAL_THREAD_CONTEXT_BYTES = 128 * 1024
 export const MAX_INITIAL_THREAD_CONTEXT_FILES = 20
-export const MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES = 200 * 1024 * 1024
+export const MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES = MAX_SLACK_THREAD_ATTACHMENT_BYTES
 
 const SLACK_TS_RE = /^\d+\.\d+$/
 const SLACK_FILE_ID_RE = /^F[A-Z0-9]+$/
@@ -19,6 +20,12 @@ export class SlackInitialThreadContextError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'SlackInitialThreadContextError'
+  }
+}
+
+export function assertSlackThreadAttachmentBudget(bytes: number, limit = MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES): void {
+  if (bytes > limit) {
+    throw new SlackInitialThreadContextError(`Slackスレッド添付の合計サイズが${SLACK_THREAD_ATTACHMENT_LIMIT_LABEL}を超えています`)
   }
 }
 

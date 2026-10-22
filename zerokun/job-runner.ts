@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { MAX_SLACK_ATTACHMENT_BYTES } from './slack-attachment-limits.ts'
 import { CLAUDE_QUOTA_FALLBACK_NOTICE } from './claude-quota-fallback.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE, STORAGE_FAILURE_MESSAGE } from './storage-failure.ts'
 import { handoffControl } from './handoff-control.ts'
@@ -907,7 +908,7 @@ CREATE TABLE IF NOT EXISTS slack_thread_attachments (
   file_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
   path TEXT NOT NULL,
-  size INTEGER NOT NULL CHECK (size >= 0 AND size <= 52428800),
+  size INTEGER NOT NULL CHECK (size >= 0 AND size <= ${MAX_SLACK_ATTACHMENT_BYTES}),
   digest TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (chat_id, thread_ts, source_message_id, file_id),
@@ -2004,6 +2005,24 @@ function persistThreadHistorySnapshot(
 
 function ensureJobSchemaMigrations(db: Database): void {
   db.exec(TASK_MODEL_SCHEMA)
+  // Existing databases also enforce the old limit. Rebuild the CHECK atomically,
+  // preserving every attachment binding and explicit index/trigger.
+  db.transaction(() => {
+    const schema = db.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='slack_thread_attachments'",
+    ).get()!.sql
+    const oldLimit = /size\s*<=\s*52428800\b/
+    if (!oldLimit.test(schema)) return
+    const related = db.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE tbl_name='slack_thread_attachments' AND type IN ('index','trigger') AND sql IS NOT NULL",
+    ).all()
+    db.exec(schema.replace('slack_thread_attachments', 'slack_thread_attachments_capacity')
+      .replace(oldLimit, `size <= ${MAX_SLACK_ATTACHMENT_BYTES}`))
+    db.exec(`INSERT INTO slack_thread_attachments_capacity SELECT * FROM slack_thread_attachments;
+      DROP TABLE slack_thread_attachments;
+      ALTER TABLE slack_thread_attachments_capacity RENAME TO slack_thread_attachments;`)
+    for (const object of related) db.exec(object.sql)
+  }).immediate()
   db.transaction(() => {
     if (!db.query<{ name: string }, []>('PRAGMA table_info(codex_session_protocols)').all().some(column => column.name === 'core')) {
       db.exec("ALTER TABLE codex_session_protocols ADD COLUMN core TEXT NOT NULL DEFAULT 'codex' CHECK(core IN ('codex','claude-code'))")
@@ -2883,7 +2902,7 @@ function parseThreadAttachments(value: string | null | undefined): ThreadAttachm
       || !Number.isSafeInteger(record.ordinal) || Number(record.ordinal) < 0
       || typeof record.path !== 'string' || !isAbsolute(record.path)
       || !Number.isSafeInteger(record.size) || Number(record.size) < 0
-      || Number(record.size) > 50 * 1024 * 1024
+      || Number(record.size) > MAX_SLACK_ATTACHMENT_BYTES
       || typeof record.digest !== 'string' || !/^[0-9a-f]{64}$/.test(record.digest)) {
       throw new Error('thread attachment snapshot fields are invalid')
     }
@@ -2921,7 +2940,7 @@ function parseInboundDownloadedFiles(value: string): InboundDownloadedFile[] {
       || !Number.isSafeInteger(record.ordinal) || Number(record.ordinal) < 0
       || typeof record.path !== 'string' || !record.path
       || !Number.isSafeInteger(record.size) || Number(record.size) < 0
-      || Number(record.size) > 50 * 1024 * 1024
+      || Number(record.size) > MAX_SLACK_ATTACHMENT_BYTES
       || typeof record.digest !== 'string' || !/^[0-9a-f]{64}$/.test(record.digest)) {
       throw new Error('inbound attachment manifest fields are invalid')
     }
@@ -6928,7 +6947,7 @@ export class JobStore {
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
       throw new Error('downloaded file ordinal is invalid')
     }
-    if (!Number.isSafeInteger(size) || size < 0 || size > 50 * 1024 * 1024) {
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_SLACK_ATTACHMENT_BYTES) {
       throw new Error('downloaded file size is invalid')
     }
     if (!/^[0-9a-f]{64}$/.test(file.digest)) {
