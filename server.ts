@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { MAX_SLACK_ATTACHMENT_BYTES as MAX_ATTACHMENT_BYTES, SLACK_ATTACHMENT_LIMIT_LABEL } from './zerokun/slack-attachment-limits.ts'
 import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
 import { fleetProject } from './zerokun/fleet-project.ts'
 import { classifyFleetRequest, fleetRoutingContext, separateSecurityWorkflow, readProjectFleet, fleetCloudTime, answerFleetStatus, unavailableFleet, fleetReplyEnvelope } from './zerokun/fleet-query.ts'
@@ -66,6 +67,7 @@ import { requireLegacyThreadRepoRoute } from './zerokun/routing.ts'
 import { legacyCutoverForState, resolveZeroJobDatabasePath, resolveZeroStateDir } from './zerokun/state-dir.ts'
 import {
   slackHttpTimeoutMs,
+  slackAttachmentTimeoutMs,
   slackWebClientOptions,
   openDirectSlackDownload,
   withSlackDeadline,
@@ -116,6 +118,7 @@ import {
 import {
   planInitialSlackThreadContext,
   MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES,
+  assertSlackThreadAttachmentBudget,
   MAX_INITIAL_THREAD_CONTEXT_MESSAGES,
   SlackInitialThreadContextError,
 } from './zerokun/slack-thread-context.ts'
@@ -160,7 +163,6 @@ const THREAD_ACTIVE_WINDOW_MS = 48 * 60 * 60 * 1000
 const THREAD_INTENT_REORDER_MS = 750
 const THREAD_INTENT_DRAIN_INTERVAL_MS = 5_000
 
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 type BudgetedSlackMethod = 'history' | 'replies' | 'list'
 type SlackBudgetLane = 'catchup' | 'owned'
@@ -968,11 +970,7 @@ async function downloadInboundFiles(
     })
     if (cached) {
       totalBytes += cached.size
-      if (totalBytes > maxTotalBytes) {
-        throw new SlackInitialThreadContextError(
-          'Slackスレッド添付の合計サイズが200MBを超えています',
-        )
-      }
+      assertSlackThreadAttachmentBudget(totalBytes, maxTotalBytes)
       if (!manifest) jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, cached)
       paths.push(cached.path)
       continue
@@ -987,13 +985,9 @@ async function downloadInboundFiles(
       if (expectedSize !== undefined
         && (!Number.isSafeInteger(expectedSize) || expectedSize < 0
           || expectedSize > MAX_ATTACHMENT_BYTES)) {
-        throw new Error(`file ${fileId} is larger than 50MB`)
+        throw new Error(`file ${fileId} is larger than ${SLACK_ATTACHMENT_LIMIT_LABEL}`)
       }
-      if (expectedSize !== undefined && totalBytes + expectedSize > maxTotalBytes) {
-        throw new SlackInitialThreadContextError(
-          'Slackスレッド添付の合計サイズが200MBを超えています',
-        )
-      }
+      if (expectedSize !== undefined) assertSlackThreadAttachmentBudget(totalBytes + expectedSize, maxTotalBytes)
       const response = await openDirectSlackDownload(file.url_private_download, BOT_TOKEN, signal)
       if (response.statusCode !== 200) {
         response.resume()
@@ -1021,13 +1015,11 @@ async function downloadInboundFiles(
           received += chunk.byteLength
           if (received > MAX_ATTACHMENT_BYTES) {
             response.destroy()
-            throw new Error(`file ${fileId} is larger than 50MB`)
+            throw new Error(`file ${fileId} is larger than ${SLACK_ATTACHMENT_LIMIT_LABEL}`)
           }
           if (totalBytes + received > maxTotalBytes) {
             response.destroy()
-            throw new SlackInitialThreadContextError(
-              'Slackスレッド添付の合計サイズが200MBを超えています',
-            )
+            assertSlackThreadAttachmentBudget(totalBytes + received, maxTotalBytes)
           }
           digest.update(chunk)
           writeAllSync(descriptor, chunk)
@@ -1075,7 +1067,7 @@ async function downloadInboundFiles(
       }
       totalBytes += received
       return destination
-    }, slackHttpTimeoutMs(), `Slack attachment ${fileId}`, parentSignal)
+    }, slackAttachmentTimeoutMs(), `Slack attachment ${fileId}`, parentSignal)
     paths.push(localPath)
   }
   return paths

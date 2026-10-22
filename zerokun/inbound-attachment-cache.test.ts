@@ -150,15 +150,15 @@ describe('durable inbound attachment cache', () => {
         { ...valid, headers: { 'content-length': String(body.length - 3) } },
         { ...valid, headers: { 'content-length': 'invalid' } },
         { ...valid, headers: { 'content-length': '-1' } },
-        { ...valid, headers: { 'content-length': String(50 * 1024 * 1024 + 1) } },
+        { ...valid, headers: { 'content-length': String(500 * 1024 * 1024 + 1) } },
         { ...valid, headers: { 'content-length': String(body.length), 'transfer-encoding': 'chunked' } },
         { ...valid, headers: { 'content-encoding': 'gzip' } },
         { ...valid, headers: { 'transfer-encoding': 'gzip, chunked' } },
       ]) {
         expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, body.length, invalid)).toThrow()
       }
-      expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, 50 * 1024 * 1024 + 1, valid)).toThrow()
-      expect(() => verifyInboundDownloadBeforeRename(descriptor, 50 * 1024 * 1024 + 1, undefined, valid)).toThrow()
+      expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, 500 * 1024 * 1024 + 1, valid)).toThrow()
+      expect(() => verifyInboundDownloadBeforeRename(descriptor, 500 * 1024 * 1024 + 1, undefined, valid)).toThrow()
       // Close-delimited responses retain the metadata check; no +/-3 exception.
       expect(() => verifyInboundDownloadBeforeRename(descriptor, body.length, body.length + 3, { ...valid, headers: {} })).toThrow()
       expect(verifyInboundDownloadBeforeRename(descriptor, body.length, body.length, { ...valid, headers: {} })).toHaveProperty('ino')
