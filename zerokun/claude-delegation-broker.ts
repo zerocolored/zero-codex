@@ -18,7 +18,7 @@ import { canFallbackFromClaudeQuota, OPUS_ADVISOR_MODEL, CLAUDE_QUOTA_FALLBACK_N
 import { readPinnedHerdrRuntime, environmentForPinnedHerdrRuntime, verifyHerdrRuntimeIdentityAsync } from './herdr-runtime.ts'
 
 export interface DelegationContext { version: 1; stateDir: string; job: JobRecord }
-interface Request { key: string; model: string; prompt: string }
+interface Request { key: string; model: string; prompt: string; authenticationRetryOf?: string }
 type Provider = 'claude' | 'antigravity'
 interface Result { provider?: Provider; id: string; model: string; requestedModel?: string; fallbackFrom?: string; fallbackReason?: 'fable-quota'; fallbackNotice?: string; failure?: DelegationFailure; attempts?: Array<{ model: string; failure: DelegationFailure }>;  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'; result?: string; truncated?: boolean; resultPath?: string; artifactDir?: string; reportError?: string }
 type Run = (context: DelegationContext, id: string, request: Request, signal: AbortSignal) => Promise<string>
@@ -62,9 +62,31 @@ export class ClaudeDelegations {
     }
     return saved
   }
+  retryAfterAuthentication(id: string): Result {
+    const prior = this.poll(id) as Result & { digest?: string }
+    if (this.provider !== 'antigravity' || prior.provider !== 'antigravity'
+      || prior.status !== 'failed' || prior.failure?.code !== 'authentication'
+      || !prior.failure.retrySafe || !prior.failure.cleanupVerified) {
+      throw new DelegationRequestError('unsafe-authentication-retry', 'Only a cleaned-up Antigravity authentication failure before any work can be retried.')
+    }
+    const path = this.path(id) + '.request'
+    const request = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(path, 1024 * 1024) ?? 'null') as Request | null
+    if (!request || request.authenticationRetryOf || request.model !== prior.model
+      || createHash('sha256').update(JSON.stringify([request.model, request.prompt])).digest('hex') !== prior.digest
+      || createHash('sha256').update(JSON.stringify([this.context.job.id, this.provider, request.key])).digest('hex') !== id) {
+      throw new DelegationRequestError('authentication-retry-unavailable', 'The original request is unavailable or its authentication retry has already failed. Do not replay it.')
+    }
+    // A deterministic separate claim preserves the original failure and makes
+    // repeated calls (including after reconnect) return the same single retry.
+    return this.start({ ...request, key: `auth-retry-${id}`, authenticationRetryOf: id })
+  }
   start(request: Request): Result {
     if (this.closing) throw Error('delegation broker closing')
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(request.key)) throw new DelegationRequestError('invalid-key', 'invalid delegation key; use a stable key containing letters, digits, underscores or hyphens.')
+    if (this.provider === 'antigravity' && request.key.startsWith('auth-retry-')
+      && (!/^[a-f0-9]{64}$/.test(request.authenticationRetryOf ?? '') || request.key !== `auth-retry-${request.authenticationRetryOf}`)) {
+      throw new DelegationRequestError('reserved-key', 'The auth-retry- key prefix is reserved for the authenticated recovery entry point.')
+    }
     // Native IDs are passed as a separate argv value. Do not restrict families
     // or versions: the installed Claude runtime decides model availability.
     if (!(this.provider === 'claude' ? /^claude-[a-zA-Z0-9][a-zA-Z0-9.-]*$/ : /^[a-zA-Z0-9][a-zA-Z0-9._/:+-]*$/).test(request.model) || request.model.length > 80) {
@@ -93,7 +115,10 @@ export class ClaudeDelegations {
     const owner = readProcessIdentity(process.pid)
     if (!owner) { releaseProcessLock(lockPath, attempt.lease); throw Error('broker owner unavailable') }
     const save = () => atomicWritePrivateFile(path, JSON.stringify({ ...result, digest, owner }))
-    try { save() } catch (error) {
+    try {
+      if (this.provider === 'antigravity') atomicWritePrivateFile(path + '.request', JSON.stringify(request))
+      save()
+    } catch (error) {
       result.status = 'interrupted'
       this.settled.set(id, { ...result, digest, owner })
       try { save() } catch {}
@@ -212,6 +237,8 @@ export function createDelegationServer(runs: ClaudeDelegations, antigravity?: Cl
       inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } }, async input => guard(() => antigravity.wait(input.id)))
     server.registerTool('antigravity_delegate_cancel', { description: 'Cancel and reap only the owned Antigravity delegation, preserving partial project changes.',
       inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } }, async input => guard(() => antigravity.cancel(input.id)))
+    server.registerTool('antigravity_delegate_retry_after_authentication', { description: 'After completing the official Antigravity sign-in, retry an original pre-work authentication failure once with its exact saved prompt and model. Requires verified cleanup and no work. Returns a new stable id; poll that id. Repeated calls return the same retry, including across reconnects. Never call for a permission, network, interrupted, or partially executed failure.',
+      inputSchema: { id: z.string().regex(/^[a-f0-9]{64}$/) } }, async input => guard(() => antigravity.retryAfterAuthentication(input.id)))
   }
   return server
 }

@@ -7,6 +7,7 @@ import { JobStore } from './job-runner.ts'
 import { pendingClaudeDelegation } from './claude-delegation-state.ts'
 import { prepareClaudeJobContext } from './claude-job-context.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { ClaudeDelegationError, delegationFailure } from './claude-delegation-attempt.ts'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 const cleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup() })
@@ -20,6 +21,41 @@ function fixture(writeEnabled = true) {
   return { version: 1 as const, stateDir, job: store.claimNext('test')! }
 }
 const model = 'gemini-3.8-flash-low'
+test('authentication recovery preserves the request and allows one durable retry only', async () => {
+  const context = fixture(); let calls = 0
+  const run = async (_context: unknown, _id: string, request: { model: string; prompt: string }) => {
+    calls++
+    expect(request.model).toBe(model); expect(request.prompt).toBe('original task')
+    if (calls === 1) throw new ClaudeDelegationError({ ...delegationFailure('authentication', 'authentication'), retrySafe: true, cleanupVerified: true })
+    return 'recovered'
+  }
+  const first = new ClaudeDelegations(context, run, 'antigravity')
+  const original = first.start({ key: 'original', model, prompt: 'original task' })
+  await first.wait(original.id); await first.close()
+  const resumed = new ClaudeDelegations(context, run, 'antigravity')
+  try {
+    const retry = resumed.retryAfterAuthentication(original.id)
+    expect(resumed.retryAfterAuthentication(original.id).id).toBe(retry.id)
+    expect((await resumed.wait(retry.id)).result).toBe('recovered')
+    expect(resumed.retryAfterAuthentication(original.id).id).toBe(retry.id)
+    expect(() => resumed.retryAfterAuthentication(retry.id)).toThrow()
+    expect(calls).toBe(2)
+  } finally { await resumed.close() }
+})
+test.each(['partial', 'cleanup', 'network', 'second-auth'] as const)('authentication retry does not replay unsafe or repeated failures (%s)', async kind => {
+  const context = fixture()
+  const agy = new ClaudeDelegations(context, async () => { throw new ClaudeDelegationError({
+    ...delegationFailure('authentication', kind === 'network' ? 'native-error' : 'authentication'),
+    retrySafe: kind !== 'partial', cleanupVerified: kind !== 'cleanup',
+  }) }, 'antigravity')
+  try {
+    const original = agy.start({ key: 'failure', model, prompt: 'task' }); await agy.wait(original.id)
+    if (kind === 'second-auth') {
+      const retry = agy.retryAfterAuthentication(original.id); await agy.wait(retry.id)
+      expect(() => agy.retryAfterAuthentication(retry.id)).toThrow()
+    } else expect(() => agy.retryAfterAuthentication(original.id)).toThrow()
+  } finally { await agy.close() }
+})
 const init = { event: 'init', conversation_id: 'test', init: { model } }
 const result = { event: 'result', result: { conversation_id: 'test', status: 'SUCCESS', response: '日本語 OK' } }
 function bytes(...events: unknown[]) { return Buffer.from(events.map(v => JSON.stringify(v)).join('\n') + '\n') }
@@ -63,6 +99,7 @@ test('Antigravity MCP catalog and omitted model route to its provider', async ()
   try {
     const names = (await client.listTools()).tools.map(t => t.name)
     expect(names).toContain('claude_delegate_start'); expect(names).toContain('antigravity_delegate_cancel')
+    expect(names).toContain('antigravity_delegate_retry_after_authentication')
     const start = await client.callTool({ name: 'antigravity_delegate_start', arguments: { key: 'mcp', prompt: 'task' } })
     const id = JSON.parse((start.content as any)[0].text).id
     expect((await agy.wait(id)).result).toBe('agy')
@@ -78,6 +115,10 @@ test.each([false, true])('sandbox retains project authorization and host state d
     const fs = parsed.permissions[prepared.toolsContext.profile].filesystem
     expect(fs[context.job.repoPath]).toBe(writeEnabled ? 'write' : 'read')
     expect(fs[context.stateDir]).toBe('deny')
+    const network = parsed.permissions[prepared.toolsContext.profile].network
+    expect(network.enabled).toBe(true)
+    expect(network.domains['*']).toBe('allow')
+    if (!writeEnabled) expect(network.domains['slack.com']).toBe('deny')
     expect(args.slice(args.indexOf('--') + 1)).toEqual([process.execPath,
       '--dangerously-skip-permissions', '--input-format', 'stream-json', '--output-format', 'stream-json', '--disable-slash-commands',
       ...(!writeEnabled ? ['--mode', 'plan'] : []), '--model', model])

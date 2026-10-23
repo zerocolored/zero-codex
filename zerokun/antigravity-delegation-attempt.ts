@@ -92,10 +92,14 @@ export function antigravitySandbox(prepared: ReturnType<typeof prepareClaudeJobC
   const network = `permissions.${context.profile}.network.enabled=`
   const local = `permissions.${context.profile}.network.allow_local_binding=`
   const domains = `permissions.${context.profile}.network.domains=`
+  // A read-only parent may omit domains entirely. Mapping existing entries
+  // alone would leave the native inference transport without an allow rule.
+  const networkOverrides = !writeEnabled && !overrides.some(value => value.startsWith(domains))
+    ? [...overrides, domains + '{}'] : overrides
   const argumentsForAgy = ['--dangerously-skip-permissions', '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--disable-slash-commands', ...(!writeEnabled ? ['--mode', 'plan'] : []),
     ...(model === 'default' ? [] : ['--model', model])]
-  return primarySandboxCommand({ ...context, permissionOverrides: overrides.map(value =>
+  return primarySandboxCommand({ ...context, permissionOverrides: networkOverrides.map(value =>
     value.startsWith(network) ? network + 'true' : value.startsWith(local) ? local + 'true'
       : value.startsWith(domains) && !writeEnabled ? domains + '{"*"="allow","slack.com"="deny","**.slack.com"="deny","slack-edge.com"="deny","**.slack-edge.com"="deny","slack-msgs.com"="deny","**.slack-msgs.com"="deny"}'
       : value.startsWith('features.network_proxy=') ? 'features.network_proxy=true' : value),
