@@ -188,6 +188,29 @@ describe('zerochan project selection', () => {
     })).toThrow('share Git metadata')
   })
 
+  test('a development clone and its worktree remain usable with an independent runtime clone', () => {
+    const value = fixture()
+    const git = (...args: string[]) => {
+      const result = Bun.spawnSync(['git', ...args], { stdout: 'pipe', stderr: 'pipe' })
+      expect(result.exitCode, result.stderr.toString()).toBe(0)
+    }
+    writeFileSync(join(value.project, 'source.ts'), 'export const version = 1\n')
+    git('-C', value.project, 'add', 'source.ts')
+    git('-C', value.project, '-c', 'user.name=Zero Test', '-c', 'user.email=zero@example.invalid', 'commit', '-qm', 'source')
+    const runtime = join(value.root, 'independent-runtime')
+    git('clone', '--no-local', '-q', value.project, runtime)
+    const worktree = join(value.root, 'development-worktree')
+    git('-C', value.project, 'worktree', 'add', '-q', worktree)
+    const options = { runtimeRepo: runtime, stateDir: value.state, homeDir: value.home }
+    expect(validateLaunchProject(value.project, options)).toBe(realpathSync(value.project))
+    expect(validateLaunchProject(worktree, options)).toBe(realpathSync(worktree))
+    writeFileSync(join(worktree, 'source.ts'), 'export const version = 2\n')
+    expect(readFileSync(join(runtime, 'source.ts'), 'utf8')).toBe('export const version = 1\n')
+    for (const target of [runtime, join(runtime, '.git'), value.root]) {
+      expect(() => validateLaunchProject(target, options)).toThrow('runtime repository')
+    }
+  })
+
   test('persists an owner-only physical last-connected project record', () => {
     const value = fixture()
     const alias = join(value.root, 'project-alias')

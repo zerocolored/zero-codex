@@ -355,6 +355,47 @@ zerochan status
 使う場合は、IDを変えて`zerochan set slack-channel`を繰り返します。同じchannelを複数projectへ
 同時には紐付けません。
 
+### Zeroちゃん自身を開発する
+
+`zero-codex`もSlackから開発できます。開発用cloneとZeroちゃんの実行用cloneは分けます。
+同じdirectoryやGit metadataを共有するworktreeを実行用にすると、開発中の変更が動作中の
+Zeroちゃんへ影響するため登録できません。開発用cloneの移動や削除は不要です。
+
+例えば開発用が`~/dev/zero-codex`なら、実行用を別の`~/dev/zero-codex-runtime`へ配置します。
+このMacでZeroちゃんが既に動いている場合は、各Appの処理完了を待って通常の`zerochan stop`で
+停止してから切り替えます。他のMacのApp/tokenは再利用しません。
+
+```bash
+cd "$HOME/dev/zero-codex"
+bash zerokun/bootstrap-macos.sh --doctor
+bash zerokun/interactive-bootstrap.sh \
+  --repo-dir "$HOME/dev/zero-codex-runtime" \
+  --project-dir "$HOME/dev/zero-codex"
+```
+
+既存のbootstrapが実行用を独立cloneとして配置し、導入元を確認してCLIの参照先を切り替えます。
+実行用の配置先に無関係な既存fileがあれば上書きしません。開発用cloneの変更も保持します。
+既にApp別releaseが配備された環境では、そのpinは保持されます。実際のApp runtimeがまだ
+開発用cloneを指している場合は、別の通常projectから`zerochan update`で移行を完了してから
+自己開発のchannelを設定してください。
+
+基本導入が成功したら、開発用cloneでこのMacの登録済みSlack Appを選び、channelを設定します。
+新規Appの登録・招待が必要なら前節の手順に従います。
+
+```bash
+cd "$HOME/dev/zero-codex"
+zerochan set slack-app
+zerochan set slack-channel C0123456789
+zerochan status
+zerochan start
+```
+
+設定の読み書きには導入済みCLIを使い、projectの隔離判定には選択したAppの実際のruntimeを使います。
+開発用cloneの通常のworktreeも、実行用cloneとGit metadataを共有しなければ利用できます。
+変更のcommit/pushと稼働版への反映は別です。統合後の反映は通常どおり`zerochan update`を使い、
+実行用cloneや配備済みreleaseをSlackの開発対象にはしないでください。
+セットアップ完了の判定には、後述のgateway・queueとSlack実応答の確認が必要です。
+
 ### 4. 起動する
 
 対象projectをcurrent directoryにして起動します。通常Terminalや通常のCodexから実行しても、

@@ -171,8 +171,14 @@ fi
 # Project configuration is owned by the installed CLI, just like set/unset
 # slack-app. An App's older runtime must not parse configuration written by a
 # newer management command. Only service execution follows the App's pin.
+PROJECT_RUNTIME="$REPO_DIR"
 case "$LAUNCH_MODE" in
-  set-channel|unset-channel|status) ;;
+  set-channel|unset-channel|status)
+    # Parse configuration with this CLI, but protect the App's actual runtime.
+    # The management checkout may itself be the development target once the
+    # App has moved to a separate clone/release.
+    PROJECT_RUNTIME="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
+    ;;
   *)
     PINNED_REPO="$(bun --config=/dev/null --no-env-file "$REPO_DIR/zerokun/runtime-release.ts" "$STATE_DIR" "$REPO_DIR")" || exit 1
     if [ "$PINNED_REPO" != "$REPO_DIR" ]; then
@@ -212,7 +218,7 @@ fi
 # the physical directory where the user invoked it.
 PROJECT="$(bun --config=/dev/null --no-env-file \
   "$REPO_DIR/zerokun/project-selection.ts" validate-launch \
-  "$PROJECT" "$REPO_DIR" "$STATE_DIR" "$HOME")" || {
+  "$PROJECT" "$PROJECT_RUNTIME" "$STATE_DIR" "$HOME")" || {
   echo "❌ 対象projectを選択できません。Git repository、または複数repositoryを直下に含むprojectへ cd して zerochan を実行してください。" >&2
   exit 1
 }
