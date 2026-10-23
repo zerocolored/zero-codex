@@ -4,6 +4,16 @@ import type { CodexLiveControlHooks } from './codex-executor.ts'
 /** Both primary transports use the same queue-owner transactions. */
 export function createPrimaryLiveControlHooks(store: JobStore, job: JobRecord): CodexLiveControlHooks {
   return {
+    attachmentSnapshot: () => {
+      const current = store.get(job.id)
+      if (!current || current.controlEpoch !== job.controlEpoch
+        || current.chatId !== job.chatId || current.threadTs !== job.threadTs
+        || current.repoPath !== (job.historyRepoPath ?? job.repoPath)) {
+        throw new Error('live attachment snapshot changed its job scope')
+      }
+      return { threadAttachments: current.threadAttachments ?? [],
+        unavailableThreadAttachments: current.unavailableThreadAttachments ?? [] }
+    },
     recordGoalStatus: status => store.recordTaskGoalStatus(job.id, status),
     next: () => store.nextReadyLiveInput(job.id, job.controlEpoch),
     nextInterjection: () => store.nextPendingInterjection(job.id, job.controlEpoch),

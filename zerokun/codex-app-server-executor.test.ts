@@ -1,3 +1,6 @@
+import { createPrimaryLiveControlHooks } from './primary-live-controls.ts'
+import { copyLiveControlAttachments } from './live-control.ts'
+import { loadCachedInboundAttachment } from './inbound-attachment-cache.ts'
 import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
 import { classifyTaskModel } from './task-model-selection.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
@@ -991,6 +994,10 @@ for line in sys.stdin:
                 children = [child_fixture["child"]]
         emit({"id": request_id, "result": {"data": children, "nextCursor": None}})
     elif method == "turn/steer":
+        attachment_log = os.environ.get("ZERO_ATTACHMENT_PROMPT_LOG")
+        if attachment_log:
+            with open(attachment_log, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(value["params"].get("input", []), ensure_ascii=False) + "\\n")
         if os.environ.get("ZERO_CONTINUATION_STEER") == "1":
             steer_text = value.get("params", {}).get("input", [{}])[0].get("text", "")
             control_log = os.environ.get("ZERO_CONTROL_LOG")
@@ -6314,6 +6321,47 @@ describe('production App Server executor', () => {
     })).rejects.toBeInstanceOf(CodexUserCancelledError)
     expect(existsSync(rpcLog)?readFileSync(rpcLog,'utf8').trim():'').toBe('')
     value.store.close()
+  },30_000)
+
+  for (const available of [true, false]) test(`same-process steer receives recovered attachment or unavailable evidence (${available})`, async () => {
+    const value = fixture('steer')
+    const rpcLog = join(value.root,'attachment-steer-rpc.log')
+    value.hooks.attachmentSnapshot = createPrimaryLiveControlHooks(value.store,value.job).attachmentSnapshot
+    value.hooks.acknowledgeInitialDispatch = ({executorNonce,threadId,turnId,requestId}) => {
+      value.store.acknowledgeInitialTurnDispatch({jobId:value.job.id,workerId:value.job.workerId!,
+        attempt:value.job.attempts,epoch:value.job.controlEpoch,executorNonce,threadId,turnId,requestId})
+      const base = {chatId:value.job.chatId,threadTs:value.job.threadTs,repoPath:value.repo,userId:'UOTHER'}
+      const stage = (messageId:string,fileIds:string[]) => {
+        value.store.stageInboundDeliveryAndAdoptSlackThread({...base,messageId,fileIds,text:'再度確認して'},
+          {appId:'A1',initialContextEligible:false})
+        return value.store.claimNextInboundDelivery()!
+      }
+      const failed = stage('1800000000.000150',['FAUDIO'])
+      value.store.tombstoneInboundDelivery(failed.idempotencyKey,{kind:'attachment-control-failed',payload:'download failed'})
+      const retry = stage('1800000000.000200',[])
+      if (available) {
+        const directory=join(value.state,'inbox',failed.messageId)
+        mkdirSync(directory,{recursive:true,mode:0o700})
+        writeFileSync(join(directory,'FAUDIO.mp4'),'synthetic media',{mode:0o600})
+        const file=loadCachedInboundAttachment({inboxDir:join(value.state,'inbox'),messageTs:failed.messageId,fileId:'FAUDIO',ordinal:0})!
+        value.store.recordRecoveredThreadAttachment(retry.idempotencyKey,value.store.pendingThreadAttachments(base)[0]!,file)
+      }
+      const paths=value.store.recoveredInboundAttachmentPaths(retry.idempotencyKey)
+      const attachments=copyLiveControlAttachments({stateDir:value.state,jobId:value.job.id,messageId:retry.messageId,attachments:paths})
+      value.store.stageLiveControl(value.store.liveControlTarget(base.chatId,base.threadTs)!,
+        {...base,messageId:retry.messageId,task:retry.text,kind:'steer',attachments})
+      value.store.completeInboundDelivery(retry.idempotencyKey)
+    }
+    const processIds:number[]=[]
+    try {
+      await executeCodexJob(value.job,{codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,extraEnvironment:{ZERO_FIXTURE_MODE:'steer',ZERO_ATTACHMENT_PROMPT_LOG:rpcLog},
+        onProcessId:pid=>{processIds.push(pid)},liveControls:value.hooks})
+      expect(processIds).toHaveLength(1)
+      const steer=readFileSync(rpcLog,'utf8')
+      expect(steer).toContain(available?'FAUDIO.mp4':'download unavailable; original reference retained')
+      expect(value.store.listJobControls(value.job.id)[0]!.status).toBe('observed')
+    } finally {value.store.close()}
   },30_000)
 
   test('同じthreadの別user返信をactive turnへsteerする', async () => {

@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { recoverThreadAttachments } from './zerokun/thread-attachment-recovery.ts'
 import { MAX_SLACK_ATTACHMENT_BYTES as MAX_ATTACHMENT_BYTES, SLACK_ATTACHMENT_LIMIT_LABEL } from './zerokun/slack-attachment-limits.ts'
 import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
 import { fleetProject } from './zerokun/fleet-project.ts'
@@ -60,6 +61,7 @@ import {
   updateTransactionPending,
   type InboundDeliveryInput,
   type InboundDeliveryRecord,
+  type InboundDownloadedFile,
   type LiveControlTarget,
   type SlackThreadReplyIntentRecord,
 } from './zerokun/job-runner.ts'
@@ -951,16 +953,24 @@ async function downloadInboundFiles(
   parentSignal?: AbortSignal,
   maxTotalBytes = Number.POSITIVE_INFINITY,
 ): Promise<string[]> {
-  const { fileIds, messageId: messageTs } = inbound
+  return downloadSlackAttachmentBatch(inbound.messageId,
+    inbound.fileIds.map((fileId, ordinal) => ({ fileId, ordinal,
+      manifest: inbound.downloadedFiles.find(file => file.fileId === fileId && file.ordinal === ordinal) })),
+    file => jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, file), parentSignal, maxTotalBytes)
+}
+
+async function downloadSlackAttachmentBatch(
+  messageTs: string,
+  files: Array<{fileId:string; ordinal:number; manifest?:InboundDownloadedFile}>,
+  record: (file: InboundDownloadedFile) => void,
+  parentSignal?: AbortSignal,
+  maxTotalBytes = Number.POSITIVE_INFINITY,
+): Promise<string[]> {
   if (!/^\d+\.\d+$/.test(messageTs)) throw new Error(`invalid Slack message ts: ${messageTs}`)
   const paths: string[] = []
   let totalBytes = 0
-  for (let ordinal = 0; ordinal < fileIds.length; ordinal += 1) {
-    const fileId = fileIds[ordinal]!
+  for (const {fileId, ordinal, manifest} of files) {
     if (!/^F[A-Z0-9]+$/.test(fileId)) throw new Error(`invalid Slack file id: ${fileId}`)
-    const manifest = inbound.downloadedFiles.find(file => (
-      file.fileId === fileId && file.ordinal === ordinal
-    ))
     const cached = loadCachedInboundAttachment({
       inboxDir: INBOX_DIR,
       messageTs,
@@ -971,7 +981,7 @@ async function downloadInboundFiles(
     if (cached) {
       totalBytes += cached.size
       assertSlackThreadAttachmentBudget(totalBytes, maxTotalBytes)
-      if (!manifest) jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, cached)
+      if (!manifest) record(cached)
       paths.push(cached.path)
       continue
     }
@@ -1053,7 +1063,7 @@ async function downloadInboundFiles(
           || completed.digest !== digest.digest('hex')) {
           throw new Error(`file ${fileId} failed its completed-download verification`)
         }
-        jobStore.recordInboundDownloadedFile(inbound.idempotencyKey, completed)
+        record(completed)
       } catch (error) {
         if (descriptorOpen) {
           try { closeSync(descriptor) } catch {}
@@ -1279,6 +1289,21 @@ async function drainInboundDeliveries(): Promise<void> {
                 ? MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES
                 : Number.POSITIVE_INFINITY,
             )
+            if (!handoffControl(inbound.text) && !isExplicitUpdateRequest(inbound.text)) {
+              await recoverThreadAttachments({
+                sources: jobStore.pendingThreadAttachments(inbound),
+                messageId: inbound.messageId, signal: download.controller.signal,
+                maxBytes: MAX_INITIAL_THREAD_CONTEXT_FILE_BYTES,
+                download: async (source, maxBytes, signal) => {
+                  let size = 0
+                  await downloadSlackAttachmentBatch(source.sourceMessageId, [source], file => {
+                    jobStore.recordRecoveredThreadAttachment(inbound.idempotencyKey, source, file)
+                    size = file.size
+                  }, signal, maxBytes)
+                  return size
+                },
+              })
+            }
           } finally {
             if (activeInboundDownload === download) activeInboundDownload = null
           }
@@ -1316,13 +1341,16 @@ async function drainInboundDeliveries(): Promise<void> {
           writeEnabled: inbound.writeEnabled,
           interrupt,
         })) {
-          const controlAttachments = interrupt || attachments.length === 0
+          const liveAttachments = interrupt ? [] : [...new Set([
+            ...attachments, ...jobStore.recoveredInboundAttachmentPaths(inbound.idempotencyKey),
+          ])]
+          const controlAttachments = liveAttachments.length === 0
             ? []
             : copyLiveControlAttachments({
               stateDir: STATE_DIR,
               jobId: target.jobId,
               messageId: inbound.messageId,
-              attachments,
+              attachments: liveAttachments,
             })
           const liveInput = {
             chatId: inbound.chatId,

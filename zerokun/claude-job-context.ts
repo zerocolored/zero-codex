@@ -181,6 +181,22 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string, dele
     contextDigest: createHash('sha256').update(JSON.stringify({ version: 4, jobId: job.id,
       attemptNonce, repoPath: jobRepo, gitRoot: layout.gitRoot, gitRoots: layout.gitRoots,
       writeEnabled: job.writeEnabled, initialRepositoryDigest })).digest('hex'),
+    refreshAttachments(snapshot: Pick<JobRecord, 'threadAttachments' | 'unavailableThreadAttachments'>) {
+      job = { ...job, ...snapshot }
+      for (const readonly of [false, true]) {
+        const permissionOverrides = buildCodexPermissionOverrides({ ...job, writeEnabled: readonly ? false : job.writeEnabled }, {
+          stateDir, artifactDir, scratchDir, jobTempDir: tempDir, liveInputDir: inputDir,
+          gitRoot: layout.gitRoot, gitRoots: layout.gitRoots, profile, multiAgentEnabled: false,
+          browserAccessEnabled: !readonly && job.writeEnabled, nativeCloudAccessEnabled: !readonly && job.writeEnabled,
+          nativeDockerAccessEnabled: !readonly && job.writeEnabled, seatbeltFingerprintAllowPath: fingerprint.allow.path,
+        })
+        const updated = { ...toolsContext, permissionOverrides,
+          shellEnvironment: (Bun.TOML.parse(permissionOverrides.join('\n')) as any).shell_environment_policy.set,
+          ...(readonly ? {allowGoalUpdate:false, allowUnityEditor:false} : {}) }
+        atomicWritePrivateFile(readonly ? readonlyToolsPath : toolsContextPath, JSON.stringify(updated))
+        if (!readonly) Object.assign(toolsContext, updated)
+      }
+    },
     pinModel(model: string) {
       if (!/^claude-opus-[a-zA-Z0-9.-]+$/.test(model) || (pinnedModel && pinnedModel !== model)) throw new Error('Claude primary model changed')
       pinClaudeJobModel(stateDir, job.id, jobRepo, model)
