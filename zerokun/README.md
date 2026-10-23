@@ -209,6 +209,10 @@ codex <trust-args> -C <repo> \
   `~/.gemini`へのアクセスを追加します。書込許可のない依頼はproject read-only + plan modeです。
   nativeの確認を省略してもOSのファイル境界は維持します。主担当が変更と検証結果を確認し、
   native toolの拒否・失敗を成功とは扱いません。モデルの応答と終了コードの両方が成功条件です。
+  認証切れ時のブラウザログイン・コード転送・自動再試行は未実装です。認証失敗を明示し、
+  同じ依頼を勝手に再送しません。既存ログインでの書込許可タスクは実機検証済みです。
+  読取専用タスクでは、このMacのsandbox内で認証tokenの読取に失敗する既知の制限があります。
+  Keychain全体の読取許可で回避せず、認証エラーとして扱います。
   実機検証は`ZERO_AGY_LIVE=1 bun test zerokun/antigravity-live.test.ts`（既存subscription使用）。
   これはnative CLI・sandboxの検証であり、稼働中Herdr UIのE2E検証ではありません。
 - 明示的に依頼されたClaude作業は`zerokun_delegation`のstart/poll/cancelで専用のHerdrタブへ渡します。
