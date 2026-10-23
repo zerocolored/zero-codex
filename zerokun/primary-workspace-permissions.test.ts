@@ -37,13 +37,13 @@ test('resumed and steered tasks cannot treat an old handwritten upload question 
     } as JobControlRecord, 'complete', host, job)
     for (const text of [initial, followup]) {
       expect(text.lastIndexOf(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)).toBeGreaterThan(text.indexOf(task))
-      expect(text).toContain('not proof that a native RPC was answered')
-      expect(text).toContain('Respect actual user declines and native policy denials')
+      expect(text).toContain('not answers to a host upload dialog')
+      expect(text).toContain('Respect user cancellations and actual native policy denials')
     }
     const developer = buildCodexDeveloperInstructions(job, f.out)
     expect(developer).toContain(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)
     expect(developer).toContain('request_user_input_async')
-    expect(developer).toContain('do not revive the old question manually')
+    expect(developer).toContain('never repeat a completed upload or revive an old confirmation question')
   } finally { rmSync(f.root, { recursive: true, force: true }) }
 })
 
@@ -134,7 +134,7 @@ test('integration authorization distinguishes product tests, host delivery and m
     expect(write).toContain('Codex native Auto-review handles eligible permission requests')
     expect(write).toContain('not a pending user dialog')
     expect(write).toContain('Other native MCP elicitation requests are answered with action=cancel')
-    expect(write).toContain('The requesting user replies 今回だけ許可 or キャンセル without a code.')
+    expect(write).toContain('browser uploads already authorized by the task without an extra Slack confirmation.')
     expect(write).toContain('does not mean the user declined, and does not approve the operation')
     expect(write).toContain('a generic Slack reply can answer an unsupported native confirmation')
     expect(write).not.toContain('Do not construct direct Slack API')

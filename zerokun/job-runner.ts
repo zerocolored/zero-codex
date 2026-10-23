@@ -21,7 +21,7 @@ import { createSecurityAuditProgress, deliverAuditMilestone } from './security-a
 import { fleetProject } from './fleet-project.ts'
 
 import { Database } from 'bun:sqlite'
-import { NativeConfirmationStore, awaitNativeConfirmation } from './native-confirmation.ts'
+import { retireLegacyUploadConfirmations } from './native-confirmation.ts'
 import { fleetReplyForDelivery, fleetContextText } from './fleet-query.ts'
 import { toSlackMrkdwn } from './slack-mrkdwn.ts'
 import { fleetSummaryWithoutPaths, type FleetLocalFacts } from './fleet-status.ts'
@@ -4511,7 +4511,6 @@ class LocalResumeAdmissionError extends Error {}
 
 export class JobStore {
   private readonly db: Database
-  readonly nativeConfirmations: NativeConfirmationStore
 
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 })
@@ -4568,7 +4567,6 @@ export class JobStore {
       chmodSync(`${dbPath}-wal`, 0o600)
       chmodSync(`${dbPath}-shm`, 0o600)
     } catch {}
-    this.nativeConfirmations = new NativeConfirmationStore(this.db)
     this.migrateLegacyThreadAttachments(dirname(dbPath))
     this.resumeLegacyAuditSetupHistory()
   }
@@ -4883,27 +4881,6 @@ export class JobStore {
          AND delivered_at IS NULL AND superseded_at IS NULL`,
       [now, jobId],
     )
-  }
-
-  answerNativeConfirmation(input: Parameters<NativeConfirmationStore['answer']>[0]): boolean | null {
-    return this.db.transaction(() => {
-      const key = `${input.chatId}:${input.messageId}`
-      if (this.db.query('SELECT 1 FROM delivery_tombstones WHERE idempotency_key=?').get(key)) return true
-      if (this.hasDurableEvent(key) || this.getSlackThreadReplyIntent(key)?.status === 'ignored') return null
-      // A code-free event predating the displayed prompt belongs to ordinary
-      // thread routing. Do not consume it merely because a newer upload waits.
-      if (!input.code && !this.nativeConfirmations.hasPendingForThread(
-        input.chatId, input.threadTs, Date.now(), input.messageId)) return null
-      const answered = this.nativeConfirmations.answer(input)
-      this.stageStatusNotificationRow({ idempotencyKey: `native-confirmation-answer:${key}`, jobId: null,
-        chatId: input.chatId, threadTs: input.threadTs, kind: 'closed-control', createdAt: Date.now(),
-        payload: answered
-          ? input.decision === 'accept' ? 'アップロードの許可を受け付けました。同じ処理を続けます。'
-            : 'アップロードのキャンセルを受け付けました。この送信は行いません。'
-          : 'この返事ではアップロードを許可・キャンセルできませんでした。依頼したご本人が、返答待ちの確認と同じスレッドで「今回だけ許可」または「キャンセル」と返信してください。番号の入力は不要です。' })
-      this.recordDeliveryTombstone(key)
-      return answered
-    }).immediate()
   }
 
   stageClaudeDelegationFallbackNotification(jobId: string, delegationId: string): void {
@@ -12217,11 +12194,7 @@ export class JobStore {
         `SELECT payload FROM commentary_notifications
          WHERE job_id = ? AND attempt = ? ORDER BY seq DESC LIMIT 1`,
       ).get(jobId, attempt)
-      // Separate native requests can ask about the same destination. They must
-      // each be delivered even when their user-facing text is identical.
-      const nativeConfirmation = this.db.query('SELECT 1 FROM native_confirmations WHERE source_key=? AND job_id=?')
-        .get(sourceKey, jobId)
-      if (!throttleNotice && !nativeConfirmation && previous?.payload === payload) {
+      if (!throttleNotice && previous?.payload === payload) {
         // Persist the new source identity even when its public body is
         // suppressed. Otherwise an App Server replay after an intervening
         // message could resurrect this old commentary out of order.
@@ -14148,6 +14121,7 @@ export class JobStore {
   } {
     // Only the runner's exclusive recovery path may shorten old waits. Opening
     // the DB from a newer gateway/status process must not affect an older runner.
+    retireLegacyUploadConfirmations(this.db)
     this.recoverLegacyTransportThrottles()
     let requeued = 0
     let failedWrites = 0
@@ -19352,16 +19326,6 @@ async function runCli(): Promise<void> {
             ...executorPidLifecycle,
             onSessionId: sessionId => store.saveSession(job.id, sessionId, executionJob.repoPath),
             onSessionReset: () => store.clearSession(job.id),
-            onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
-              store: store.nativeConfirmations,
-              binding: { ...request, jobId: job.id, epoch: job.controlEpoch },
-              signal,
-              prepareText: text => {
-                const current = store.get(job.id) ?? job
-                return sanitizeExecutionTextForSlack(current, current.sessionId ?? '', text, dir, [], 'progress')
-              },
-              publish: event => executionContext.reportCommentary(event),
-            }),
             liveControls: createPrimaryLiveControlHooks(store, job),
             onMonitorMessage: message => mirrorMonitorMessage(message),
             onHandoffContext: cloudRuntime ? (key, text) => store.recordCloudContext(job.id, key, text) : undefined,

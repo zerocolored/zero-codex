@@ -6,7 +6,6 @@ import { classifyTaskModel } from './task-model-selection.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE } from './storage-failure.ts'
 import { readTaskUsage } from './task-usage.ts'
 import { registerNativeAdvisor } from './native-advisor-recovery.ts'
-import { awaitNativeConfirmation, parseNativeConfirmationAnswer } from './native-confirmation.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { createHash } from 'crypto'
@@ -390,6 +389,8 @@ for line in sys.stdin:
     request_id = value.get("id")
     if mode in ("native-upload", "native-app") and method is None and request_id == 0:
         action = value.get("result", {}).get("action", "missing")
+        if mode == "native-upload":
+            assert not (value.get("result", {}).get("_meta") or {}).get("persist")
         if mode == "native-app":
             action += ":" + str((value.get("result", {}).get("_meta") or {}).get("persist", "none"))
         emit({"method": "turn/completed", "params": {"threadId": requested_thread or thread_id, "turn": {"id": turn_id, "status": "completed", "itemsView": "full", "items": [{"type": "agentMessage", "text": "native result: " + action}], "error": None}}})
@@ -565,10 +566,15 @@ for line in sys.stdin:
             approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "browser-use", "tool_name": "upload_browser_files", "file_transfer": "upload", "tool_params": {"origin": "https://example.com"}}
             if mode == "native-app":
                 approval_meta = {"codex_approval_kind": "mcp_tool_call", "connector_id": "computer-use", "tool_name": "get_app_state", "tool_params": {"app": "com.google.Chrome"}, "persist": ["session"] if os.environ.get("ZERO_NATIVE_SESSION_ONLY") else ["session", "always"]}
+            upload_fault = os.environ.get("ZERO_UPLOAD_FAULT", "")
+            if upload_fault == "unknown-tool":
+                approval_meta["tool_name"] = "unknown"
+            if upload_fault == "policy-review":
+                approval_meta["codex_approval_kind"] = "auto-review"
             emit({"id": 0, "method": "mcpServer/elicitation/request", "params": {
-                "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") else (requested_thread or thread_id),
-                "turnId": turn_id, "serverName": "node_repl", "mode": "form",
-                "requestedSchema": {"type": "object", "properties": {}},
+                "threadId": "foreign-thread" if os.environ.get("ZERO_NATIVE_CONFIRMATION_FOREIGN") or upload_fault == "foreign" else (requested_thread or thread_id),
+                "turnId": "stale-turn" if upload_fault == "stale-turn" else turn_id, "serverName": "node_repl", "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {"password": {"type": "string"}} if upload_fault == "form-data" else {}},
                 "_meta": approval_meta
             }})
             continue
@@ -3249,39 +3255,24 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
-  test.each([{ write: true, foreign: false, action: 'accept' },
-    { write: false, foreign: false, action: 'cancel' }, { write: true, foreign: true, action: 'cancel' }])(
-    'native upload confirmation stays bound to the writable root turn: %j', async scenario => {
-      const value = fixture('native-upload', scenario.write)
-      let posted = 0
-      try {
-        const result = await executeCodexJob(value.job, {
-          codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
-          skipEffectiveConfigCheck: true, liveControls: value.hooks,
-          extraEnvironment: { ZERO_FIXTURE_MODE: 'native-upload',
-            ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}) },
-          onNativeConfirmation: (request, signal) => awaitNativeConfirmation({
-            store: value.store.nativeConfirmations, signal,
-            binding: { ...request, jobId: value.job.id, epoch: value.job.controlEpoch },
-            prepareText: text => sanitizeExecutionTextForSlack(value.job, '', text, value.state, [], 'progress'),
-            publish: event => {
-              posted++
-              value.store.stageCommentaryNotification(value.job.id, value.job.attempts, event.sourceKey, `💬 ${event.text}`)
-              const notice = value.store.pendingCommentaryNotifications()[0]!
-              value.store.markCommentaryNotificationDelivered(notice.id)
-              const line = event.text.split('\n').find(line => line === '今回だけ許可')!
-              expect(value.store.answerNativeConfirmation({ ...parseNativeConfirmationAnswer(line)!,
-                chatId: value.job.chatId, threadTs: value.job.threadTs, userId: value.job.userId,
-                messageId: '1800000000.000200', writeEnabled: scenario.write })).toBe(true)
-              return true
-            },
-          }),
-        })
-        expect(result.result).toBe(`native result: ${scenario.action}`)
-        expect(posted).toBe(scenario.action === 'accept' ? 1 : 0)
-      } finally { value.store.close() }
-    }, 30_000,
-  )
+  test.each([
+    { write: true, fault: '', action: 'accept' },
+    { write: false, fault: '', action: 'cancel' },
+    ...['foreign', 'stale-turn', 'form-data', 'unknown-tool', 'policy-review'].map(fault =>
+      ({ write: true, fault, action: 'cancel' })),
+  ])('native upload continues without a Slack gate, scoped to the writable root turn: %j', async scenario => {
+    const value = fixture('native-upload', scenario.write)
+    try {
+      const result = await executeCodexJob(value.job, {
+        codexBinForTesting: value.executable, logDir: value.logDir, stateDir: value.state,
+        skipEffectiveConfigCheck: true, liveControls: value.hooks,
+        extraEnvironment: { ZERO_FIXTURE_MODE: 'native-upload', ZERO_UPLOAD_FAULT: scenario.fault },
+      })
+      expect(result.result).toBe(`native result: ${scenario.action}`)
+      expect(value.store.pendingCommentaryNotifications()).toHaveLength(0)
+      expect(value.store.pendingStatusNotifications()).toHaveLength(0)
+    } finally { value.store.close() }
+  }, 30_000)
 
   test.skipIf(process.platform !== 'darwin').each([
     { write: true, foreign: false, sessionOnly: false, result: 'accept:always' },
@@ -3299,7 +3290,6 @@ describe('production App Server executor', () => {
         extraEnvironment: { ZERO_FIXTURE_MODE: 'native-app',
           ...(scenario.foreign ? { ZERO_NATIVE_CONFIRMATION_FOREIGN: '1' } : {}),
           ...(scenario.sessionOnly ? { ZERO_NATIVE_SESSION_ONLY: '1' } : {}) },
-        onNativeConfirmation: async () => { throw new Error('app approval must not ask again in Slack') },
       })
       expect(result.result).toBe(`native result: ${scenario.result}`)
       expect(value.store.pendingCommentaryNotifications()).toHaveLength(0)

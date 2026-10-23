@@ -1,24 +1,20 @@
-import { createHash, randomBytes } from 'crypto'
 import type { Database } from 'bun:sqlite'
 
 export type NativeConfirmation = { threadId: string; turnId: string; origin: string }
-export type NativeConfirmationDecision = 'accept' | 'decline' | 'cancel'
 
 /** Kept in both developer instructions and fresh turn/control context: resumed
  * conversation history can contain a question whose native RPC has ended. */
 export const NATIVE_UPLOAD_CONFIRMATION_PROTOCOL = [
-  'Native upload confirmation has exactly one owner: the host relay of a live Browser Use request.',
-  'Never ask for 今回だけ許可 or キャンセル for a browser upload in your own commentary,',
-  'async questions, request_user_input, request_user_input_async, or final answer. Do not create a preliminary permission question.',
-  'For an upload already authorized by the task, invoke the actual browser operation. If it needs',
-  'native confirmation, the host posts the question and waits for its answer inside that same call.',
-  'While that call waits, do not repeat its question or finish the task as awaiting another reply.',
-  'An old upload question in resumed history is not a live pending request. After interruption,',
-  'inspect the previous effect and retry the same authorized operation if it was not performed;',
-  'do not revive the old question manually or ask the user to answer a closed native request.',
-  'A normal Slack reply saying 今回だけ許可 is task context, not proof that a native RPC was answered.',
-  'Do not claim native permission was accepted unless the current tool result confirms it.',
-  'Respect actual user declines and native policy denials; a host/session cancellation is not a user decline.',
+  'The operator has enabled browser uploads already authorized by the task without an extra Slack confirmation.',
+  'Never ask for 今回だけ許可 or キャンセル for a browser upload in commentary, async questions,',
+  'request_user_input, request_user_input_async, or final answers. Invoke the authorized browser operation directly.',
+  'The host answers only the recognized empty Browser Use upload request for the current writable root turn.',
+  'This is not new user consent, proof of upload success, or an Auto-review approval. Native policy remains authoritative.',
+  'Ordinary Slack replies are task context, not answers to a host upload dialog.',
+  'Old upload questions in resumed history are retired. Inspect the previous effect before retrying an authorized',
+  'operation after interruption; never repeat a completed upload or revive an old confirmation question.',
+  'Respect user cancellations and actual native policy denials across resume. Never use another route to bypass a denial.',
+  'A host/session cancellation is not a user decline. Report unsupported requests or failures accurately.',
   'This rule takes priority over generic instructions to begin an unfinished reply with a request.',
 ].join('\n')
 
@@ -80,150 +76,19 @@ export function browserUploadConfirmation(params: Record<string, unknown>): Nati
   } catch { return null }
 }
 
-export function parseNativeConfirmationAnswer(text: string): { code?: string; decision: NativeConfirmationDecision } | null {
-  const match = /^(今回だけ許可|許可|キャンセル)(?:[ \t　]+([a-f0-9]{12}))?$/.exec(text.trim())
-  return match ? { ...(match[2] ? { code: match[2] } : {}), decision: match[1] === 'キャンセル' ? 'decline' : 'accept' } : null
-}
-
-type Binding = NativeConfirmation & { jobId: string; epoch: number; executorNonce: string; requestId: number | string }
-type Row = Binding & { code: string; sourceKey: string }
-const LEASE_MS = 30_000
-
-/** The runner alone consumes decisions. Gateway restarts preserve replies, never live RPC ownership. */
-export class NativeConfirmationStore {
-  constructor(private readonly db: Database) {
-    db.exec(`CREATE TABLE IF NOT EXISTS native_confirmations (
-      code TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, epoch INTEGER NOT NULL,
-      executor_nonce TEXT NOT NULL, thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-      request_id TEXT NOT NULL, source_key TEXT NOT NULL UNIQUE, origin TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending', decision TEXT, answer_message_id TEXT,
-      expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
-    )`)
-  }
-
-  private live(binding: Binding): boolean {
-    return Boolean(this.db.query(`SELECT 1 FROM jobs WHERE id=? AND control_epoch=?
-      AND executor_nonce=? AND active_thread_id=? AND active_turn_id=?
-      AND status='running' AND write_enabled=1 AND cancel_requested_at IS NULL`).get(
-      binding.jobId, binding.epoch, binding.executorNonce, binding.threadId, binding.turnId,
-    ))
-  }
-
-  create(binding: Binding, now = Date.now()): Row | null {
-    if (!this.live(binding)) return null
-    const code = randomBytes(6).toString('hex')
-    const sourceKey = createHash('sha256').update(`native-confirmation:${code}`).digest('hex')
-    this.db.run(`INSERT INTO native_confirmations
-      (code,job_id,epoch,executor_nonce,thread_id,turn_id,request_id,source_key,origin,expires_at,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [code, binding.jobId, binding.epoch, binding.executorNonce,
-      binding.threadId, binding.turnId, JSON.stringify(binding.requestId), sourceKey, binding.origin,
-      now + LEASE_MS, now])
-    return { ...binding, code, sourceKey }
-  }
-
-  hasPendingForThread(chatId: string, threadTs: string, now = Date.now(), messageId?: string): boolean {
-    if (messageId !== undefined && !/^\d+\.\d{6}$/.test(messageId)) return false
-    const messageMs = messageId === undefined ? null : Number(messageId) * 1000
-    return Boolean(this.db.query(`SELECT 1 FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
-      WHERE j.chat_id=? AND j.thread_ts=? AND n.status='pending' AND n.expires_at>?
-        AND j.status='running' AND j.cancel_requested_at IS NULL
-        AND j.control_epoch=n.epoch AND j.executor_nonce=n.executor_nonce
-        AND j.active_thread_id=n.thread_id AND j.active_turn_id=n.turn_id
-        AND (? IS NULL OR (n.created_at<=? AND EXISTS (SELECT 1 FROM commentary_notifications c
-          WHERE c.source_key=n.source_key AND c.suppressed_at IS NULL AND c.delivered_at<=?)))
-        LIMIT 1`).get(chatId, threadTs, now, messageMs, messageMs, messageMs))
-  }
-
-  /** Resolve an explicit reply to one delivered, live request; identifiers stay internal. */
-  answer(input: { code?: string; decision: NativeConfirmationDecision; chatId: string; threadTs: string;
-    userId: string; messageId: string; writeEnabled: boolean }, now = Date.now()): boolean {
-    if (!input.writeEnabled || !/^\d+\.\d{6}$/.test(input.messageId)) return false
-    return this.db.transaction(() => {
-      // Replay must resolve its original decision before considering any newer request.
-      const prior = this.db.query<{ code: string; decision: string }, [string, string, string, string]>(
-        `SELECT n.code,n.decision FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
-         WHERE n.answer_message_id=? AND j.chat_id=? AND j.thread_ts=? AND j.user_id=?`,
-      ).get(input.messageId, input.chatId, input.threadTs, input.userId)
-      if (prior) return prior.decision === input.decision && (!input.code || prior.code === input.code)
-      const candidates = this.db.query<{ code: string }, [number, string, string, string, number, string | null, number, string | null, string | null]>(
-        `SELECT n.code FROM native_confirmations n JOIN jobs j ON j.id=n.job_id
-         JOIN commentary_notifications c ON c.source_key=n.source_key
-         WHERE n.status='pending' AND n.decision IS NULL AND n.expires_at>?
-           AND j.chat_id=? AND j.thread_ts=? AND j.user_id=? AND j.status='running'
-           AND j.write_enabled=1 AND j.cancel_requested_at IS NULL
-           AND j.control_epoch=n.epoch AND j.executor_nonce=n.executor_nonce
-           AND j.active_thread_id=n.thread_id AND j.active_turn_id=n.turn_id
-           AND n.created_at<=? AND c.suppressed_at IS NULL
-           AND (? IS NOT NULL OR (c.delivered_at IS NOT NULL AND c.delivered_at<=?))
-           AND (? IS NULL OR n.code=?) LIMIT 2`,
-      ).all(now, input.chatId, input.threadTs, input.userId, Number(input.messageId) * 1000,
-        input.code ?? null, Number(input.messageId) * 1000, input.code ?? null, input.code ?? null)
-      if (candidates.length !== 1) return false
-      return this.db.run(`UPDATE native_confirmations SET decision=?,answer_message_id=?
-        WHERE code=? AND status='pending' AND decision IS NULL`,
-      [input.decision, input.messageId, candidates[0]!.code]).changes === 1
-    }).immediate()
-  }
-
-  poll(row: Row, now = Date.now()): NativeConfirmationDecision | null {
-    return this.db.transaction(() => {
-      if (!this.live(row)) return 'cancel' as const
-      const current = this.db.query<{ decision: NativeConfirmationDecision | null; delivered: number | null;
-        suppressed: number | null; expires: number }, [string]>(
-        `SELECT n.decision,c.delivered_at AS delivered,c.suppressed_at AS suppressed,n.expires_at AS expires
-         FROM native_confirmations n LEFT JOIN commentary_notifications c ON c.source_key=n.source_key
-         WHERE n.code=? AND n.status='pending'`,
-      ).get(row.code)
-      if (!current || current.expires <= now || current.suppressed !== null) return 'cancel' as const
-      if (current.decision && current.delivered !== null) {
-        this.db.run("UPDATE native_confirmations SET status='consumed' WHERE code=? AND status='pending'", [row.code])
-        return current.decision
-      }
-      this.db.run("UPDATE native_confirmations SET expires_at=? WHERE code=? AND status='pending'", [now + LEASE_MS, row.code])
-      return null
-    }).immediate()
-  }
-
-  close(row: Row): void {
-    this.db.run("UPDATE native_confirmations SET status='closed' WHERE code=? AND status='pending'", [row.code])
-    // An unsent prompt cannot remain actionable after its native session ends.
-    this.db.run(`UPDATE commentary_notifications SET suppressed_at=?
-      WHERE source_key=? AND delivered_at IS NULL AND suppressed_at IS NULL`, [Date.now(), row.sourceKey])
-  }
-}
-
-export async function awaitNativeConfirmation(options: {
-  store: NativeConfirmationStore; binding: Binding; signal: AbortSignal;
-  prepareText(text: string): string;
-  publish(event: { sourceKey: string; text: string }): boolean;
-  sleep?: () => Promise<void>;
-}): Promise<NativeConfirmationDecision> {
-  if (options.signal.aborted) return 'cancel'
-  // turn/started and the first server request can precede the turn/start RPC reply.
-  let row: Row | null = null
-  for (let attempt = 0; attempt < 5 && !options.signal.aborted; attempt++) {
-    row = options.store.create(options.binding)
-    if (row) break
-    await (options.sleep?.() ?? Bun.sleep(100))
-  }
-  if (!row) return 'cancel'
-  try {
-    const text = options.prepareText([
-      `お願い: この依頼のファイルを ${row.origin} へアップロードしてよいか確認してください。`,
-      '依頼したご本人が、このスレッドで次のどちらかを返信してください。',
-      '今回だけ許可',
-      'キャンセル',
-      '回答後は同じ処理を続けます。この確認だけへの回答で、常時許可にはしません。',
-    ].join('\n'))
-    // An approval must display its exact destination. This is a delivery
-    // integrity check, independent of the destination text or hostname.
-    if (!text.includes(row.origin)) return 'cancel'
-    if (!options.publish({ sourceKey: row.sourceKey, text })) return 'cancel'
-    while (!options.signal.aborted) {
-      const decision = options.store.poll(row)
-      if (decision) return decision
-      await (options.sleep?.() ?? Bun.sleep(250))
-    }
-    return 'cancel'
-  } finally { options.store.close(row) }
+/** Called only in exclusive runner recovery, after old executors have stopped.
+ * A gateway/status DB open must never cancel an older runner's live RPC.
+ * Keep the legacy history and decisions; retirement is not user consent.
+ */
+export function retireLegacyUploadConfirmations(db: Database, now = Date.now()): void {
+  if (!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_confirmations'").get()) return
+  db.transaction(() => {
+    db.run(`UPDATE commentary_notifications SET suppressed_at=?
+      WHERE delivered_at IS NULL AND suppressed_at IS NULL
+        AND source_key IN (SELECT source_key FROM native_confirmations)`, [now])
+    db.run(`UPDATE status_notifications SET superseded_at=?
+      WHERE delivered_at IS NULL AND superseded_at IS NULL
+        AND idempotency_key GLOB 'native-confirmation-answer:*'`, [now])
+    db.run("UPDATE native_confirmations SET status='closed' WHERE status='pending'")
+  }).immediate()
 }
