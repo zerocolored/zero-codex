@@ -9,6 +9,6 @@
     "strict": true,
     "noEmit": true
   },
-  "include": ["server.ts", "gate.ts", "plugin-lock.ts", "zerokun/*.ts", "fleet-web/worker.ts"],
+  "include": ["server.ts", "gate.ts", "plugin-lock.ts", "zerokun/*.ts", "fleet-web/worker.ts", "meeting-web/*.ts"],
   "exclude": ["**/*.test.ts"]
 }
