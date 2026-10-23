@@ -153,6 +153,12 @@ export function adoptLegacySlackApp(home = homedir(), environment: Record<string
 function adoptExistingSlackApp(state: string, home: string): RegisteredSlackApp | null {
   const content = readOptionalBoundedOwnerOnlyRegularFile(join(state, '.env'), 64 * 1024)
   if (content === null) return null
+  // Fresh bootstrap writes this exact unconfigured pair. Preserve it and
+  // allow first registration, while still rejecting malformed real tokens.
+  const assignments = content.split(/\r?\n/).filter(line => /^SLACK_(BOT|APP)_TOKEN=/.test(line))
+  if (assignments.length === 2
+    && assignments.includes('SLACK_BOT_TOKEN=xoxb-ここに貼る')
+    && assignments.includes('SLACK_APP_TOKEN=xapp-ここに貼る')) return null
   const tokens = parseStateSlackTokens(content)
   if (!tokens.SLACK_APP_TOKEN || !tokens.SLACK_BOT_TOKEN) return null
   let appId: string

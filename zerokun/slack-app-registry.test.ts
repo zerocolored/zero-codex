@@ -48,6 +48,21 @@ test('legacy adoption preserves credentials and queued data in their original st
   expect(listRegisteredSlackApps(home)).toHaveLength(1)
 })
 
+test('fresh bootstrap placeholders allow first registration without accepting malformed credentials', () => {
+  const { home } = fixture()
+  const state = prepareManagedStateRoot(join(home, '.codex/zerokun'))
+  const path = join(state, '.env')
+  const content = 'SLACK_BOT_TOKEN=xoxb-ここに貼る\nSLACK_APP_TOKEN=xapp-ここに貼る\n'
+  writeFileSync(path, content, { mode: 0o600 })
+  expect(adoptLegacySlackApp(home)).toBeNull()
+  expect(readFileSync(path, 'utf8')).toBe(content)
+  expect(listRegisteredSlackApps(home)).toEqual([])
+  writeFileSync(path, content + 'SLACK_BOT_TOKEN=invalid\n')
+  expect(() => adoptLegacySlackApp(home)).toThrow()
+  writeFileSync(path, content.replace('xapp-ここに貼る', 'xapp-1-ALEGACY-synthetic-123456'))
+  expect(() => adoptLegacySlackApp(home)).toThrow()
+})
+
 test('cutover installation is adopted at its original state and new app does not inherit its cutover flag', () => {
   const { home } = fixture()
   const old = prepareManagedStateRoot(join(home, '.claude/channels/slack'))
