@@ -47,20 +47,81 @@ class VisibleReadyTests(unittest.TestCase):
         receipt = {k: workspace[k] for k in ['agent_name', 'workspace_id', 'pane_id', 'terminal_id', 'nonce']}
         receipt.update(version=self.m['EPHEMERAL_SESSION_VERSION'], native_session='N/A:safe-mode', state_change_seq=1,
                        shell_pid=1, claude_pid=2, process_group_id=2, process_ids=[2], argv=[], argv0='claude', executable={})
-        for screen in ['Password:\n❯', 'Sign in\n❯', self.effort,
+        hint_screens = ['──────\n❯ Try "edit adminPageApp.ts\n  to..."\n──────', '❯ Try "' + 'a' * 120 + '"']
+        dialogs = [text for hint in hint_screens for label in ['Allow this action', 'Do you want to proceed']
+                   for text in [label + '\n' + hint, hint + '\n' + label]]
+        for screen in dialogs + ['Password:\n❯', 'Sign in\n❯', self.effort,
                        'Accessing workspace:\n/tmp/project\n❯ Yes, I trust this folder\nNo, exit\nEnter to confirm · Esc to cancel']:
             self.g['_read_visible'] = lambda _, text=screen: text
             with self.assertRaises(self.m['UnsafeRequest']):
                 self.m['_owned_target']({'caller': {}}, workspace, receipt)
-        for screen in ['❯', '❯ Try "approve payment changes"']:
+        for screen in hint_screens + ['❯', '❯ Try "approve payment changes"',
+                                     '❯\n──────\n⏵⏵ bypass permissions on\n✔ Done\nnew task?\n/rc']:
             self.g['_read_visible'] = lambda _, text=screen: text
             self.assertEqual(self.m['_owned_target']({'caller': {}}, workspace, receipt), 'owned')
+        self.assertEqual(self.keys, [])
+
+    def test_wrapped_and_long_hint_do_not_bypass_surrounding_confirmation(self):
+        hints = ['──────\n❯ Try "edit adminPageApp.ts\n  to..."\n──────', '❯ Try "' + 'a' * 120 + '"']
+        for hint in hints:
+            for label in ['Allow this action', 'Do you want to proceed', 'transcript sharing',
+                          'How is Claude doing this session?', '0: Bad', 'Permission request']:
+                for screen in [label + '\n' + hint, hint + '\n' + label]:
+                    self.g['_read_visible'] = lambda _, text=screen: text
+                    with self.assertRaises(self.m['UnsafeRequest']):
+                        self.m['_settle_visible_ready']('owned', {})
         self.assertEqual(self.keys, [])
 
     def test_transient_startup_frame_waits_for_ready(self):
         reads = iter(['Starting…'] * 2 + ['❯'] * 2)
         self.g['_read_visible'] = lambda _: next(reads)
         self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(self.keys, [])
+
+    def test_wrapped_visible_placeholder_and_long_hint_settle_without_keys(self):
+        # Reflow of the 2.1.309 live hint, inside its real input-box boundaries.
+        wrapped = '──────\n❯ Try "edit adminPageApp.ts\n  to..."\n──────'
+        for screen in [wrapped, '❯ Try "' + 'a' * 120 + '"',
+                       wrapped.replace('edit adminPageApp.ts', 'approve payment')]:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(self.keys, [])
+        for screen in [wrapped.replace('to..."', 'to..." draft'),
+                       wrapped.replace('  to...', '❯ to...'),
+                       wrapped.replace('Try "edit', 'typed edit'),
+                       wrapped + '\nSign in', 'Sign in\n' + wrapped]:
+            self.g['_read_visible'] = lambda _, text=screen: text
+            with self.assertRaises(self.m['UnsafeRequest']):
+                self.m['_settle_visible_ready']('owned', {})
+        self.assertEqual(self.keys, [])
+
+    def test_timeout_retains_only_fixed_state_and_boolean_evidence(self):
+        self.g['_read_visible'] = lambda _: 'private-account-value\nunknown startup dialog'
+        with self.assertRaises(self.m['_StartupReadinessTimeout']) as caught:
+            self.m['_settle_visible_ready']('owned', {})
+        record = self.m['_startup_failure_record'](caught.exception)
+        self.assertEqual(record['code'], 'readiness-timeout')
+        self.assertEqual(record['detail']['lastState'], 'unrecognized-screen')
+        self.assertEqual(record['detail']['agentStatus'], 'idle')
+        self.assertTrue(record['detail']['stableObserved'])
+        self.assertFalse(record['detail']['promptPresent'])
+        self.assertNotIn('private-account-value', str(record))
+        self.assertNotIn('unknown startup dialog', str(record))
+        self.assertEqual(self.keys, [])
+
+    def test_timeout_distinguishes_metadata_not_ready_and_unstable_observations(self):
+        self.g['_read_visible'] = lambda _: '❯'
+        for unstable in [False, True]:
+            seq = iter(range(10000))
+            self.g['_agent_information'] = lambda _: ({}, {'state_change_seq': next(seq) if unstable else 1,
+                'agent_status': 'working', 'interactive_ready': False, 'launch_pending': True})
+            with self.assertRaises(self.m['_StartupReadinessTimeout']) as caught:
+                self.m['_settle_visible_ready']('owned', {})
+            detail = caught.exception.detail
+            self.assertEqual(detail['lastState'], 'empty-prompt')
+            self.assertEqual(detail['stableObserved'], not unstable)
+            self.assertFalse(detail['interactiveReady'])
+            self.assertTrue(detail['launchPending'])
         self.assertEqual(self.keys, [])
 
     def test_changed_selection_is_not_confirmed(self):
