@@ -11,7 +11,7 @@ import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
 import type { GrokChromeCapability } from './grok-oauth-chrome.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-environment.ts'
-import { browserUploadConfirmation, computerUseAppApproval, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
+import { browserUploadConfirmation, computerUseAppApproval, NATIVE_UPLOAD_CONFIRMATION_PROTOCOL, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { AdvisorRoundDeadlines, readActiveAdvisorRound, waitForAdvisorSettlement } from './advisor-settlement.ts'
@@ -4160,6 +4160,7 @@ export function buildCodexDeveloperInstructions(
       'in the same Slack thread. The requesting user replies 今回だけ許可 or キャンセル without a code.',
       'The host binds that explicit reply to one delivered, live native request and returns the answer once.',
       'Do not invent confirmation codes. A generic continue is not upload approval.',
+      NATIVE_UPLOAD_CONFIRMATION_PROTOCOL,
       'For authorized primary Computer Use, the operator has enabled standing app-access permission.',
       'The host answers official app-access requests and requests Always allow when offered by the native client.',
       'Other native MCP elicitation requests are answered with action=cancel; no form answer is fabricated.',
@@ -4419,6 +4420,7 @@ export function buildCodexWorkerPrompt(
     'investigated, what you confirmed, or execution records; those belong below that line.',
     'If you genuinely need nothing from the reader, say that in the same first line instead.',
   )
+  if (job.writeEnabled) control.push(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)
   control.push(...rateLimitRecoveryControl(job))
   if (host.advisorEnabled) {
     control.push(
@@ -5345,6 +5347,7 @@ export function buildCodexLiveControlPrompt(
       `Current sender: ${control.userId}`,
       `Artifact directory: ${host.artifactDir}`,
     )
+    if (control.writeEnabled) prompt.push(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)
     if (stage === 'prepare') {
       prompt.push(
         'Re-run or extend the read-only preparation for this exact combined input.',
