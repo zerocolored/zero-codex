@@ -198,7 +198,9 @@ describe('zerochan project selection', () => {
     git('-C', value.project, 'add', 'source.ts')
     git('-C', value.project, '-c', 'user.name=Zero Test', '-c', 'user.email=zero@example.invalid', 'commit', '-qm', 'source')
     const runtime = join(value.root, 'independent-runtime')
-    git('clone', '--no-local', '-q', value.project, runtime)
+    // Copy objects into an independent clone without a git-upload-pack subprocess.
+    // The updater sandbox intentionally exposes only its staged Git executable.
+    git('clone', '--local', '--no-hardlinks', '-q', value.project, runtime)
     const worktree = join(value.root, 'development-worktree')
     git('-C', value.project, 'worktree', 'add', '-q', worktree)
     const options = { runtimeRepo: runtime, stateDir: value.state, homeDir: value.home }
