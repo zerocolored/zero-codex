@@ -90,6 +90,14 @@ export async function executeClaudeJob(job: JobRecord, options: Options, fixture
     transport = undefined; session = undefined
   }
   const openProcess = async (readonly: boolean) => {
+    const attachments = controls.attachmentSnapshot?.()
+    if (attachments && JSON.stringify(attachments) !== JSON.stringify({
+      threadAttachments: job.threadAttachments ?? [], unavailableThreadAttachments: job.unavailableThreadAttachments ?? [],
+    })) {
+      await closeProcess(); abort()
+      context.refreshAttachments(attachments)
+      job = { ...job, ...attachments }
+    }
     if (session && readonlyProcess === readonly) return
     await closeProcess(); abort()
     readonlyProcess = readonly

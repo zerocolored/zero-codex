@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { initializeAttachmentRecovery, recoveredInboundAttachmentPaths, preserveFailedAttachments, pendingThreadAttachments, recordRecoveredAttachment, type PendingThreadAttachment, type AttachmentScope } from './thread-attachment-recovery.ts'
 import { MAX_SLACK_ATTACHMENT_BYTES } from './slack-attachment-limits.ts'
 import { CLAUDE_QUOTA_FALLBACK_NOTICE } from './claude-quota-fallback.ts'
 import { isStorageFailure, retainedStorageFailure, STORAGE_FAILURE, STORAGE_FAILURE_MESSAGE } from './storage-failure.ts'
@@ -627,6 +628,7 @@ export interface JobRecord {
   inputRevision: number
   attachments: string[]
   /** Immutable, thread-scoped Slack files available to every continuation. */
+  unavailableThreadAttachments?: string[]
   threadAttachments?: ThreadAttachmentRecord[]
   runtime: JobRuntime
   writeEnabled: boolean
@@ -722,6 +724,7 @@ type JobRow = {
   task: string
   input_revision: number
   attachments_json: string
+  unavailable_thread_attachments_json?: string
   thread_attachments_json: string
   runtime: JobRuntime
   write_enabled: number
@@ -3112,6 +3115,7 @@ function mapRow(row: JobRow): JobRecord {
     inputRevision: row.input_revision,
     attachments: parseAttachments(row.attachments_json),
     threadAttachments: parseThreadAttachments(row.thread_attachments_json),
+    unavailableThreadAttachments: parseAttachments(row.unavailable_thread_attachments_json ?? '[]'),
     runtime: row.runtime,
     writeEnabled: row.write_enabled === 1,
     status: row.status,
@@ -4548,6 +4552,7 @@ export class JobStore {
             PRIMARY KEY(job_id,source_key)
           )`)
           ensureJobSchemaMigrations(db)
+          initializeAttachmentRecovery(db)
           return db
         } catch (error) {
           db.close()
@@ -4798,6 +4803,24 @@ export class JobStore {
       }
     }
     return this.threadAttachmentSnapshot(scope.chatId, scope.threadTs, scope.repoPath)
+  }
+
+  pendingThreadAttachments(scope: AttachmentScope): PendingThreadAttachment[] {
+    return retrySqlite(() => pendingThreadAttachments(this.db, scope))
+  }
+
+  private pendingAttachmentNotes(scope: AttachmentScope): string {
+    return JSON.stringify(this.pendingThreadAttachments(scope).map(source => (
+      `Slack file ${source.fileId}, source message ${source.sourceMessageId}: download unavailable; original reference retained`
+    )))
+  }
+
+  recoveredInboundAttachmentPaths(key: string): string[] {
+    return retrySqlite(() => recoveredInboundAttachmentPaths(this.db, join(dirname(this.dbPath), 'inbox'), key))
+  }
+
+  recordRecoveredThreadAttachment(key: string, source: PendingThreadAttachment, file: InboundDownloadedFile): void {
+    retrySqlite(() => recordRecoveredAttachment(this.db, join(dirname(this.dbPath), 'inbox'), key, source, file))
   }
 
   listThreadAttachments(
@@ -7030,6 +7053,7 @@ export class JobStore {
          VALUES (?, ?, 'failed', ?, ?)`,
         [randomUUID(), jobId, error, now],
       )
+      preserveFailedAttachments(this.db, key)
       this.db.run('DELETE FROM inbound_deliveries WHERE idempotency_key = ?', [key])
       return jobId
     })
@@ -7228,6 +7252,7 @@ export class JobStore {
           createdAt: Date.now(),
         })
       }
+      if (status?.kind === 'attachment-control-failed') preserveFailedAttachments(this.db, key)
       this.db.run('DELETE FROM inbound_deliveries WHERE idempotency_key = ?', [key])
     })
     retrySqlite(() => consume.immediate())
@@ -7362,8 +7387,8 @@ export class JobStore {
             repoPath: target.repo_path,
           }, true)
       this.db.run(
-        'UPDATE jobs SET thread_attachments_json = ? WHERE id = ?',
-        [JSON.stringify(threadAttachments), jobId],
+        'UPDATE jobs SET thread_attachments_json = ?, unavailable_thread_attachments_json = ? WHERE id = ?',
+        [JSON.stringify(threadAttachments), this.pendingAttachmentNotes({chatId, threadTs, repoPath: target.repo_path}), jobId],
       )
       const now = Date.now()
       let inputRevision = target.input_revision
@@ -7618,8 +7643,8 @@ export class JobStore {
         repoPath: target.repo_path,
       }, true)
       this.db.run(
-        'UPDATE jobs SET thread_attachments_json = ? WHERE id = ?',
-        [JSON.stringify(threadAttachments), jobId],
+        'UPDATE jobs SET thread_attachments_json = ?, unavailable_thread_attachments_json = ? WHERE id = ?',
+        [JSON.stringify(threadAttachments), this.pendingAttachmentNotes({chatId, threadTs, repoPath: target.repo_path}), jobId],
       )
       const snapshotControls = this.db.query<{
         input_revision: number
@@ -9378,10 +9403,10 @@ export class JobStore {
       const result = this.db.run(
         `INSERT OR IGNORE INTO jobs (
            id, idempotency_key, chat_id, thread_ts, message_id, user_id,
-           repo_path, task, attachments_json, thread_attachments_json,
+           repo_path, task, attachments_json, thread_attachments_json, unavailable_thread_attachments_json,
            runtime, write_enabled, status, workflow,
            control_epoch, accepts_control, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 1, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 1, 1, ?)`,
         [
           id,
           idempotencyKey,
@@ -9393,6 +9418,7 @@ export class JobStore {
           task,
           JSON.stringify(attachments),
           JSON.stringify(threadAttachments),
+          this.pendingAttachmentNotes({chatId, threadTs, repoPath}),
           core,
           input.workflow === 'security-audit' ? 0 : input.writeEnabled ? 1 : 0,
           input.workflow ?? 'work',

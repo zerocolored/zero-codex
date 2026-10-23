@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { loadCachedInboundAttachment } from './inbound-attachment-cache.ts'
 import { JobStore } from './job-runner.ts'
 import { executeClaudeJob } from './claude-executor.ts'
 import { prepareClaudeJobContext } from './claude-job-context.ts'
@@ -13,7 +14,7 @@ const cleanups: Array<() => void> = []
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup() })
 
 
-function fixture(mode: 'complete' | 'continue' | 'steer' | 'question' | 'question-update' | 'cancel' | 'lost-ack' | 'failed' | 'late-inbound' | 'quota' | 'capacity' | 'proposal' | 'proposal-withdrawn' | 'proposal-changed' | 'proposal-revision') {
+function fixture(mode: 'complete' | 'continue' | 'steer' | 'question' | 'question-update' | 'cancel' | 'lost-ack' | 'failed' | 'late-inbound' | 'quota' | 'capacity' | 'proposal' | 'proposal-withdrawn' | 'proposal-changed' | 'proposal-revision', attachment?: 'recover' | 'unavailable') {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'zero-claude-executor-')))
   cleanups.push(() => rmSync(root, { recursive: true, force: true }))
   const repo = join(root, 'repo'), state = join(root, 'state'), logs = join(state, 'job-logs')
@@ -44,8 +45,26 @@ function fixture(mode: 'complete' | 'continue' | 'steer' | 'question' | 'questio
     if (!['steer', 'question', 'question-update', 'cancel'].includes(mode)) return
     const target = store.liveControlTarget(job.chatId, job.threadTs)!
     const next = { chatId: job.chatId, threadTs: job.threadTs, messageId: '1800000000.000200', userId: 'UOTHER', task: '追加の入力' }
+    if (attachment) {
+      const stage = (messageId: string, fileIds: string[]) => {
+        store.stageInboundDeliveryAndAdoptSlackThread({ ...next, messageId, repoPath: repo, text: next.task, fileIds },
+          { appId: 'A1', initialContextEligible: false })
+        return store.claimNextInboundDelivery()!
+      }
+      const failed = stage('1800000000.000150', ['FAUDIO'])
+      store.tombstoneInboundDelivery(failed.idempotencyKey, { kind: 'attachment-control-failed', payload: 'download failed' })
+      const retry = stage(next.messageId, [])
+      if (attachment === 'recover') {
+        const directory = join(state, 'inbox', failed.messageId)
+        mkdirSync(directory, { recursive: true, mode: 0o700 })
+        writeFileSync(join(directory, 'FAUDIO.mp4'), 'synthetic media', { mode: 0o600 })
+        const file = loadCachedInboundAttachment({ inboxDir: join(state,'inbox'), messageTs: failed.messageId, fileId: 'FAUDIO', ordinal: 0 })!
+        store.recordRecoveredThreadAttachment(retry.idempotencyKey, store.pendingThreadAttachments(job)[0]!, file)
+      }
+    }
     if (mode.startsWith('question')) store.stageLiveInterjection(target, next)
     else store.stageLiveControl(target, { ...next, kind: mode === 'cancel' ? 'interrupt' : 'steer' })
+    if (attachment) store.completeInboundDelivery(`${next.chatId}:${next.messageId}`)
   }
   // Delivery is independently acknowledged by the outbox in production.
   // Use that exact store path in the fixture, too.
@@ -70,6 +89,11 @@ function fixture(mode: 'complete' | 'continue' | 'steer' | 'question' | 'questio
       opens += 1
       const id = options.arguments.at(-1)!, readonly = options.arguments.some(value => value.endsWith('/readonly-mcp.json'))
       readOnly.push(readonly)
+      if (readonly && attachment === 'recover') {
+        const mcp = JSON.parse(readFileSync(options.arguments[options.arguments.indexOf('--mcp-config') + 1]!, 'utf8'))
+        const permissions = JSON.parse(readFileSync(mcp.mcpServers.zerokun_runtime.args.at(-1), 'utf8')).permissionOverrides.join('\n')
+        expect(permissions).toContain('FAUDIO.mp4')
+      }
       let output!: ReadableStreamDefaultController<Uint8Array>, closed = false
       const emit = (event: object) => { if (!closed) output.enqueue(Buffer.from(JSON.stringify(event) + '\n')) }
       const terminal = (kind: 'success' | 'cancelled' | 'failed', text = '完了しました') => emit({ type: 'result',
@@ -209,3 +233,15 @@ for (const mode of ['proposal', 'proposal-withdrawn', 'proposal-changed', 'propo
     else expect(result.result).toBe(mode === 'proposal-withdrawn' ? '添付を撤回します<zerokun_files>[]</zerokun_files>' : '承認待ちです')
     expect(f.counts().turns).toBe(2)
   })
+
+for (const attachment of ['recover', 'unavailable'] as const) test(`live reply refreshes ${attachment} attachment metadata and read permissions`, async () => {
+  const f = fixture('question', attachment)
+  await f.run()
+  expect(f.messages[0]).not.toContain('FAUDIO')
+  expect(f.messages[1]).toContain('FAUDIO')
+  if (attachment === 'recover') {
+    expect(f.messages[1]).toContain('source message 1800000000.000150')
+    expect(f.messages[1]).not.toContain('download unavailable')
+  } else expect(f.messages[1]).toContain('download unavailable; original reference retained')
+  expect(f.readOnly).toEqual([false, true, false])
+})
