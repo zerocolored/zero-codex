@@ -198,6 +198,28 @@ codex <trust-args> -C <repo> \
   `opus5.5に依頼して`などの委任先や`GPT Image 2.5`などの画像・動画生成モデルは、主担当変更と区別します。
   主担当を変えないという明示的な訂正は、過去の誤判定を解除して直前の有効な主担当モデルを保持します。
   単なる「続けて」では未解決の主担当指定を取り消しません。
+- 明示的に依頼されたAntigravity CLI作業は同じ`zerokun_delegation`の
+  `antigravity_delegate_start` / `antigravity_delegate_poll` / `antigravity_delegate_cancel`で
+  専用Herdrタブへ渡します。公式`agy`をPATHへ導入し、通常の`agy`でGoogleアカウントへ
+  ログインしておきます。モデル指定は`agy models`のnative slug、未指定ならCLIの既定値です。
+  別モデルへの自動切替はありません。安定したkeyで開始し、同じidを完了までpollします。
+  Claudeと共通の永続記録・取消・プロセス回収を使い、切断後に依頼を自動再送しません。
+  `agy --dangerously-skip-permissions`で起動します。CLI全体は親のプロジェクト権限
+  サンドボックス内で動かし、CLI自身の認証・cache用に
+  `~/.gemini`へのアクセスを追加します。書込許可のない依頼はproject read-only + plan modeです。
+  nativeの確認を省略してもOSのファイル境界は維持します。主担当が変更と検証結果を確認し、
+  native toolの拒否・失敗を成功とは扱いません。モデルの応答と終了コードの両方が成功条件です。
+  作業開始前の認証失敗で `retrySafe=true` と `cleanupVerified=true` の場合だけ、主担当が
+  公式CLIのブラウザログインを完了し、表示コードを同じ待機中CLIへ非表示で渡します。
+  本人操作待ちでも認証セッションを維持し、コードをSlack・通常logへ載せません。
+  その後 `antigravity_delegate_retry_after_authentication` に元idを渡すと、保存済みの同じ
+  prompt・modelで1回だけ再試行します。返されたidをpollし、再接続時も同じ元idを使います。
+  再試行自体の認証失敗、部分実行、通信・権限・終了処理の失敗は再送しません。
+  本人のアカウント選択・MFAは自動化せず、主担当が必要な操作だけ引き継ぎます。
+  読取専用時にもモデル通信のdomain設定を追加し、project read-onlyとplan modeを維持します。
+  このMacで書込許可・読取専用の両方の応答を実機検証済みです。Keychain全体の許可は追加しません。
+  実機検証は`ZERO_AGY_LIVE=1 bun test zerokun/antigravity-live.test.ts`（既存subscription使用）。
+  これはnative CLI・sandboxの検証であり、稼働中Herdr UIのE2E検証ではありません。
 - 明示的に依頼されたClaude作業は`zerokun_delegation`のstart/poll/cancelで専用のHerdrタブへ渡します。
   指定したnative model IDを照合します。Fableが作業開始前にFable固有の上限で拒否した場合だけ、終了確認後にOpus 5.5へ一度切り替えます。
   切り替えをスレッドへ通知し、指定モデル・実行モデル・各失敗理由を保存します。途中まで作業した場合、他の上限、認証・通信・終了処理の失敗では再送しません。

@@ -16,7 +16,7 @@ export function readClaudePaneManifest(path: string): ClaudePaneManifest {
   const text = readOptionalBoundedOwnerOnlyRegularFile(path, 256 * 1024)
   if (!text) throw new Error('missing Claude pane manifest')
   const value = JSON.parse(text) as ClaudePaneManifest
-  if (value.version !== 1 || !/^[a-f0-9]{32}$/.test(value.nonce)
+  if (value.version !== 1 || (value.providerLabel !== undefined && value.providerLabel !== 'Antigravity') || !/^[a-f0-9]{32}$/.test(value.nonce)
     || typeof value.jobId !== 'string' || !/^[A-Za-z0-9._-]+$/.test(value.jobId)
     || typeof value.cwd !== 'string' || !isAbsolute(value.cwd) || realpathSync(value.cwd) !== value.cwd
     || typeof value.socketPath !== 'string' || !isAbsolute(value.socketPath)
@@ -104,7 +104,7 @@ export async function runClaudePane(path: string): Promise<number> {
       if (!childIdentity) throw new Error('Claude supervisor identity unavailable')
       if (stopping) stop()
       else await write(socket, { type: 'ready', identity: childIdentity })
-      process.stdout.write('Claude Code主担当の実行を開始しました。\n')
+      process.stdout.write(manifest.providerLabel === 'Antigravity' ? 'Antigravity委任作業を開始しました。\n' : 'Claude Code主担当の実行を開始しました。\n')
       const streams = Promise.all([relay(child.stdout, 'stdout'), relay(child.stderr, 'stderr')])
       const code = await child.exited
       await streams

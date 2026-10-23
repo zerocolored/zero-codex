@@ -9,6 +9,8 @@ import type { DelegationContext } from './claude-delegation-broker.ts'
 
 type Stage = 'authentication' | 'preparation' | 'startup' | 'initialize' | 'dispatch' | 'execution' | 'cleanup' | 'persistence'
 const REASONS = {
+  'permission-denied': '委任先のnative toolが操作を拒否しました。部分的な変更を確認し、拒否された操作を再送しないでください。',
+  'cli-missing': 'Antigravity CLI (agy) が見つかりません。公式CLIをPATHに導入してください。',
   'fable-quota': 'Fable の利用上限に達しています。',
   'rate-limit': 'Claude の利用上限またはリクエスト制限に達しています。',
   authentication: 'Claude の認証を確認できませんでした。',

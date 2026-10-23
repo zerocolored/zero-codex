@@ -3,6 +3,7 @@ import type { ProcessIdentity } from './process-generation.ts'
 
 export interface ClaudePaneManifest {
   version: 1
+  providerLabel?: 'Antigravity'
   nonce: string
   jobId: string
   cwd: string

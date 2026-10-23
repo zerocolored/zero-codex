@@ -238,3 +238,27 @@ test.skipIf(process.platform !== 'darwin')('a valid receipt with a live owned su
     await child.exited
   }
 })
+
+test.skipIf(process.platform !== 'darwin')('shared owned Herdr transport carries Antigravity NDJSON and labels its tab', async () => {
+  const f = fixture()
+  writeFileSync(f.executable, `#!${process.execPath}
+let input = '';
+for await (const chunk of Bun.stdin.stream()) input += new TextDecoder().decode(chunk);
+const request = JSON.parse(input.trim());
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+send({event:'init',conversation_id:'agy-test',init:{model:'gemini-test'}});
+send({event:'result',result:{conversation_id:'agy-test',status:'SUCCESS',response:request.message.content}});
+`, { mode: 0o700 })
+  const transport = await openClaudeHerdrTransport({ ...f, jobId: 'agy-bridge-test', sequence: 1, cwd: f.root,
+    providerLabel: 'Antigravity', arguments: [], controlForTesting: f.control,
+    environmentForTesting: { PATH: '/usr/bin:/bin', HOME: f.root } })
+  transports.push(transport)
+  expect((await f.control.listTabs('wT'))[0]?.label).toContain('Antigravity')
+  await transport.input.write(JSON.stringify({ event: 'user', message: { content: '日本語 agy' } }) + '\n')
+  await transport.input.end()
+  const lines = (await new Response(transport.output).text()).trim().split('\n').map(line => JSON.parse(line))
+  expect(lines[1].result.response).toBe('日本語 agy')
+  expect(await transport.exited).toBe(0)
+  await transport.close()
+  expect(f.counters()).toEqual({ runs: 1, closed: 1 })
+})
