@@ -4,6 +4,24 @@ import type { Database } from 'bun:sqlite'
 export type NativeConfirmation = { threadId: string; turnId: string; origin: string }
 export type NativeConfirmationDecision = 'accept' | 'decline' | 'cancel'
 
+/** Kept in both developer instructions and fresh turn/control context: resumed
+ * conversation history can contain a question whose native RPC has ended. */
+export const NATIVE_UPLOAD_CONFIRMATION_PROTOCOL = [
+  'Native upload confirmation has exactly one owner: the host relay of a live Browser Use request.',
+  'Never ask for 今回だけ許可 or キャンセル for a browser upload in your own commentary,',
+  'async questions, request_user_input, request_user_input_async, or final answer. Do not create a preliminary permission question.',
+  'For an upload already authorized by the task, invoke the actual browser operation. If it needs',
+  'native confirmation, the host posts the question and waits for its answer inside that same call.',
+  'While that call waits, do not repeat its question or finish the task as awaiting another reply.',
+  'An old upload question in resumed history is not a live pending request. After interruption,',
+  'inspect the previous effect and retry the same authorized operation if it was not performed;',
+  'do not revive the old question manually or ask the user to answer a closed native request.',
+  'A normal Slack reply saying 今回だけ許可 is task context, not proof that a native RPC was answered.',
+  'Do not claim native permission was accepted unless the current tool result confirms it.',
+  'Respect actual user declines and native policy denials; a host/session cancellation is not a user decline.',
+  'This rule takes priority over generic instructions to begin an unfinished reply with a request.',
+].join('\n')
+
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : null

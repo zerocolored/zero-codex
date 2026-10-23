@@ -313,6 +313,46 @@ test('a crashed request lease cannot permanently intercept normal thread replies
   expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs, now)).toBe(false)
 })
 
+test('interrupted upload resumes with one live question and one answer to that exact call', async () => {
+  const f = fixture(), n = f.store.nativeConfirmations
+  const old = n.create(f.binding)!
+  f.publish({ sourceKey: old.sourceKey, text: 'お願い: upload' }); f.deliver()
+  n.close(old)
+  expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs)).toBe(false)
+  expect(f.store.answerNativeConfirmation(f.answer)).toBeNull()
+
+  // Model the supervisor retiring the old native process before completion.
+  f.db.run('UPDATE jobs SET executor_nonce=NULL,active_turn_id=NULL WHERE id=?', [f.job.id])
+  f.store.complete(f.job.id, 'thread-one', '旧確認は中断しました')
+  for (const notice of f.store.pendingTerminalNotifications()) f.store.markTerminalNotificationDelivered(notice.id)
+  f.store.enqueue({ chatId: f.job.chatId, threadTs: f.job.threadTs, messageId: '1800000000.000102',
+    userId: f.job.userId, repoPath: f.job.repoPath, task: 'つづけて', writeEnabled: true })
+  const resumed = f.store.claimNext('worker')!
+  f.store.bindAppServerTurn(resumed.id, resumed.workerId!, resumed.controlEpoch,
+    'executor-resumed', 'thread-one', 'turn-resumed')
+  let questions = 0
+  const result = await awaitNativeConfirmation({ store: n, signal: new AbortController().signal,
+    binding: { ...f.binding, jobId: resumed.id, epoch: resumed.controlEpoch,
+      executorNonce: 'executor-resumed', turnId: 'turn-resumed' },
+    prepareText: f.prepareText,
+    publish: event => {
+      questions++
+      f.store.stageCommentaryNotification(resumed.id, resumed.attempts, event.sourceKey, `💬 ${event.text}`)
+      f.deliver()
+      const reply = { ...f.answer, messageId: '1800000001.000100' }
+      expect(f.store.answerNativeConfirmation(reply)).toBe(true)
+      expect(f.store.answerNativeConfirmation(reply)).toBe(true)
+      return true
+    },
+  })
+  expect(result).toBe('accept')
+  expect(questions).toBe(1)
+  expect(f.store.pendingStatusNotifications()).toHaveLength(1)
+  expect(f.db.query('SELECT status,decision FROM native_confirmations WHERE code=?').get(old.code))
+    .toEqual({ status: 'closed', decision: null })
+  expect(n.hasPendingForThread(f.job.chatId, f.job.threadTs)).toBe(false)
+})
+
 
 test('an older ordinary reply and an already queued event are not consumed by a new confirmation', () => {
   const f = fixture(), n = f.store.nativeConfirmations, row = n.create(f.binding)!
