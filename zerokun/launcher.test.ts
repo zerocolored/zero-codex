@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
-  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync,
+  chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync,
   rmSync, symlinkSync, writeFileSync,
 } from 'fs'
 import { tmpdir } from 'os'
@@ -142,7 +142,7 @@ async function runLauncher(
   state: string,
   env: Record<string, string>,
   beforeConfirm?: () => void | Promise<void>,
-  launch: { invokedAs?: 'zerochan' | 'zerokun'; cwd?: string; args?: string[] } = {},
+  launch: { invokedAs?: 'zerochan' | 'zerokun'; cwd?: string; args?: string[]; launcher?: string } = {},
 ) {
   // The launcher intentionally prepends $HOME/.local/bin before Homebrew.
   // Put the fixture shims there so tests do not depend on whether the host
@@ -320,10 +320,10 @@ async function runLauncher(
     "echo 'Usage: herdr agent list Usage: herdr agent get Usage: herdr agent send-keys'",
     '',
   ].join('\n'), { mode: 0o700 })
-  let launcherPath = LAUNCHER
+  let launcherPath = launch.launcher ?? LAUNCHER
   if (launch.invokedAs) {
     launcherPath = join(state, launch.invokedAs)
-    if (!existsSync(launcherPath)) symlinkSync(LAUNCHER, launcherPath)
+    if (!existsSync(launcherPath)) symlinkSync(launch.launcher ?? LAUNCHER, launcherPath)
   }
   const child = Bun.spawn([
     '/bin/bash', launcherPath,
@@ -506,6 +506,42 @@ describe('codex-channel.sh replacement guard', () => {
       .toEqual({ version: 1, slackChannels: [] })
   })
 
+  test('self-development config uses the separated App runtime while the current source CLI owns parsing', async () => {
+    const state = realpathSync(fixture())
+    const source = realpathSync(join(dirname(state), 'project'))
+    const launcher = join(source, 'codex-channel.sh')
+    copyFileSync(LAUNCHER, launcher)
+    symlinkSync(import.meta.dir, join(source, 'zerokun'))
+    const env = { FAKE_REAL_RUNTIME: '1' }
+    const run = (args: string[], cwd = source) => runLauncher(state, env, undefined, {
+      invokedAs: 'zerochan', cwd, args, launcher,
+    })
+    const before = await run(['set', 'slack-channel', 'CSELF'])
+    expect(before.exitCode, before.output).toBe(1)
+    expect(before.output).toContain('Zeroちゃん自身の開発は可能です')
+    expect(existsSync(join(source, '.zerochan/config.json'))).toBe(false)
+
+    const runtime = join(dirname(state), 'runtime')
+    mkdirSync(runtime)
+    expect(Bun.spawnSync(['git', 'init', '-q', runtime]).exitCode).toBe(0)
+    writeFileSync(join(state, 'legacy-runtime.json'), JSON.stringify({ version: 1, path: runtime }), { mode: 0o600 })
+    writeFileSync(join(runtime, 'codex-channel.sh'), '#!/bin/bash\necho separated-runtime:"$@"\npwd -P\nexit 73\n')
+    const set = await run(['set', 'slack-channel', 'CSELF'])
+    expect(set.exitCode, set.output).toBe(0)
+    expect(readProjectChannelConfig(source).slackChannels).toEqual(['CSELF'])
+    expect((await run(['status'])).output).toContain('CSELF')
+    const start = await run(['start'])
+    expect(start.exitCode, start.output).toBe(73)
+    expect(start.output).toContain('separated-runtime:start')
+    expect(start.output).toContain(source)
+    const blocked = await run(['set', 'slack-channel', 'CUNSAFE'], runtime)
+    expect(blocked.exitCode, blocked.output).toBe(1)
+    expect(blocked.output).toContain('runtime repository')
+    expect(existsSync(join(runtime, '.zerochan/config.json'))).toBe(false)
+    expect((await run(['unset', 'slack-channel'])).exitCode).toBe(0)
+    expect(readProjectChannelConfig(source).slackChannels).toEqual([])
+  })
+
   test('unset/rebind requires a compatible route runtime and keeps management current and service dispatch pinned', async () => {
     const state = realpathSync(fixture())
     const project = realpathSync(join(dirname(state), 'project'))
@@ -519,6 +555,7 @@ describe('codex-channel.sh replacement guard', () => {
     // A previously prepared but never started App still points to its old code.
     const oldRoot = join(state, 'old-release')
     mkdirSync(join(oldRoot, 'zerokun'), { recursive: true })
+    expect(Bun.spawnSync(['git', 'init', '-q', oldRoot]).exitCode).toBe(0)
     writeFileSync(join(oldRoot, 'zerokun/job-runner.ts'), '')
     const reader = join(oldRoot, 'reader.ts')
     writeFileSync(reader, `import { existsSync, readFileSync } from 'fs';

@@ -88,7 +88,9 @@ export function validateLaunchProject(
     throw new Error(`Slack project cannot be the filesystem root or home directory: ${projectDir}`)
   }
   if (pathContains(runtimeRepo, projectDir) || pathContains(projectDir, runtimeRepo)) {
-    throw new Error(`Slack project must be separate from the Zero runtime repository: ${projectDir}`)
+    throw new Error(`Slack project must be separate from the Zero runtime repository: ${projectDir}`
+      + '\nZeroちゃん自身の開発は可能です。実行用を別cloneへ配置し、このcloneを開発対象にしてください。'
+      + '\n手順: SETUP.md「Zeroちゃん自身を開発する」')
   }
   if (pathContains(stateDir, projectDir) || pathContains(projectDir, stateDir)) {
     throw new Error(`Slack project must be separate from Zero managed state: ${projectDir}`)
