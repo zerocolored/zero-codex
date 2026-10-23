@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import { TestProcessScope } from './test-process-scope.ts'
 import { browserScreenshotFromNotification } from './codex-monitor-display.ts'
 import { createHash } from 'crypto'
 import {
@@ -8283,11 +8284,12 @@ describe('single FIFO worker', () => {
     const store = new JobStore(join(dir, 'jobs.sqlite3'))
     const job = store.enqueue(input({ repoPath: repo, messageId: 'cleanup-confirmed-live' })).job
     const claimed = store.claimNext('serial-worker')!
-    const supervisor = Bun.spawn([process.execPath, fixture, job.id], {
+    await using testProcesses = new TestProcessScope()
+    const supervisor = testProcesses.own(Bun.spawn([process.execPath, fixture, job.id], {
       cwd: repo,
       stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
       detached: process.platform !== 'win32',
-    })
+    }))
     let identity = readProcessIdentity(supervisor.pid)
     const identityDeadline = Date.now() + 2_000
     while ((!identity || identity.pgid !== supervisor.pid) && Date.now() < identityDeadline) {
@@ -8332,8 +8334,6 @@ describe('single FIFO worker', () => {
       expect(store.get(job.id)?.executorPid).toBeNull()
       if (injectUnknown) expect(warnings.filter(message => message.includes('PID 1000000'))).toHaveLength(1)
     } finally {
-      try { supervisor.kill('SIGKILL') } catch {}
-      await supervisor.exited
       store.close()
     }
   })
@@ -8359,19 +8359,20 @@ describe('single FIFO worker', () => {
         'setInterval(() => {}, 1_000)',
         '',
       ].join('\n'))
-      const supervisor = Bun.spawn([
+      await using testProcesses = new TestProcessScope()
+      const supervisor = testProcesses.own(Bun.spawn([
         process.execPath, '--config=/dev/null', '--no-env-file', supervisorScript, job.id,
         supervisorReady,
       ], {
         cwd: repo,
         stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
         detached: true,
-      })
-      const detached = Bun.spawn(['/bin/sleep', '30'], {
+      }))
+      const detached = testProcesses.own(Bun.spawn(['/bin/sleep', '30'], {
         cwd: repo,
         stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
         detached: true,
-      })
+      }))
       let supervisorIdentity = readProcessIdentity(supervisor.pid)
       let detachedIdentity = readProcessIdentity(detached.pid)
       const identityDeadline = Date.now() + 2_000
@@ -8435,11 +8436,6 @@ describe('single FIFO worker', () => {
         expect(existsSync(registration)).toBe(false)
         expect(store.get(job.id)?.executorPid).toBeNull()
       } finally {
-        signalProcessGroupIfLeaderLive(supervisorIdentity!, 'SIGKILL')
-        signalProcessGroupIfLeaderLive(detachedIdentity!, 'SIGKILL')
-        signalProcessIfLive(supervisorIdentity!, 'SIGKILL')
-        signalProcessIfLive(detachedIdentity!, 'SIGKILL')
-        await Promise.all([supervisor.exited, detached.exited])
         store.close()
       }
     },
