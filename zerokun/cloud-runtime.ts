@@ -284,7 +284,11 @@ export class CloudRuntime {
             throw new CloudControlUnavailableError('保存済みの変更を復元できませんでした。元の担当の所有権と保存データは保持しています。対象リポジトリと保存データの確認が必要です。')
           }
           git(root, ['switch', '-c', `zerochan/${waiting.id}/handoff-${expectedEpoch}`])
-          return { root, name: repo.name, base: repo.base }
+          // Reuse this PC's known integration refs; import must not add a new
+          // remote/auth dependency merely to preserve synchronization metadata.
+          const heads = git(sources.get(repo.remote.replace(/\.git$/, ''))!, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin/'])
+          const integrationBranch = (['develop', 'main', 'master'] as const).find(name => heads.split('\n').includes(`refs/remotes/origin/${name}`))
+          return { root, name: repo.name, base: repo.base, integrationBranch }
         })
         workspace = { epoch: expectedEpoch, project, repositories }
         const instructions = layout.rootInstructionPaths.filter(p => basename(p) === 'AGENTS.md')

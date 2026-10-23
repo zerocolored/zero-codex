@@ -77,7 +77,7 @@ import {
   type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
-import { synchronizeTaskProject } from './task-start-sync.ts'
+import { synchronizeTaskProject, TaskStartSyncInterruptedError, type TaskStartSyncResult } from './task-start-sync.ts'
 import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE, cloudFailureReason } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
@@ -611,6 +611,7 @@ type InboundDeliveryRow = {
 export interface JobRecord {
   /** Host-selected integration branches for managed cloud repositories. */
   gitIntegrationBranches?: Record<string, string>
+  taskStartSync?: TaskStartSyncResult[]
   workflow?: 'work' | 'security-audit'
   auditReportPath?: string
   auditReportUnavailable?: boolean
@@ -15882,6 +15883,22 @@ export async function runQueuedJobs(options: RunQueuedJobsOptions): Promise<RunS
         scheduleNotificationFlush()
         continue
       }
+      if (error instanceof TaskStartSyncInterruptedError) {
+        if (options.store.get(job.id)?.cancelRequestedAt != null) {
+          await updateMonitor(job, '中止要求を反映し、安全な後処理を完了しました')
+          await quiesceMonitorBeforeTerminal()
+          options.store.cancel(job.id)
+          stats.failed += 1
+          scheduleNotificationFlush()
+          log(`${workerId} cancelled Git observation before primary execution ${job.id}`)
+          continue
+        }
+        // Only remote refs were observed; this attempt never reached a primary.
+        await quiesceLifecycleBeforeStateChange()
+        options.store.requeue(job.id, error.message)
+        log(`${workerId} stopped Git observation before primary execution ${job.id}`)
+        return stats
+      }
       if (error instanceof CodexUserCancelledError) {
         if (!executionStarted) {
           await runExternalContextBoundary(
@@ -19308,7 +19325,12 @@ async function runCli(): Promise<void> {
             return auditResult
           }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
-          await synchronizeTaskProject(executionJob, executionController.signal)
+          // Fetch is safe before interpreting the request; checkout writes require
+          // the primary to distinguish an investigation from an authorized edit.
+          executionJob.taskStartSync = await synchronizeTaskProject(
+            {...executionJob, writeEnabled: false}, executionController.signal,
+            () => store.get(job.id)?.cancelRequestedAt != null,
+          )
           const previousAudit = store.previousSecurityAudit(executionJob, id => !auditHasReadinessOnlyResult(dir, id))
           if (previousAudit) {
             try {

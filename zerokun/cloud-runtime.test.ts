@@ -156,6 +156,7 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
     const repo = join(source, name); mkdirSync(repo)
     git(repo, 'init', '-b', 'main', '--quiet')
     writeFileSync(join(repo, 'file.txt'), 'base'); git(repo, 'add', '.'); git(repo, 'commit', '--quiet', '-m', 'base')
+    git(repo, 'branch', 'develop')
     git(repo, 'remote', 'add', 'origin', repo)
     writeFileSync(join(repo, '.env.keys'), `synthetic-A-${name}`, { mode: 0o600 })
   }
@@ -200,6 +201,7 @@ test('new cloud preparation and multi-repo import both pin the execution parent'
     await runtimeB.receive(control)
     const imported = runtimeB.executionJob(b.claimNext('worker-B')!)
     expect(resolveProjectLayout(imported.repoPath).pinned).toBe(true)
+    expect(Object.values(imported.gitIntegrationBranches ?? {})).toEqual(['develop', 'develop'])
     for (const name of ['back', 'front']) expect(readFileSync(join(imported.repoPath, name, '.env.keys'), 'utf8')).toBe(`synthetic-B-${name}`)
     expect(Buffer.from(cloud.bytes).toString()).not.toContain('synthetic-B')
     const request = join(root, 'snapshot'); mkdirSync(request, { mode: 0o700 })

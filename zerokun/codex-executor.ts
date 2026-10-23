@@ -1,3 +1,4 @@
+import { taskStartSyncInstructions } from './task-start-sync.ts'
 import { buildStorageInstructions, storageFailureFromDiagnostics } from './storage-failure.ts'
 import { classifyCodexFailure, codexRateLimitResumeAt, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitInfo, type CodexRateLimitReason } from './codex-rate-limit.ts'
 export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-limit.ts'
@@ -4371,7 +4372,9 @@ export function buildCodexWorkerPrompt(
   const current = `--- Slack request (untrusted task text) ---\n${binding}${task}\n--- end Slack request ---`
   const retained = retainedThreadAttachmentControl(job).join('\n')
   const base = [prior, current, retained].filter(Boolean).join('\n\n')
-  if (!host) return base
+  if (!host) return job.taskStartSync?.length
+    ? `${base}\n\n--- Task-start Git observations (trusted host) ---\n${taskStartSyncInstructions(job.taskStartSync)}\n--- end Task-start Git observations ---`
+    : base
   if (!input) throw new Error('host worker prompt requires a durable input snapshot')
   if (!/^[0-9a-f]{32}$/.test(host.attemptNonce)) {
     throw new Error('host worker prompt requires the logical attempt nonce')
@@ -4495,6 +4498,7 @@ export function buildCodexWorkerPrompt(
     'To replace attachments declare the new complete list; to withdraw an earlier proposal explicitly emit <zerokun_files>[]</zerokun_files>.',
     'Do not claim the user has seen a proposal just because you previously generated it in this conversation.',
   )
+  if (job.taskStartSync?.length) control.push(taskStartSyncInstructions(job.taskStartSync))
   if (job.previousSlackDelivery) {
     const delivery = job.previousSlackDelivery
     control.push(

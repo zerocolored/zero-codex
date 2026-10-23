@@ -474,16 +474,11 @@ zerochan-access write deny U0123456789
 
 ### タスク開始時のGit同期
 
-書き込み権限のある通常タスクは、Codex / Claude Codeの実行前（再開時も）に対象repositoryをpullし、
-作業ファイルへリモート更新を反映します。upstreamがあればそのbranch、未設定ならremoteの既定branchを取得元にし、
-feature branchにはremoteの既定branchの更新も取り込み、現在の作業branchは維持します。developへの強制切替はしません。クラウドの新規作業場所の起点は
-従来どおりdevelop → main → masterです。
-
-未pushのcommitはmergeで保持し、無関係な未コミット変更はそのまま残します。同期失敗や競合時は
-主担当の実行を開始しません。自動stash・resetは行わないため、上書きされる変更や競合は解消後に再開してください。
-読み取り専用タスク・独立したセキュリティ監査はcheckoutを更新しません。remoteのないrepositoryと
-非Git projectは同期対象外です。push直前の同期も引き続き必要です。
-
+通常タスクは読み取り専用・再開を含め、Codex / Claude Codeの実行前にremoteの作業branchと統合branchをfetchし、SHA・ahead/behind・未コミット状態を主担当へ渡します。
+ホストは依頼を解釈する前にcheckoutを書き換えません。主担当が実装前にcleanな作業branchを明示的なpull --ff-onlyで更新します。fetchだけでは作業ファイルの最新化完了にはなりません。
+新規作業はrepositoryの統合branchの取得済みSHAから専用branch/worktreeで開始し、継続は既存の作業branchを維持します。developへの強制切替や継続branchへの無条件の統合先mergeは行いません。
+未コミット変更、履歴分岐、競合、upstreamの欠落、通信失敗は主担当へ引き継ぎ、未確認の実装は進めず、原因調査や認可済みの競合解消を行います。自動stash・reset・force-pushはしません。
+独立セキュリティ監査は既存の検査対象を維持します。remoteのないrepositoryと非Git projectには同期元がありません。push直前の同期も引き続き必要です。
 
 
 ```bash
