@@ -4107,6 +4107,17 @@ print('review complete')
     })))).toBe(true)
   })
 
+  test('Claudeの可視入力box内だけ折返しplaceholderを空promptとして扱う', () => {
+    const wrapped = '──────\n❯ Try "edit adminPageApp.ts\n  to..."\n──────\n⏵⏵ bypass permissions on'
+    expect(emptyClaudePrompt(wrapped)).toBe(true)
+    expect(emptyClaudePrompt('❯ Try "' + 'a'.repeat(120) + '"')).toBe(true)
+    for (const screen of [wrapped.replace('to..."', 'to..." draft'),
+      wrapped.replace('  to...', '❯ to...'), wrapped.replace('Try "edit', 'typed edit'),
+      '❯ Try "hello\n  world"', wrapped + '\nAllow this action']) {
+      expect(emptyClaudePrompt(screen)).toBe(false)
+    }
+  })
+
   test('Claude回答はprompt echoと最終独立markerの完全envelopeだけを採択する', () => {
     const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
     expect(extractCompleteClaudeResponse([

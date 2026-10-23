@@ -52,10 +52,44 @@ export function claudeBlockedPermission(transcript: string): boolean {
 
 const STARTUP_CODES = ['prohibited-ui', 'authentication-ui', 'rate-limit-ui', 'billing-ui', 'trust-confirmation-failed', 'effort-confirmation-failed',
   'trust-confirmation-timeout', 'readiness-timeout', 'identity-check-failed', 'startup-failed'] as const
+const STARTUP_STATES = ['unrecognized-screen', 'empty-prompt', 'keep-xhigh', 'trust-trust', 'trust-exit', 'prohibited-ui'] as const
+const STARTUP_AGENT_STATUSES = ['idle', 'done', 'working', 'blocked', 'unknown', 'other'] as const
+export type ClaudeStartupDetail = {
+  lastState: typeof STARTUP_STATES[number]
+  agentStatus: typeof STARTUP_AGENT_STATUSES[number]
+  interactiveReady: boolean | null
+  launchPending: boolean | null
+  stableObserved: boolean
+  effortConfirmed: boolean
+  trustConfirmed: boolean
+  promptPresent: boolean
+  placeholderPresent: boolean
+  trustPresent: boolean
+  effortPresent: boolean
+}
+
+function startupDetail(value: unknown): ClaudeStartupDetail | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const v = value as Record<string, unknown>
+  if (!STARTUP_STATES.includes(v.lastState as ClaudeStartupDetail['lastState'])
+    || !STARTUP_AGENT_STATUSES.includes(v.agentStatus as ClaudeStartupDetail['agentStatus'])) return undefined
+  for (const key of ['interactiveReady', 'launchPending']) {
+    if (v[key] !== null && typeof v[key] !== 'boolean') return undefined
+  }
+  const flags = ['stableObserved', 'effortConfirmed', 'trustConfirmed', 'promptPresent', 'placeholderPresent', 'trustPresent', 'effortPresent'] as const
+  if (flags.some(key => typeof v[key] !== 'boolean')) return undefined
+  // Select fixed fields; neither unknown keys nor arbitrary screen text reach
+  // the diagnostic, even when a future helper adds other benign metadata.
+  return { lastState: v.lastState, agentStatus: v.agentStatus,
+    interactiveReady: v.interactiveReady, launchPending: v.launchPending,
+    ...Object.fromEntries(flags.map(key => [key, v[key]])) } as ClaudeStartupDetail
+}
+
 export type ClaudeFailureDiagnostic = {
   stage: 'startup' | 'send' | 'acquisition'
   cause: AdvisorFailure['cause']
   startupCode?: typeof STARTUP_CODES[number]
+  startupDetail?: ClaudeStartupDetail
   operation?: 'runtime' | 'authentication' | 'request-directory' | 'prompt-files' | 'snapshot' | 'open' | 'send' | 'acquisition'
 }
 
@@ -67,14 +101,21 @@ export type ClaudeSnapshotDiagnostic = {
   outputTruncated?: boolean
 }
 
-export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagnostic['startupCode'] {
+export function parseClaudeStartupDiagnosticRecord(stdout: string): { code: NonNullable<ClaudeFailureDiagnostic['startupCode']>; detail?: ClaudeStartupDetail } | undefined {
   for (const line of stdout.split('\n')) {
     try {
       const value = JSON.parse(line)
-      if (value?.status === 'ephemeral-claude-startup-failed' && STARTUP_CODES.includes(value.code)) return value.code
+      if (value?.status === 'ephemeral-claude-startup-failed' && STARTUP_CODES.includes(value.code)) {
+        const detail = ['readiness-timeout', 'trust-confirmation-timeout'].includes(value.code) ? startupDetail(value.detail) : undefined
+        return { code: value.code, ...(detail ? { detail } : {}) }
+      }
     } catch { /* Other helper records are not startup diagnostics. */ }
   }
   return undefined
+}
+
+export function parseClaudeStartupDiagnostic(stdout: string): ClaudeFailureDiagnostic['startupCode'] {
+  return parseClaudeStartupDiagnosticRecord(stdout)?.code
 }
 
 export function claudeStartupFailure(code: ClaudeFailureDiagnostic['startupCode']): AdvisorFailure | undefined {

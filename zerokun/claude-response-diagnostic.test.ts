@@ -6,6 +6,7 @@ import { createHash } from 'crypto'
 import { ClaudeReadError, claudeReadCommandFailure, captureClaudeFailureDiagnostic, saveClaudeResponseDiagnostic, parseClaudeStartupDiagnostic, claudeStartupFailure, MAX_CLAUDE_DIAGNOSTIC_TRANSCRIPT_BYTES } from './claude-response-diagnostic.ts'
 import { analyzeClaudeResponse, extractCompleteClaudeResponse, AdvisorOwnedProcessStillLiveError } from './advisor-broker.ts'
 import { claudeBlockedPermission, claudeRequestRateLimited } from './claude-response-diagnostic.ts'
+import { parseClaudeStartupDiagnosticRecord } from './claude-response-diagnostic.ts'
 
 test('working-directory permission is recognized after terminal line wrapping', () => {
   const dialog = ['Read outside the working directories', 'Read(/synthetic/inbox/image.png)',
@@ -28,6 +29,29 @@ function fixture() {
   return { stateDir, directory: join(stateDir, 'journal', 'revision'), attempt: 'a'.repeat(32), reads: [] }
 }
 const marker = 'REQUEST_MARKER=0123456789ABCDEF0123456789ABCDEF'
+test('startup timeout evidence survives persistence without arbitrary screen fields', () => {
+  const detail = { lastState: 'empty-prompt', agentStatus: 'working', interactiveReady: false,
+    launchPending: true, stableObserved: true, effortConfirmed: false, trustConfirmed: false,
+    promptPresent: true, placeholderPresent: false, trustPresent: false, effortPresent: false }
+  const parsed = parseClaudeStartupDiagnosticRecord(JSON.stringify({
+    status: 'ephemeral-claude-startup-failed', code: 'readiness-timeout',
+    detail: { ...detail, rawScreen: 'private-account-value' },
+  }))!
+  expect(parsed.detail).toEqual(detail)
+  const options = fixture()
+  const saved = saveClaudeResponseDiagnostic({ ...options,
+    failure: { stage: 'startup', cause: 'startup', operation: 'open', startupCode: parsed.code, startupDetail: parsed.detail },
+  })
+  expect(saved.status).toBe('saved')
+  const raw = readFileSync(join(options.stateDir, saved.path!), 'utf8')
+  expect(JSON.parse(raw)).toMatchObject({ failure: { startupDetail: detail }, transcript: { available: false } })
+  expect(raw).not.toContain('private-account-value')
+  for (const invalid of [{ ...detail, lastState: 'private-account-value' },
+    { ...detail, promptPresent: 'private-account-value' }, { ...detail, interactiveReady: {} }]) {
+    expect(parseClaudeStartupDiagnosticRecord(JSON.stringify({ status: 'ephemeral-claude-startup-failed',
+      code: 'readiness-timeout', detail: invalid }))).toEqual({ code: 'readiness-timeout' })
+  }
+})
 const instruction = '応答の最後の独立行に、次のrequest markerをそのまま記載してください。'
 
 const fableLimit = "⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model."

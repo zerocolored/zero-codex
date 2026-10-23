@@ -2229,7 +2229,8 @@ _FIRST_CHOICE_SELECTED = re.compile(r"^[\s\u2500-\u257f]*[❯›▶▷][\s\u2500
 # '❯\xa0Try "fix lint errors"'）。プレースホルダは入力が空のときにしか出ないので、
 # 「❯ + プレースホルダのみ」も空の可視プロンプトとして扱う。advisor-broker.ts の
 # emptyClaudePrompt と同じ判定に保つこと。
-_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯[\s ]*(?:Try \"[^\"]{0,80}\")?[\s ]*$")
+_EMPTY_PROMPT_LINE = re.compile(r"^\s*❯[\s ]*(?:Try \"[^\"]*\")?[\s ]*$")
+_PROMPT_BORDER = re.compile(r"^\s*[─━═╌╍┄┅┈┉]{3,}\s*$")
 _INTERACTIVE_HINT = re.compile(
     r"(?i)(?:\b(?:press|hit|choose|select|confirm|cancel|continue|proceed|approve|deny|allow)\b.*\b(?:enter|return|esc|escape|key|option)\b|"
     r"\b(?:enter|return|esc|escape)\b.*\b(?:confirm|cancel|continue|select|submit)\b|"
@@ -2241,13 +2242,52 @@ def _semantic_terminal_line(line: str) -> str:
     return " ".join(_TRUST_DECORATION.sub(" ", line).split())
 
 
-def _empty_claude_prompt_screen(text: str) -> bool:
+def _startup_visible_text(text: str) -> str:
+    """Rejoin only a closed placeholder inside the visible input box.
+
+    Herdr's visible read preserves terminal wraps. Do not join arbitrary lines:
+    a following authentication dialog or an unfinished draft is not a hint.
+    """
     plain = _ANSI_SEQUENCE.sub("", text).replace("\r", "")
     lines = plain.splitlines()
+    for start in range(1, len(lines)):
+        if (not _PROMPT_BORDER.fullmatch(lines[start - 1])
+                or not re.match(r'^\s*❯[\s ]*Try "', lines[start])
+                or _EMPTY_PROMPT_LINE.fullmatch(lines[start])):
+            continue
+        end = start + 1
+        while end < len(lines) and not _PROMPT_BORDER.fullmatch(lines[end]):
+            if not lines[end].strip() or not lines[end].startswith('  ') or '❯' in lines[end]:
+                break
+            end += 1
+        if end > start + 1 and end < len(lines) and _PROMPT_BORDER.fullmatch(lines[end]):
+            joined = ' '.join(line.strip() for line in lines[start:end])
+            if _EMPTY_PROMPT_LINE.fullmatch(joined):
+                return '\n'.join(lines[:start] + [joined] + lines[end:])
+    return plain
+
+
+def _empty_claude_prompt_screen(text: str) -> bool:
+    lines = [line.strip() for line in _startup_visible_text(text).splitlines()]
     prompt_lines = [index for index, line in enumerate(lines) if "❯" in line]
     if not prompt_lines:
         return False
-    return _EMPTY_PROMPT_LINE.fullmatch(lines[prompt_lines[-1]]) is not None
+    last_prompt = prompt_lines[-1]
+    if not _EMPTY_PROMPT_LINE.fullmatch(lines[last_prompt]):
+        return False
+    # Keep the same surrounding-screen guard as advisor-broker.ts. A valid
+    # placeholder can remain painted while a later dialog awaits input.
+    for line in lines[last_prompt + 1:]:
+        if (line and not re.fullmatch(r"[─━═╌╍┄┅┈┉]+", line)
+                and not re.match(r"^⏵⏵\s", line)
+                and not re.match(r"(?:✔\s|new task\?|/rc\b)", line, re.I)):
+            return False
+    for line in lines[max(0, last_prompt - 8):last_prompt]:
+        if (re.search(r"How is Claude doing this session\?", line, re.I)
+                or re.fullmatch(r"(?:[0-3]:\s*(?:Bad|Fine|Good|Dismiss)|Allow this action|Do you want to proceed|transcript sharing)", line, re.I)
+                or re.match(r"(?:permission (?:required|request)|requires? permission)\b", line, re.I)):
+            return False
+    return True
 
 
 def _startup_project_display(line: str, project_root: str) -> bool:
@@ -2351,6 +2391,7 @@ def _trust_screen_choice(text: str, project_root: str) -> Optional[Tuple[str, st
 
 
 def _startup_screen_state(text: str, project_root: str) -> Tuple[str, str]:
+    text = _startup_visible_text(text)
     trust = _trust_screen_choice(text, project_root)
     if trust:
         return ("trust-" + trust[0], trust[1])
@@ -2377,12 +2418,28 @@ def _startup_screen_state(text: str, project_root: str) -> Tuple[str, str]:
     return ("unrecognized-screen", "")
 
 
+class _StartupReadinessTimeout(UnsafeRequest):
+    def __init__(self, detail: Dict[str, object]) -> None:
+        self.detail = detail
+        super().__init__(f"ephemeral Claude visible ready prompt did not settle ({detail['lastState']})")
+
+
+def _startup_failure_record(error: BaseException) -> Dict[str, object]:
+    result = {"status": "ephemeral-claude-startup-failed", "code": _startup_failure_code(error)}
+    if isinstance(error, _StartupReadinessTimeout):
+        result["detail"] = error.detail
+    return result
+
+
 def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str, object]:
     """Metadata-ready can precede the effort question. Confirm only the owned UI."""
     accepted_effort = False
     accepted_trust = False
     moved_to_trust = False
     last_state = "unrecognized-screen"
+    stable_observed = False
+    second: Dict[str, object] = {}
+    second_text = ""
     deadline = time.monotonic() + CLAUDE_SETTLE_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         _result, first = _agent_information(target)
@@ -2404,6 +2461,7 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
                   and all(first.get(key) == second.get(key)
                           for key in ("agent_status", "interactive_ready", "launch_pending"))
                   and first_screen == second_screen)
+        stable_observed = stable_observed or stable
         if not stable:
             continue
         if last_state == "keep-xhigh":
@@ -2442,7 +2500,20 @@ def _settle_visible_ready(target: str, workspace: Dict[str, object]) -> Dict[str
         # Metadata can precede a fully painted startup screen. Do not turn an
         # incidental frame into a launch failure; wait within the same attempt.
         continue
-    raise UnsafeRequest(f"ephemeral Claude visible ready prompt did not settle ({last_state})")
+    status = second.get("agent_status")
+    raise _StartupReadinessTimeout({
+        "lastState": last_state,
+        "agentStatus": status if status in {"idle", "done", "working", "blocked", "unknown"} else "other",
+        "interactiveReady": second.get("interactive_ready") if type(second.get("interactive_ready")) is bool else None,
+        "launchPending": second.get("launch_pending") if type(second.get("launch_pending")) is bool else None,
+        "stableObserved": stable_observed,
+        "effortConfirmed": accepted_effort,
+        "trustConfirmed": accepted_trust,
+        "promptPresent": "❯" in second_text,
+        "placeholderPresent": 'Try "' in second_text,
+        "trustPresent": "Accessing workspace:" in second_text,
+        "effortPresent": "Keep xhigh" in second_text,
+    })
 
 
 def _strict_trust_screen(text: str, project_root: str) -> bool:
@@ -4409,8 +4480,7 @@ def _open_ephemeral_workspace(
         _suppress_open_signals()
         # Preserve a bounded, non-secret diagnosis before closing the only UI
         # that can explain an open failure. Never relay the screen or argv here.
-        print(json.dumps({"status": "ephemeral-claude-startup-failed",
-                          "code": _startup_failure_code(startup_error)}), flush=True)
+        print(json.dumps(_startup_failure_record(startup_error)), flush=True)
         if workspace_validated and workspace_receipt is not None:
             cleanup_process_ids = None
             cleanup_process_group_id = None
