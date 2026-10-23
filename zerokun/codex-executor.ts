@@ -11,7 +11,7 @@ import { GROK_OAUTH_BROWSER_AUTHORIZATION } from './grok-oauth-observation.ts'
 import type { GrokChromeCapability } from './grok-oauth-chrome.ts'
 import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCliConfig } from './deployment-cli-runtime.ts'
 import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-environment.ts'
-import { browserUploadConfirmation, computerUseAppApproval, NATIVE_UPLOAD_CONFIRMATION_PROTOCOL, type NativeConfirmation, type NativeConfirmationDecision } from './native-confirmation.ts'
+import { browserUploadConfirmation, computerUseAppApproval, NATIVE_UPLOAD_CONFIRMATION_PROTOCOL } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { AdvisorRoundDeadlines, readActiveAdvisorRound, waitForAdvisorSettlement } from './advisor-settlement.ts'
@@ -4156,10 +4156,6 @@ export function buildCodexDeveloperInstructions(
       'do not establish a native proxy denial. Treat successful connect/AUTH TLS, authentication,',
       'directory listing, and upload as separate results; missing credentials do not undo a',
       'verified transport connection. Never claim an upload from a TLS-only probe.',
-      'The host can relay native Browser Use empty upload confirmations to the requesting user',
-      'in the same Slack thread. The requesting user replies 今回だけ許可 or キャンセル without a code.',
-      'The host binds that explicit reply to one delivered, live native request and returns the answer once.',
-      'Do not invent confirmation codes. A generic continue is not upload approval.',
       NATIVE_UPLOAD_CONFIRMATION_PROTOCOL,
       'For authorized primary Computer Use, the operator has enabled standing app-access permission.',
       'The host answers official app-access requests and requests Always allow when offered by the native client.',
@@ -6951,8 +6947,6 @@ export async function executeCodexJob(
     onProcessId?(processId: number): void
     onSessionId?(sessionId: string): void
     onSessionReset?(): void
-    onNativeConfirmation?(request: NativeConfirmation & { requestId: number | string; executorNonce: string },
-      signal: AbortSignal): Promise<NativeConfirmationDecision>
     onProcessExit?(exitCode: number): void
     onStdoutChunk?(value: Uint8Array): void
     onStderrChunk?(value: Uint8Array): void
@@ -8122,16 +8116,17 @@ export async function executeCodexJob(
       // turn.
       let notificationTurnId: string | null = null
       const session = new CodexAppServerSession(proc.stdin, proc.stdout, {
-        onElicitation: async ({ id, params }, signal) => {
+        onElicitation: async ({ params }, signal) => {
           if (!job.writeEnabled || signal.aborted
             || params.threadId !== monitorParentThreadId || params.turnId !== notificationTurnId) return 'cancel'
           const appApproval = advisorAttempt.computerUseEnabled ? computerUseAppApproval(params) : null
           if (appApproval) return { action: 'accept', persist: appApproval.persist }
           const confirmation = browserUploadConfirmation(params)
-          if (!job.writeEnabled || !confirmation || !options.onNativeConfirmation
-            || confirmation.threadId !== monitorParentThreadId || confirmation.turnId !== notificationTurnId) return 'cancel'
-          return options.onNativeConfirmation({ ...confirmation, requestId: id,
-            executorNonce: advisorAttempt.attemptNonce }, signal)
+          if (!confirmation) return 'cancel'
+          // Operator-approved host behavior: no extra Slack gate. The checks
+          // above bind this one response to the current writable root turn;
+          // Auto-review and tool policy denials remain separate and binding.
+          return 'accept'
         },
         onOutputChunk: value => {
           processOutputRevision += 1
