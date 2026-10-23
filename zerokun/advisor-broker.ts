@@ -143,7 +143,7 @@ import {
   ClaudeReadError,
   claudeReadFailure,
   claudeReadCommandFailure,
-  parseClaudeStartupDiagnostic,
+  parseClaudeStartupDiagnosticRecord,
   claudeStartupFailure,
   type ClaudeFailureDiagnostic,
   type ClaudeResponseAnalysis,
@@ -258,7 +258,7 @@ const CLAUDE_REQUEST_MARKER = /^REQUEST_MARKER=[0-9A-F]{32}$/
 function isEmptyClaudePromptLine(trimmedLine: string): boolean {
   if (!trimmedLine.startsWith('❯')) return false
   const remainder = trimmedLine.slice(1).replace(/\u00a0/g, ' ').trim()
-  return remainder === '' || /^Try "[^"]{0,80}"$/.test(remainder)
+  return remainder === '' || /^Try "[^"]*"$/.test(remainder)
 }
 
 export function extractCompleteClaudeResponse(transcript: string, marker: string): string | null {
@@ -1274,7 +1274,24 @@ function stripAnsi(value: string): string {
 
 export function emptyClaudePrompt(value: string): boolean {
   const normalized = stripAnsi(value)
-  const lines = normalized.split('\n').map(line => line.trim())
+  const rawLines = normalized.split('\n')
+  const border = (line: string) => /^[─━═╌╍┄┅┈┉]{3,}$/.test(line.trim())
+  // Match the helper's visible input-box reflow, never arbitrary output or a
+  // later dialog. The terminal can wrap an otherwise empty prompt's hint.
+  for (let start = 1; start < rawLines.length; start++) {
+    if (!border(rawLines[start - 1]!) || !/^\s*❯[\s\u00a0]*Try "/.test(rawLines[start]!)
+      || isEmptyClaudePromptLine(rawLines[start]!.trim())) continue
+    let end = start + 1
+    while (end < rawLines.length && !border(rawLines[end]!)) {
+      if (!rawLines[end]!.trim() || !rawLines[end]!.startsWith('  ') || rawLines[end]!.includes('❯')) break
+      end++
+    }
+    if (end > start + 1 && end < rawLines.length && border(rawLines[end]!)) {
+      const joined = rawLines.slice(start, end).map(line => line.trim()).join(' ')
+      if (isEmptyClaudePromptLine(joined)) { rawLines.splice(start, end - start, joined); break }
+    }
+  }
+  const lines = rawLines.map(line => line.trim())
   let lastPrompt = -1
   for (let index = 0; index < lines.length; index += 1) {
     if (lines[index]?.startsWith('❯')) lastPrompt = index
@@ -2135,6 +2152,7 @@ async function main(): Promise<void> {
     const diagnosticStartedAt = Date.now()
     let acquisitionStartedAt: number | undefined
     let startupCode: ClaudeFailureDiagnostic['startupCode']
+    let startupDetail: ClaudeFailureDiagnostic['startupDetail']
     const persistDiagnostic = () => {
       responseDiagnostic = saveClaudeResponseDiagnostic({
         stateDir,
@@ -2317,7 +2335,9 @@ async function main(): Promise<void> {
       })
       if (opened.timedOut || opened.forcedCleanup
         || opened.outputTruncated || opened.exitCode !== 0) {
-        startupCode = parseClaudeStartupDiagnostic(opened.stdout)
+        const startup = parseClaudeStartupDiagnosticRecord(opened.stdout)
+        startupCode = startup?.code
+        startupDetail = startup?.detail
         failure = claudeStartupFailure(startupCode)
         throw new Error(`ephemeral Claude open failed (${opened.exitCode}): ${opened.stderr}`)
       }
@@ -2578,7 +2598,7 @@ async function main(): Promise<void> {
       failure ??= classifyAdvisorFailure('claude', reason)
       diagnosticFailure = { ...diagnosticFailure, stage: failureStage, cause: failure.cause,
         operation: failureStage === 'acquisition' ? 'acquisition' : diagnosticOperation,
-        ...(startupCode ? { startupCode } : {}) }
+        ...(startupCode ? { startupCode } : {}), ...(startupDetail ? { startupDetail } : {}) }
       persistDiagnostic()
     } finally {
       if (!response && marker && target && claudeRuntime
