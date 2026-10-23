@@ -45,7 +45,7 @@ interface Execution {
   stopTracking: ReturnType<typeof setInterval>
 }
 
-function spawnCommand(context: PrimaryToolsContext, argv: string[], cwd: string) {
+export function primarySandboxCommand(context: PrimaryToolsContext, argv: string[], cwd: string) {
   verifyOfficialCodexSnapshot(context.codex)
   let overrides = context.permissionOverrides
   if (context.fingerprintDenyPath) {
@@ -60,9 +60,13 @@ function spawnCommand(context: PrimaryToolsContext, argv: string[], cwd: string)
       ? prefix + '{' + Object.entries(rules).map(([path, access]) => `${JSON.stringify(path)}=${JSON.stringify(access)}`).join(',') + '}'
       : value)
   }
-  return Bun.spawn([context.codex.physical, 'sandbox', '-C', cwd,
+  return [context.codex.physical, 'sandbox', '-C', cwd,
     ...overrides.flatMap(value => ['-c', value]),
-    '-P', context.profile, '--', ...argv], {
+    '-P', context.profile, '--', ...argv]
+}
+
+function spawnCommand(context: PrimaryToolsContext, argv: string[], cwd: string) {
+  return Bun.spawn(primarySandboxCommand(context, argv, cwd), {
     cwd, env: { ...buildCodexChildEnvironment(), ...context.shellEnvironment },
     stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', detached: true,
   })

@@ -160,6 +160,8 @@ export async function openClaudeHerdrTransport(options: {
   stateDir: string
   jobId: string
   sequence: number
+  providerLabel?: 'Antigravity'
+  environment?: Record<string, string>
   cwd: string
   executable: string
   arguments: string[]
@@ -193,15 +195,15 @@ export async function openClaudeHerdrTransport(options: {
   const receipt: Receipt = { version: 1, jobId: options.jobId, nonce, directory,
     directoryDevice: metadata.dev, directoryInode: metadata.ino,
     workspaceId: runtime.workspaceId, baselineTabIds: (await control.listTabs(runtime.workspaceId)).map(tab => tab.tabId),
-    label: `Zeroちゃん #${options.sequence} Claude ${nonce.slice(0, 8)}` }
+    label: `Zeroちゃん #${options.sequence} ${options.providerLabel ?? 'Claude'} ${nonce.slice(0, 8)}` }
   const persist = () => atomicWritePrivateFile(receiptPath, JSON.stringify(receipt))
   persist()
-  const manifest: ClaudePaneManifest = { version: 1, nonce, jobId: options.jobId,
+  const manifest: ClaudePaneManifest = { version: 1, providerLabel: options.providerLabel, nonce, jobId: options.jobId,
     cwd: realpathSync(options.cwd), socketPath: join(directory, 'host.sock'),
     registrationPath: join(registrationRoot, `${options.jobId}.json`),
     executable: snapshotClaudeExecutable(options.executable), arguments: options.arguments,
     fingerprint: options.fingerprint,
-    environment: options.environmentForTesting ?? claudeMainlineEnvironment() }
+    environment: options.environmentForTesting ?? options.environment ?? claudeMainlineEnvironment() }
   const manifestPath = join(directory, 'manifest.json')
   atomicWritePrivateFile(manifestPath, JSON.stringify(manifest))
   let socket: Socket | undefined, outputController!: ReadableStreamDefaultController<Uint8Array>
