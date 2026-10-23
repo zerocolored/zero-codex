@@ -472,6 +472,20 @@ zerochan-access write deny U0123456789
 
 ## 起動と運用
 
+### タスク開始時のGit同期
+
+書き込み権限のある通常タスクは、Codex / Claude Codeの実行前（再開時も）に対象repositoryをpullし、
+作業ファイルへリモート更新を反映します。upstreamがあればそのbranch、未設定ならremoteの既定branchを取得元にし、
+feature branchにはremoteの既定branchの更新も取り込み、現在の作業branchは維持します。developへの強制切替はしません。クラウドの新規作業場所の起点は
+従来どおりdevelop → main → masterです。
+
+未pushのcommitはmergeで保持し、無関係な未コミット変更はそのまま残します。同期失敗や競合時は
+主担当の実行を開始しません。自動stash・resetは行わないため、上書きされる変更や競合は解消後に再開してください。
+読み取り専用タスク・独立したセキュリティ監査はcheckoutを更新しません。remoteのないrepositoryと
+非Git projectは同期対象外です。push直前の同期も引き続き必要です。
+
+
+
 ```bash
 # setup後、対象projectへ移動して起動（Herdr外なら専用workspaceを自動作成）
 cd /absolute/path/to/project

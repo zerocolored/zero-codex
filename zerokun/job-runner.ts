@@ -77,6 +77,7 @@ import {
   type ProcessLockLease,
 } from './process-lock.ts'
 import { resolveZeroJobDatabasePath, resolveZeroStateDir } from './state-dir.ts'
+import { synchronizeTaskProject } from './task-start-sync.ts'
 import { CloudRuntime, CloudPreparationError, CloudControlUnavailableError, CLOUD_PREPARATION_FAILURE_MESSAGES, type CloudControl } from './cloud-runtime.ts'
 import { CLOUD_SAVE_FAILED_MESSAGE, cloudFailureReason } from './cloud-handoff.ts'
 import { createAdvisorInputSnapshot, readAdvisorInputSnapshot } from './advisor-input.ts'
@@ -608,6 +609,8 @@ type InboundDeliveryRow = {
 }
 
 export interface JobRecord {
+  /** Host-selected integration branches for managed cloud repositories. */
+  gitIntegrationBranches?: Record<string, string>
   workflow?: 'work' | 'security-audit'
   auditReportPath?: string
   auditReportUnavailable?: boolean
@@ -19305,6 +19308,7 @@ async function runCli(): Promise<void> {
             return auditResult
           }
           const executionJob = cloudRuntime?.executionJob(job) ?? job
+          await synchronizeTaskProject(executionJob, executionController.signal)
           const previousAudit = store.previousSecurityAudit(executionJob, id => !auditHasReadinessOnlyResult(dir, id))
           if (previousAudit) {
             try {

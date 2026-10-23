@@ -1,5 +1,17 @@
 # zero-codex working instructions
 
+## タスク開始前の最新コード取り込み（必須）
+
+- コードを変更するタスクは、開始時・再開時にremote、現在branch、upstream、未コミット変更を確認し、
+  remoteとbranchを明示した`git pull --no-rebase --no-edit --no-autostash`で作業ファイルまで更新してから着手する。
+  fetchだけで最新化したと扱わない。未pushのcommitや未コミット変更は保持する。
+- 現在branchにupstreamがあればそのbranchを取り込む。追跡先がない新規branchはremoteの既定branchを起点とする。
+  feature branchにはremoteの既定branchの更新も取り込む。developへ無条件に切り替えない。クラウドの新規作業場所は既存どおりdevelop、main、masterの優先順で作成する。
+- 通信・認証失敗、上書きされる未コミット変更、競合などで同期できなければ、古いコードで実装を進めず原因を報告する。
+  自動stash、reset、force-pushは禁止。競合解消は双方の変更を保持する。
+- 読み取り専用の依頼ではcheckoutを書き換えない。remoteのないローカルrepositoryと非Git projectには同期元がない。
+  これらの例外を「最新版へ同期済み」と報告しない。
+
 ## push前の最新コード取り込み（必須）
 
 - pushする前に、remote、対象branchとupstream、worktree、未コミット変更を確認し、

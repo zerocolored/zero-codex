@@ -163,6 +163,7 @@ export class CloudRuntime {
       + 'Do not call authenticated APIs with absent or still-encrypted credentials, request key rotation, read keys into the conversation, or bypass strict loading. '
       + 'Missing/unavailable settings do not prevent unrelated local investigation; report the concrete local configuration requirement if needed.\n'
     return { ...job, historyRepoPath: job.repoPath,
+      gitIntegrationBranches: Object.fromEntries(workspace.repositories.filter(r => r.integrationBranch).map(r => [realpathSync(r.root), r.integrationBranch!])),
       repoPath, resumed, sessionId: resumed ? job.sessionId : null,
       task: job.task + CONTINUATION_INSTRUCTIONS + settingsInstructions,
       attachments: [...new Set([...job.attachments, ...(existsSync(context) ? [context] : [])])] }
