@@ -191,16 +191,16 @@ describe('zerochan project selection', () => {
   test('a development clone and its worktree remain usable with an independent runtime clone', () => {
     const value = fixture()
     const git = (...args: string[]) => {
-      const result = Bun.spawnSync(['git', ...args], { stdout: 'pipe', stderr: 'pipe' })
+      const result = Bun.spawnSync([projectGitExecutable(), ...args], { stdout: 'pipe', stderr: 'pipe' })
       expect(result.exitCode, result.stderr.toString()).toBe(0)
     }
     writeFileSync(join(value.project, 'source.ts'), 'export const version = 1\n')
     git('-C', value.project, 'add', 'source.ts')
     git('-C', value.project, '-c', 'user.name=Zero Test', '-c', 'user.email=zero@example.invalid', 'commit', '-qm', 'source')
     const runtime = join(value.root, 'independent-runtime')
-    // Copy objects into an independent clone without a git-upload-pack subprocess.
-    // The updater sandbox intentionally exposes only its staged Git executable.
-    git('clone', '--local', '--no-hardlinks', '-q', value.project, runtime)
+    // The updater stages Git itself, not the developer tools' git-upload-pack shim.
+    // Use the same verified executable for the local transport subprocess.
+    git('clone', '--no-local', `--upload-pack=${projectGitExecutable()} upload-pack`, '-q', value.project, runtime)
     const worktree = join(value.root, 'development-worktree')
     git('-C', value.project, 'worktree', 'add', '-q', worktree)
     const options = { runtimeRepo: runtime, stateDir: value.state, homeDir: value.home }
