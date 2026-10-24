@@ -7,3 +7,5 @@ __pycache__/
 .letta/
 .DS_Store
 claude-channel.sh.bak-*
+
+meeting-web/public/simli.js

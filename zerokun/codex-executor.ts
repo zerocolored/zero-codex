@@ -15,6 +15,7 @@ import { linkDeploymentCliConfig, resolveDeploymentCliConfigs, type DeploymentCl
 import { nativeCliShellEnvironment, NATIVE_CONFIG_ENV_KEYS } from './native-cli-environment.ts'
 import { browserUploadConfirmation, computerUseAppApproval, NATIVE_UPLOAD_CONFIRMATION_PROTOCOL } from './native-confirmation.ts'
 import { retainDeliveredArtifacts, retainedArtifactInstructions } from './retained-artifacts.ts'
+import { meetingRecordingDirectories, meetingRecordingInstructions } from './meeting-client.ts'
 import { readNativeAdvisorRegistrations, recoverNativeAdvisorAnswers, retainedNativeAdvisorPrompt, settleNativeAdvisors } from './native-advisor-recovery.ts'
 import { AdvisorRoundDeadlines, readActiveAdvisorRound, waitForAdvisorSettlement } from './advisor-settlement.ts'
 import { ensureJobTempDirectory, existingJobTempDirectory, jobTempRoot } from './job-temp.ts'
@@ -6001,6 +6002,8 @@ export function buildCodexPermissionOverrides(
     ...(primaryWorkspaceAccess ? registeredSlackAppStatePaths(home) : []),
   ].flatMap(root => [resolve(root), ...(existsSync(root) ? [realpathSync(root)] : [])])
   for (const privateRoot of privateRoots) rules.set(privateRoot, 'deny')
+  // Narrowly reopen verified meeting data for this exact conversation; never the room credentials or registry.
+  for (const directory of meetingRecordingDirectories(state, job)) rules.set(directory, 'read')
   const systemTemp = existsSync(tmpdir()) ? realpathSync(tmpdir()) : null
   // TMPDIR is configurable. It must never turn HOME, private state, or an
   // arbitrary host directory into a writable tree. Job scratch is always open.
@@ -7136,7 +7139,7 @@ export async function executeCodexJob(
   const jobTempDir = ensureJobTempDirectory(stateDir, job.id)
   const liveInputRoot = liveControlInputDir(stateDir, job.id)
   const retainedArtifacts = retainDeliveredArtifacts(job, stateDir, liveInputRoot)
-  const priorArtifactPrompt = retainedArtifactInstructions(retainedArtifacts.manifest)
+  const priorArtifactPrompt = retainedArtifactInstructions(retainedArtifacts.manifest) + meetingRecordingInstructions(stateDir, job)
   ensureManagedDirectory(stateDir, join(stateDir, 'executors'))
   const finalOutputDir = ensureManagedDirectory(
     stateDir,

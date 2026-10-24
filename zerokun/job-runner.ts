@@ -1042,7 +1042,7 @@ CREATE TABLE IF NOT EXISTS audit_setup_history_checks (
 CREATE TABLE IF NOT EXISTS fleet_queries (
  idempotency_key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
  repo_path TEXT NOT NULL, project_key TEXT, input TEXT NOT NULL,
- route TEXT NOT NULL CHECK(route IN ('work','fleet-status','security-audit')), created_at INTEGER NOT NULL,
+ route TEXT NOT NULL CHECK(route IN ('work','fleet-status','security-audit','meeting')), created_at INTEGER NOT NULL,
  completed_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS status_notifications (
@@ -1053,7 +1053,7 @@ CREATE TABLE IF NOT EXISTS status_notifications (
   thread_ts TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN (
     'accepted', 'interrupt-accepted', 'closed-control',
-    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started', 'fleet-status'
+    'inactive-interrupt', 'attachment-control-failed', 'rate-limited', 'execution-started', 'fleet-status', 'meeting-ready'
   )),
   payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -2041,8 +2041,9 @@ function ensureJobSchemaMigrations(db: Database): void {
   }).immediate()
   db.transaction(() => {
     const schema = db.query<{sql:string},[]>("SELECT sql FROM sqlite_master WHERE name='fleet_queries'").get()!.sql
-    if (!schema.includes("'security-audit'")) {
-      db.exec(schema.replace('fleet_queries','fleet_queries_next').replace("'fleet-status'", "'fleet-status','security-audit'"))
+    if (!schema.includes("'meeting'")) {
+      const missing = ['security-audit', 'meeting'].filter(route => !schema.includes(`'${route}'`))
+      db.exec(schema.replace('fleet_queries','fleet_queries_next').replace("'fleet-status'", ["'fleet-status'", ...missing.map(route => `'${route}'`)].join(',')))
       db.exec('INSERT INTO fleet_queries_next SELECT * FROM fleet_queries; DROP TABLE fleet_queries; ALTER TABLE fleet_queries_next RENAME TO fleet_queries;')
     }
     const columns = db.query<{name:string},[]>('PRAGMA table_info(jobs)').all()
@@ -2055,7 +2056,7 @@ function ensureJobSchemaMigrations(db: Database): void {
     const schema = db.query<{ sql: string }, []>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'status_notifications'",
     ).get()!.sql
-    const missingKinds = ['execution-started', 'fleet-status'].filter(kind => !schema.includes(`'${kind}'`))
+    const missingKinds = ['execution-started', 'fleet-status', 'meeting-ready'].filter(kind => !schema.includes(`'${kind}'`))
     if (!missingKinds.length) return
     db.exec(schema.replace('status_notifications', 'status_notifications_next')
       .replace("'rate-limited'", ["'rate-limited'", ...missingKinds.map(kind => `'${kind}'`)].join(', ')))
@@ -7045,8 +7046,8 @@ export class JobStore {
     return retrySqlite(() => fail.immediate())
   }
 
-  fleetQueryRoute(key: string): 'work' | 'fleet-status' | 'security-audit' | null {
-    return this.db.query<{route:'work'|'fleet-status'|'security-audit'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
+  fleetQueryRoute(key: string): 'work' | 'fleet-status' | 'security-audit' | 'meeting' | null {
+    return this.db.query<{route:'work'|'fleet-status'|'security-audit'|'meeting'},[string]>('SELECT route FROM fleet_queries WHERE idempotency_key=?').get(key)?.route ?? null
   }
 
   fleetTriageContext(chat: string, thread: string, repo: string): string {
@@ -7168,7 +7169,7 @@ export class JobStore {
     ).all(job.chatId,job.threadTs,job.historyRepoPath??job.repoPath,job.seq).find(row => include(row.id))?.id??null
   }
 
-  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit', projectKey: string | null): void {
+  stageFleetRoute(inbound: InboundDeliveryRecord, route: 'work' | 'fleet-status' | 'security-audit' | 'meeting', projectKey: string | null): void {
     retrySqlite(()=>this.db.transaction(()=>{
       this.db.run(`INSERT OR IGNORE INTO fleet_queries (idempotency_key,chat_id,thread_ts,repo_path,project_key,input,route,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,NULL)`,[
         inbound.idempotencyKey,inbound.chatId,inbound.threadTs,inbound.repoPath,projectKey,inbound.text,route,Date.now()])
@@ -7186,6 +7187,16 @@ export class JobStore {
       if(!row)return
       this.stageStatusNotificationRow({idempotencyKey:`fleet-status:${key}`,jobId:null,chatId:row.chat_id,threadTs:row.thread_ts,kind:'fleet-status',payload,createdAt:Date.now()})
       this.db.run('UPDATE fleet_queries SET completed_at=? WHERE idempotency_key=?',[Date.now(),key])
+    }).immediate())
+  }
+
+  completeMeetingInvitation(inbound: InboundDeliveryRecord, payload: string): void {
+    retrySqlite(() => this.db.transaction(() => {
+      if (!this.db.query("SELECT 1 FROM fleet_queries WHERE idempotency_key=? AND route='meeting' AND completed_at IS NULL").get(inbound.idempotencyKey)) return
+      this.stageStatusNotificationRow({ idempotencyKey: `meeting:${inbound.idempotencyKey}`, jobId: null,
+        chatId: inbound.chatId, threadTs: inbound.threadTs, kind: 'meeting-ready', payload, createdAt: Date.now() })
+      this.db.run('UPDATE fleet_queries SET completed_at=? WHERE idempotency_key=?', [Date.now(), inbound.idempotencyKey])
+      this.tombstoneInboundDelivery(inbound.idempotencyKey)
     }).immediate())
   }
 
@@ -14426,7 +14437,7 @@ export interface CommentaryNotification {
 export type StatusNotificationKind =
   | 'accepted' | 'interrupt-accepted' | 'closed-control'
   | 'inactive-interrupt' | 'attachment-control-failed' | 'rate-limited'
-  | 'execution-started' | 'fleet-status'
+  | 'execution-started' | 'fleet-status' | 'meeting-ready'
   | 'interjection-answer'
 
 export interface StatusNotification {

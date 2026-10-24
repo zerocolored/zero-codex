@@ -1,4 +1,5 @@
 #!/usr/bin/env -S bun --config=/dev/null --no-env-file
+import { createMeetingInvitation, meetingHistory, meetingUnavailable, startMeetingSync } from './zerokun/meeting-client.ts'
 import { recoverThreadAttachments } from './zerokun/thread-attachment-recovery.ts'
 import { MAX_SLACK_ATTACHMENT_BYTES as MAX_ATTACHMENT_BYTES, SLACK_ATTACHMENT_LIMIT_LABEL } from './zerokun/slack-attachment-limits.ts'
 import { assertSlackProjectAdmission, isSlackProjectStop, SlackProjectDisconnectedError } from './zerokun/slack-project-admission.ts'
@@ -16,7 +17,6 @@ import { App } from '@slack/bolt'
 import { createSlackThreadFailureReactionApplier, createSlackThreadFailureReactionDrainer } from './zerokun/slack-thread-failure-reaction.ts'
 import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
-import { startMeetingSync } from './zerokun/meeting-client.ts'
 import {
   closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
   mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync,
@@ -1071,6 +1071,26 @@ async function downloadSlackAttachmentBatch(
   return paths
 }
 
+/** Meeting context is the actual thread, not the short routing snapshot. */
+async function readMeetingThreadContext(inbound: InboundDeliveryRecord): Promise<any[]> {
+  const messages: any[] = []
+  let cursor: string | undefined
+  const seen = new Set<string>()
+  do {
+    takeSlackMethodBudget('replies', 'owned')
+    const page = await withSlackDeadline(() => slackApp!.client.conversations.replies({
+      channel: inbound.chatId, ts: inbound.threadTs, latest: inbound.messageId,
+      inclusive: true, limit: 200, ...(cursor ? { cursor } : {}),
+    }), slackHttpTimeoutMs(), 'Meeting thread context')
+    messages.push(...(page.messages ?? []))
+    cursor = page.response_metadata?.next_cursor || undefined
+    if ((cursor && seen.has(cursor)) || messages.length > 10000) throw new Error('Meeting history pagination could not complete')
+    if (cursor) seen.add(cursor)
+    if (page.has_more && !cursor) throw new Error('Meeting history page is incomplete')
+  } while (cursor)
+  return messages
+}
+
 async function hydrateInitialThreadContext(
   inbound: InboundDeliveryRecord,
   parentSignal: AbortSignal,
@@ -1269,6 +1289,14 @@ async function drainInboundDeliveries(): Promise<void> {
                 jobStore.stageFleetRoute(inbound,route,fleetProject(inbound.repoPath)?.key??null)
               }
               if(route==='fleet-status') { void drainFleetQueries().catch(() => {}); continue }
+              if(route==='meeting') {
+                const invitation = await createMeetingInvitation({ state: STATE_DIR, repo: inbound.repoPath,
+                  chat: inbound.chatId, thread: inbound.threadTs, key: inbound.idempotencyKey,
+                  history: async () => meetingHistory(await readMeetingThreadContext(inbound), botUserId, inbound.messageId) })
+                jobStore.completeMeetingInvitation(inbound, invitation === meetingUnavailable ? invitation
+                  : `こちらから入室できます（招待は発行から24時間有効です）。\n${invitation}\n会議画面・共有画面と双方の音声を録画します。`)
+                continue
+              }
             }
             attachments = await downloadInboundFiles(
               inbound,
