@@ -1652,17 +1652,19 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
     event: {
       kind: 'request',
       text: job.task,
+      source: { userId: job.user_id, messageId: job.message_id },
       attachmentCount: parseAttachments(job.attachments_json).length,
     },
   }]
   const controls = db.query<{
     seq: number
     message_id: string
+    user_id: string
     task: string
     attachments_json: string
     created_at: number
   }, [string]>(
-    `SELECT seq, message_id, task, attachments_json, created_at
+    `SELECT seq, message_id, user_id, task, attachments_json, created_at
      FROM job_controls WHERE job_id = ? AND kind = 'steer'
      ORDER BY created_at, seq`,
   ).all(job.id)
@@ -1674,6 +1676,7 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
       event: {
         kind: 'update',
         text: control.task,
+        source: { userId: control.user_id, messageId: control.message_id },
         attachmentCount: parseAttachments(control.attachments_json).length,
       },
     })
@@ -1681,6 +1684,7 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
   const interjections = db.query<{
     seq: number
     message_id: string
+    user_id: string
     task: string
     attachments_json: string
     answer_payload: string | null
@@ -1688,7 +1692,7 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
     answered_at: number | null
     delivered_at: number | null
   }, [string]>(
-    `SELECT seq, message_id, task, attachments_json, answer_payload,
+    `SELECT seq, message_id, user_id, task, attachments_json, answer_payload,
             created_at, answered_at, delivered_at
      FROM job_interjections WHERE job_id = ?
      ORDER BY created_at, seq`,
@@ -1701,6 +1705,7 @@ function threadHistoryEventsForSettledJob(db: Database, job: JobRow): ThreadHist
         event: {
           kind: 'question',
           text: interjection.task,
+          source: { userId: interjection.user_id, messageId: interjection.message_id },
           attachmentCount: parseAttachments(interjection.attachments_json).length,
         },
       })
@@ -1873,6 +1878,8 @@ function priorAttemptThreadHistoryEvents(
   }))
   const interjections = db.query<{
     seq: number
+    user_id: string
+    message_id: string
     task: string
     attachments_json: string
     status: JobInterjectionStatus
@@ -1882,7 +1889,7 @@ function priorAttemptThreadHistoryEvents(
     answered_at: number
     delivered_at: number | null
   }, [string, number]>(
-    `SELECT seq, task, attachments_json, status, disposition, answer_payload,
+    `SELECT seq, user_id, message_id, task, attachments_json, status, disposition, answer_payload,
             created_at, answered_at, delivered_at
      FROM job_interjections
      WHERE job_id = ? AND answer_payload IS NOT NULL AND answered_at IS NOT NULL
@@ -1900,6 +1907,7 @@ function priorAttemptThreadHistoryEvents(
         event: {
           kind: 'question',
           text: interjection.task,
+          source: { userId: interjection.user_id, messageId: interjection.message_id },
           attachmentCount: parseAttachments(interjection.attachments_json).length,
         },
       })

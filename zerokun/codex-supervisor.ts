@@ -383,7 +383,9 @@ async function main(): Promise<void> {
     // runner abort/timeout signals; the executor alone decides whether the
     // resulting non-zero Codex exit is a logically completed success.
     let logicalStopDelivered = false
+    let logicalCompletionSealed = false
     const finishCompletedTurn = () => {
+      logicalCompletionSealed = true
       // A sealed logical completion is not an abort deadline. Give the direct
       // child unlimited time to emit a delayed terminal event and close its
       // relays. A later explicit parent SIGINT/SIGTERM still enters the
@@ -412,6 +414,14 @@ async function main(): Promise<void> {
     if (forceKillTimer) clearTimeout(forceKillTimer)
     stopTracking?.()
     supervisionStage = 'draining'
+    // Only a sealed terminal result plus direct-child exit authorizes this
+    // deadline. Active work and advisor acquisition retain their own budgets.
+    const testDrainGrace = Number(process.env.ZEROKUN_SUPERVISOR_TEST_DRAIN_GRACE_MS)
+    const drainGraceMs = hasTestOverride && Number.isFinite(testDrainGrace)
+      && testDrainGrace >= 25 && testDrainGrace <= 5_000 ? testDrainGrace : 60_000
+    const drainDeadline = Date.now() + drainGraceMs
+    const allowDescendantForce = () => forceCleanupRequested
+      || (logicalCompletionSealed && Date.now() >= drainDeadline)
     revision += 1
     atomicWritePrivateFile(registrationPath, serializedRegistration())
     if (hasTestOverride
@@ -447,7 +457,10 @@ async function main(): Promise<void> {
         }
         process.stderr.write(`Codex cleanup warning: generation unavailable for PID ${identity.pid}; not signaled, continuing.\n`)
       },
-      waitForForce: () => forceCleanupRequested,
+      waitForForce: allowDescendantForce,
+      onForce: () => {
+        process.stderr.write('Codex descendant cleanup: reaping exact generations after termination grace or explicit force.\n')
+      },
     })
     // Keep SIGUSR2 handled until the supervisor process itself exits. The
     // executor may seal the final file while this wrapper is draining relays
@@ -463,7 +476,7 @@ async function main(): Promise<void> {
         fingerprint,
         earliest: supervisorIdentity,
         excludePids: new Set([process.pid]),
-        waitForForce: () => forceCleanupRequested,
+        waitForForce: allowDescendantForce,
       })
     }
     // A logical job has no relay deadline. After an explicit force request,
