@@ -40,20 +40,15 @@ test('malformed goal is not treated as completed', async () => {
   await expect(readTaskGoal(session, 'root')).rejects.toThrow('invalid task goal')
 })
 
-test('blocked goal must lead the Slack reply with one concrete ask', () => {
-  // ブロック報告が「何を調べたか」から始まると、読む人には何をしてほしいのか
-  // 分からない情報の羅列になる。2026-09-28 のオーナー指摘:
-  // 「やってほしいことがあるのかないのか分からない。ただの情報しか垂れ流して
-  // いないからノイズでしかない」。冒頭1行に依頼を置かせる。
+test('blocked goal asks only for a necessary permitted action and preserves consent', () => {
   const objective = taskGoalObjective('job-1')
+  expect(objective).toContain('Only when a necessary and permitted user action remains')
   expect(objective).toContain('お願い: <who> が <what> してください')
-  // 誰に・何を・どこで、を具体名で書かせる。
-  expect(objective).toContain('Name the person or role')
-  // 調査内容や内部記録を先頭に置かせない。
-  expect(objective).toContain('Do not open with what you investigated')
-  // 依頼が無いときも、その旨を同じ1行目で言わせる（黙って情報だけ出させない）。
-  expect(objective).toContain('If you truly need nothing from the reader')
+  expect(objective).toContain('do not request the same approval again')
+  expect(objective).toContain('do not turn it into a request for the user to run the denied command')
+  expect(objective).toContain('report the actual blocker instead of inventing an ask')
 })
+
 test('completed parent collects its existing advisor round without launching a replacement', async () => {
   const goal = { objective: 'task', status: 'complete' as const }, session = fixture(goal)
   const result = await retainGoalForAdvisors(session, 'root', 'job', goal,
@@ -71,3 +66,17 @@ test.each(['paused', 'blocked', 'usageLimited', 'budgetLimited', 'active'] as co
       { phase: 'investigation', round: 1, inputRevision: 1 })).toEqual(goal)
     expect(session.calls).toHaveLength(0)
   })
+
+test('legacy goals retain their exact objective and usage; developer context supersedes old reply guidance', async () => {
+  const legacy = "If user judgment, authorization, authentication, or an external blocker is genuinely required, leave the goal blocked or paused, not complete, and open your Slack reply with one line naming the single concrete action the reader must take, in the form `お願い: <who> が <what> してください`. Name the person or role, the exact command, file path, screen, or setting, and where it is. Do not open with what you investigated, what you confirmed, or internal execution records; those belong after that line. If you truly need nothing from the reader, say so in that first line instead."
+  for (const status of ['active', 'blocked', 'paused', 'usageLimited', 'budgetLimited'] as const) {
+    const objective = 'Original approved task. ' + legacy + ' Existing delegation abc: collect its result.'
+    const session = fixture({ objective, status })
+    await ensureTaskGoal(session, 'root', 'different-job')
+    if (status === 'blocked' || status === 'paused') {
+      expect(session.calls[1]!.params).toEqual({ threadId: 'root', status: 'active' })
+    } else {
+      expect(session.calls).toHaveLength(1)
+    }
+  }
+})
