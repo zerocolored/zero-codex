@@ -110,21 +110,30 @@ export function createMeetingService(options: {
       if (!/^[a-f0-9]{64}$/.test(owner)) throw new HttpError(401, 'ブラウザの参加情報がありません')
       if (action === 'join' && request.method === 'POST') {
         if (room.expires < now() || room.ended) throw new HttpError(410, 'この会議は終了または期限切れです')
-        db.run('UPDATE rooms SET owner=? WHERE id=? AND owner IS NULL', [digest(owner), room.id])
       }
-      if (getRoom(room.id).owner !== digest(owner)) throw new HttpError(409, 'この会議は別のブラウザで参加中です')
+      const unclaimedEntry = room.owner === null && ((action === 'join' || action === 'prepare') && request.method === 'POST' || action === 'status' && request.method === 'GET')
+      if (!unclaimedEntry && room.owner !== digest(owner)) throw new HttpError(409, 'この会議は別のブラウザで参加中です')
     }
     if (action === 'join' && request.method === 'POST') return json({ project: room.project, expires: room.expires })
     if (action === 'prepare' && request.method === 'POST') {
       if (room.ended || now() > room.expires) throw new HttpError(410, 'この会議は終了または期限切れです')
       const body = z.object({ segment: uuid, mime: z.enum(['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']) }).strict().parse(await readJson(request))
-      const previous = db.query<Segment, [string]>('SELECT * FROM segments WHERE id=?').get(body.segment)
-      if (previous) {
-        if (previous.room !== room.id || previous.mime !== body.mime) throw new HttpError(409, '録画の識別情報が異なります')
-        return json({ prepared: true })
-      }
-      if (db.query('SELECT 1 FROM segments WHERE room=?').get(room.id)) throw new HttpError(409, '前回の録画を保存して、新しい会議リンクから参加してください')
-      db.run("INSERT INTO segments VALUES(?,?,?,NULL,NULL,'prepared')", [body.segment, room.id, body.mime])
+      // Claim only after the browser has microphone/audio ready. Recheck inside
+      // the transaction because readJson yields while another browser can prepare.
+      db.transaction(() => {
+        const current = getRoom(room.id)
+        if (current.ended || now() > current.expires) throw new HttpError(410, 'この会議は終了または期限切れです')
+        const owner = digest(request.headers.get('x-meeting-client') ?? '')
+        if (!admin && current.owner !== null && current.owner !== owner) throw new HttpError(409, 'この会議は別のブラウザで参加中です')
+        const previous = db.query<Segment, [string]>('SELECT * FROM segments WHERE id=?').get(body.segment)
+        if (previous) {
+          if (previous.room !== room.id || previous.mime !== body.mime) throw new HttpError(409, '録画の識別情報が異なります')
+          return
+        }
+        if (db.query('SELECT 1 FROM segments WHERE room=?').get(room.id)) throw new HttpError(409, '前回の録画を保存して、新しい会議リンクから参加してください')
+        if (!admin) db.run('UPDATE rooms SET owner=? WHERE id=? AND owner IS NULL', [owner, room.id])
+        db.run("INSERT INTO segments VALUES(?,?,?,NULL,NULL,'prepared')", [body.segment, room.id, body.mime])
+      }).immediate()
       return json({ prepared: true })
     }
     if (action === 'avatar' && request.method === 'POST') {

@@ -171,3 +171,21 @@ test('zero-chunk failed calls finalize and sync without creating an empty video'
  expect((await (await f.send(base+'/status')).json() as any).state).toBe('local_verified')
  }finally{f.close();rmSync(state,{recursive:true,force:true})}
 })
+
+test('opening an invite does not claim it; preparing atomically admits just one browser',async()=>{
+ const f=fixture();try{
+  const room=await f.create(),base=`/api/rooms/${room.id}`,invite=new URL(room.url).hash.slice(1)
+  const mobile={'x-meeting-client':'c'.repeat(64)},desktop={'x-meeting-client':'d'.repeat(64)}
+  expect((await f.send(base+'/join','POST',{},invite,mobile)).status).toBe(200)
+  expect((await f.send(base+'/status','GET',undefined,invite,mobile)).status).toBe(200)
+  expect((await f.send(base+'/avatar','POST',{segment:crypto.randomUUID()},invite,mobile)).status).toBe(409)
+  expect((await f.send(base+'/prepare','POST',{segment:'invalid',mime:'video/webm'},invite,mobile)).status).toBe(400)
+  expect((await f.send(base+'/join','POST',{},invite,desktop)).status).toBe(200)
+  const body={segment:crypto.randomUUID(),mime:'video/webm'}
+  const results=await Promise.all([f.send(base+'/prepare','POST',body,invite,desktop),f.send(base+'/prepare','POST',{...body,segment:crypto.randomUUID()},invite,mobile)])
+  expect(results.map(r=>r.status).sort()).toEqual([200,409]);expect(f.calls).toHaveLength(0)
+  const winner=results[0]!.status===200?desktop:mobile,loser=winner===desktop?mobile:desktop
+  expect((await f.send(base+'/join','POST',{},invite,winner)).status).toBe(200)
+  expect((await f.send(base+'/join','POST',{},invite,loser)).status).toBe(409)
+ }finally{f.close()}
+})

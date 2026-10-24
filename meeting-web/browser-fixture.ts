@@ -16,9 +16,10 @@ writeFileSync(join(directory,'meetings','a'.repeat(64)+'.json'),JSON.stringify({
 const fixtureScript=String.raw`
 const nativeFetch=window.fetch.bind(window),NativePeer=window.RTCPeerConnection;
 let remotePeer,remoteContext,micContext,sessionAt,screenAt,endedAt;
+document.querySelector("#join").addEventListener("click",()=>{void micContext?.resume()});
 document.querySelector("#end").addEventListener("click",()=>{endedAt=Date.now()});
 function tone(frequency){const context=new AudioContext(),osc=context.createOscillator(),gain=context.createGain(),out=context.createMediaStreamDestination();osc.frequency.value=frequency;gain.gain.value=.14;osc.connect(gain).connect(out);osc.start();context.resume();return {context,stream:out.stream}}
-navigator.mediaDevices.getUserMedia=async()=>{const t=tone(440);micContext=t.context;return t.stream};
+navigator.mediaDevices.getUserMedia=async()=>{if(${process.env.MEETING_FIXTURE_MIC_WAIT==='1'})await new Promise(()=>{});const t=tone(440);micContext=t.context;return t.stream};
 navigator.mediaDevices.getDisplayMedia=async()=>{screenAt=Date.now();const c=document.createElement('canvas');c.width=1280;c.height=720;const x=c.getContext('2d');x.fillStyle='#156644';x.fillRect(0,0,1280,720);x.fillStyle='white';x.font='70px sans-serif';x.fillText('共有画面テスト',120,360);return c.captureStream(15)};
 window.fetch=async(input,init)=>{
  const response=await nativeFetch(input,init);

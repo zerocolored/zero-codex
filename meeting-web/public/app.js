@@ -10,11 +10,13 @@ const hash = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-2
 let db, meta, mic, display, pc, events, context, mix, analyser, recorder, recordedStream, paintTimer, uploadTimer, statusTimer
 let mediaGeneration=0, liveSource, audioOnly=false, avatarSource, greeting, avatarClient, avatarContext, audioPump, speakerGain, disconnectTimer, durationTimer, visionTimer, visionBusy=false, lastVisionAt=0, shareGeneration=0
 let sessionClosed = false, sessionReady = false, greeted = false
+let starting=false, cancelled=false, resumeAudio
 let releaseTab
 let recording = false, ending = false, uploading = false, storageQueue = Promise.resolve(), storageError = false
 let seq = 0, volatile = []
 const canvas = $('scene'), ctx = canvas.getContext('2d'), samples = new Float32Array(256)
-const state = text => { $('status').textContent = text }
+const state = text => { $('status').textContent = text; $('entryStatus').textContent = text; $('permissionHint').hidden=$('permissionHelp').hidden=text!=='マイクの許可を待っています' }
+const offerRetry = () => { $('join').textContent='接続を再試行'; $('join').hidden=false; $('join').disabled=false }
 const transaction = (store, mode, action) => new Promise((resolve,reject) => {
   const tx = db.transaction(store,mode), request = action(tx.objectStore(store))
   tx.oncomplete = () => resolve(request?.result); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error)
@@ -77,6 +79,7 @@ function releaseMedia(){
 }
 async function finish() {
   if(ending)return;ending=true;$('end').disabled=true
+  if(!recording&&!meta?.stopped){cancelled=true;releaseMedia();resumeAudio?.();$('join').hidden=true;state('会議を終了しました');if(meta?.segment)void post('hangup',{segment:meta.segment}).catch(()=>{});ending=false;return}
   try{
     if(sessionReady&&!sessionClosed&&events?.readyState==='open'){
       state('会話を終了しています');events.send(JSON.stringify({type:'session.close'}))
@@ -113,32 +116,45 @@ async function iceComplete(connection){
   if(connection.iceGatheringState==='complete')return
   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{connection.removeEventListener('icegatheringstatechange',listen);reject(new Error('音声接続の準備がタイムアウトしました'))},15000);function listen(){if(connection.iceGatheringState==='complete'){clearTimeout(timer);connection.removeEventListener('icegatheringstatechange',listen);resolve()}}connection.addEventListener('icegatheringstatechange',listen)})
 }
-$('join').onclick=async()=>{
-  $('join').disabled=true
+async function startMeeting(){
+  if(starting||cancelled)return;starting=true
+  $('join').hidden=true;$('end').disabled=false
   const generation=++mediaGeneration;sessionClosed=false;sessionReady=false;greeted=false;audioOnly=false
+  const check=()=>{if(generation!==mediaGeneration||cancelled)throw new DOMException('接続を中止しました','AbortError')}
+  const step=async promise=>{const result=await promise;check();return result}
   try{
     if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder||!canvas.captureStream)throw new Error('録画対応のChromeまたはEdgeで開いてください')
     const mime=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(t=>MediaRecorder.isTypeSupported(t))
     if(!mime)throw new Error('このブラウザは録画形式に対応していません')
-    mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false})
-    context=new AudioContext();await context.resume();mix=context.createMediaStreamDestination();analyser=context.createAnalyser();analyser.fftSize=256
+    const joined=await step(post('join',{}));meta.project=joined.project
+    state('マイクの許可を待っています')
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false})
+    if(generation!==mediaGeneration||cancelled){stream.getTracks().forEach(t=>t.stop());check()}
+    mic=stream
+    context=new AudioContext();avatarContext=new AudioContext({sampleRate:16000})
+    await step(new Promise(resolve=>{
+      const ready=()=>{if(cancelled||(context.state==='running'&&avatarContext?.state==='running')){context.removeEventListener('statechange',ready);avatarContext?.removeEventListener('statechange',ready);resumeAudio=null;$('join').hidden=true;resolve()}}
+      resumeAudio=()=>{void context.resume().catch(()=>{});void avatarContext?.resume().catch(()=>{});ready()}
+      context.addEventListener('statechange',ready);avatarContext.addEventListener('statechange',ready)
+      state('音声を準備しています');$('join').textContent='音声を開始';$('join').disabled=false;$('join').hidden=false;resumeAudio()
+    }));mix=context.createMediaStreamDestination();analyser=context.createAnalyser();analyser.fftSize=256
     context.createMediaStreamSource(mic).connect(mix)
-    const joined=await post('join',{});meta.project=joined.project;meta.segment=meta.segment||crypto.randomUUID();meta.mime=mime;meta.startedAt=Date.now();meta.stopped=false;meta.count=0;seq=0;await saveMeta()
-    await post('prepare',{segment:meta.segment,mime})
+    meta.segment=meta.segment||crypto.randomUUID();meta.mime=mime;meta.startedAt=Date.now();meta.stopped=false;meta.count=0;seq=0;await step(saveMeta())
+    await step(post('prepare',{segment:meta.segment,mime}))
     speakerGain=context.createGain();speakerGain.connect(context.destination)
     const avatarLost=()=>{if(generation!==mediaGeneration||audioOnly)return;audioOnly=true;avatarSource?.disconnect();audioPump?.disconnect();avatarContext?.close().catch(()=>{});if(liveSource){liveSource.connect(mix);liveSource.connect(speakerGain)}state('映像に接続できません。音声のみで続けます')}
     try{
-      state('映像に接続しています');const avatarSession=await post('avatar',{segment:meta.segment})
+      state('映像に接続しています');const avatarSession=await step(post('avatar',{segment:meta.segment}))
       const client=new SimliClient(avatarSession.session_token,$('avatar'),$('avatarAudio'),avatarSession.iceServers,LogLevel.ERROR,'p2p');avatarClient=client
       client.on('error',avatarLost);client.on('stop',avatarLost)
       $('avatarAudio').muted=true
       const attachAvatarAudio=()=>{const stream=$('avatarAudio').srcObject;if(audioOnly||generation!==mediaGeneration)return;if(!(stream instanceof MediaStream)||!stream.getAudioTracks().length)return;avatarSource?.disconnect();avatarSource=context.createMediaStreamSource(stream);avatarSource.connect(mix);avatarSource.connect(speakerGain)}
       $('avatarAudio').onloadedmetadata=attachAvatarAudio
       let timer;try{await Promise.race([client.start(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Avatar timeout')),25000)})])}finally{clearTimeout(timer)}
-      attachAvatarAudio()
-      if(!audioOnly){avatarContext=new AudioContext({sampleRate:16000});await avatarContext.resume();await avatarContext.audioWorklet.addModule('/pcm-worklet.js');audioPump=new AudioWorkletNode(avatarContext,'pcm16');audioPump.port.onmessage=e=>{if(!audioOnly)client.sendAudioData(new Uint8Array(e.data))};audioPump.connect(avatarContext.destination)}
+      check();attachAvatarAudio()
+      if(!audioOnly){await step(avatarContext.audioWorklet.addModule('/pcm-worklet.js'));audioPump=new AudioWorkletNode(avatarContext,'pcm16');audioPump.port.onmessage=e=>{if(!audioOnly)client.sendAudioData(new Uint8Array(e.data))};audioPump.connect(avatarContext.destination)}
     }catch{avatarLost();const failed=avatarClient;avatarClient=null;void failed?.stop().catch(()=>{})}
-    pc=new RTCPeerConnection();mic.getTracks().forEach(t=>pc.addTrack(t,mic));events=pc.createDataChannel('oai-events')
+    check();pc=new RTCPeerConnection();mic.getTracks().forEach(t=>pc.addTrack(t,mic));events=pc.createDataChannel('oai-events')
     events.onmessage=event=>{try{const data=JSON.parse(event.data);if(data.type==='session.started'){sessionReady=true;state(audioOnly?'映像に接続できません。音声のみで続けます':'');if(!greeted){greeted=true;events.send(JSON.stringify({type:'session.commentary.append',event_id:'greeting_'+meta.segment,delegation_id:null,content:greeting}))}}if(data.type==='session.closed'){sessionClosed=true;if(!ending)void finish()}if(data.type==='error'){state('音声サービスで一部の処理に失敗しました。会話を続けられます')}}catch{}}
     pc.ontrack=event=>{const stream=new MediaStream([event.track]);$('remoteAudio').srcObject=stream;$('remoteAudio').muted=true;void $('remoteAudio').play();liveSource=context.createMediaStreamSource(stream);if(!audioOnly)avatarContext.createMediaStreamSource(stream).connect(audioPump);if(audioOnly){liveSource.connect(mix);liveSource.connect(speakerGain)}}
     recordedStream=new MediaStream([...canvas.captureStream(30).getVideoTracks(),...mix.stream.getAudioTracks()])
@@ -152,8 +168,8 @@ $('join').onclick=async()=>{
     recorder.onerror=()=>{state('録画が停止しました。取得済みの録画を保存します');void finish()}
     // Recording begins before the session can produce its first audio.
 
-    const offer=await pc.createOffer();await pc.setLocalDescription(offer);await iceComplete(pc)
-    const hour=new Date().getHours(),greetingText=hour<11?'おはようございます':hour<18?'こんにちは':'こんばんは';greeting='今すぐ日本語で「'+greetingText+'、ゼロちゃんです。タスクの内容について聞かせていただけますか？」と挨拶して、返事を待ってください。';state('音声に接続しています');const answer=await post('session',{segment:meta.segment,mime,sdp:pc.localDescription.sdp,hour});recorder.start(3000);recording=true;uploadTimer=setInterval(flush,4000);await pc.setRemoteDescription({type:'answer',sdp:answer.sdp})
+    const offer=await step(pc.createOffer());await step(pc.setLocalDescription(offer));await step(iceComplete(pc))
+    const hour=new Date().getHours(),greetingText=hour<11?'おはようございます':hour<18?'こんにちは':'こんばんは';greeting='今すぐ日本語で「'+greetingText+'、ゼロちゃんです。タスクの内容について聞かせていただけますか？」と挨拶して、返事を待ってください。';state('音声に接続しています');const answer=await post('session',{segment:meta.segment,mime,sdp:pc.localDescription.sdp,hour});if(generation!==mediaGeneration||cancelled){void post('hangup',{segment:meta.segment}).catch(()=>{});check()}recorder.start(3000);recording=true;uploadTimer=setInterval(flush,4000);await step(pc.setRemoteDescription({type:'answer',sdp:answer.sdp}))
     pc.onconnectionstatechange=()=>{
       if(pc.connectionState==='connected'){clearTimeout(disconnectTimer);if(sessionReady)state(audioOnly?'映像に接続できません。音声のみで続けます':'')}
       if(pc.connectionState==='disconnected'&&!ending){state('再接続を待っています');clearTimeout(disconnectTimer);disconnectTimer=setTimeout(()=>{if(pc.connectionState==='disconnected')void finish()},15000)}
@@ -162,10 +178,17 @@ $('join').onclick=async()=>{
     $('entry').hidden=true;$('speaker').disabled=$('mute').disabled=$('end').disabled=false;$('share').disabled=!navigator.mediaDevices.getDisplayMedia;if(!sessionReady)state('音声に接続しています')
     visionTimer=setInterval(describeScreen,15000)
     durationTimer=setTimeout(()=>{if(recording)void finish()},2*60*60*1000)
-  }catch(error){state(error.message);if(recorder?.state==='recording'){await finish()}else{releaseMedia();if(!meta.segment){$('join').disabled=false;return}try{const status=await api('status');if(status.retryable)$('join').disabled=false;else if(meta.segment){meta.stopped=true;await saveMeta();$('entry').hidden=true;$('retry').hidden=false;state('接続を終了して保存を確定してください')}}catch{$('join').disabled=false}}}
+  }catch(error){
+    if(cancelled||generation!==mediaGeneration)return
+    const message=error.name==='NotAllowedError'?'マイクを許可してから接続を再試行してください':error.name==='NotFoundError'?'マイクを接続してから再試行してください':error.name==='NotReadableError'?'マイクを使用中のアプリを閉じて再試行してください':error.message
+    state(message)
+    if(recorder?.state==='recording')await finish()
+    else{releaseMedia();if(!meta.segment)offerRetry();else try{const status=await api('status');if(status.retryable)offerRetry();else{meta.stopped=true;await saveMeta();$('entry').hidden=true;$('retry').hidden=false;state('接続を終了して保存を確定してください')}}catch{offerRetry()}}
+  }finally{starting=false}
 }
+$('join').onclick=()=>resumeAudio?resumeAudio():startMeeting()
 window.addEventListener('beforeunload',event=>{if(recording||(!meta?.finished&&meta?.segment)){event.preventDefault();event.returnValue=''}})
-window.addEventListener('pagehide',()=>{if(meta?.segment&&!meta.finished)void fetch(`/api/rooms/${room}/hangup`,{method:'POST',keepalive:true,headers:{authorization:`Bearer ${token}`,'x-meeting-client':meta.client,'content-type':'application/json'},body:JSON.stringify({segment:meta.segment})}).catch(()=>{});releaseMedia();releaseTab?.()})
+window.addEventListener('pagehide',()=>{cancelled=true;resumeAudio?.();if(meta?.segment&&!meta.finished)void fetch(`/api/rooms/${room}/hangup`,{method:'POST',keepalive:true,headers:{authorization:`Bearer ${token}`,'x-meeting-client':meta.client,'content-type':'application/json'},body:JSON.stringify({segment:meta.segment})}).catch(()=>{});releaseMedia();releaseTab?.()})
 window.addEventListener('pageshow',event=>{if(event.persisted)location.reload()})
 async function init(){
   if(!/^[a-f0-9-]{36}$/.test(room||'')||!/^[a-f0-9]{64}$/.test(token)){state('Slackで受け取った招待リンクから開いてください');$('join').disabled=true;return}
@@ -173,8 +196,8 @@ async function init(){
   if(!releaseTab){state('別のタブで会議を開いています。そちらを閉じてから再読み込みしてください');$('join').disabled=true;return}
   db=await new Promise((resolve,reject)=>{const request=indexedDB.open('zero-hearing',1);request.onupgradeneeded=()=>{request.result.createObjectStore('meta');request.result.createObjectStore('chunks')};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)})
   meta=await transaction('meta','readonly',s=>s.get(key))||{client:random()};await saveMeta()
-  if(meta.segment&&!meta.finished){const status=await api('status');if(status.retryable){meta.stopped=false;meta.count=0;await saveMeta();$('join').disabled=false;return}}
+  if(meta.segment&&!meta.finished){const status=await api('status');if(status.retryable&&(await chunks()).length===0){meta.stopped=false;meta.count=0;await saveMeta();void startMeeting();return}}
   if(meta.segment){$('entry').hidden=true;$('download').hidden=false;try{seq=recoverRecordingCount(await chunks());meta.count=seq;await saveMeta()}catch(error){state(error.message);return}if(meta.finished){state('会議は終了しています');}else{meta.stopped=true;$('retry').hidden=false;state(seq?'前回の録画が残っています。保存を再試行してください':'接続を終了して保存を確定してください')}}
-  else $('join').disabled=false
+  else void startMeeting()
 }
 init().catch(error=>{state(error.message||'録画の保存領域を開けません。ブラウザのストレージを許可してください');$('join').disabled=true})
