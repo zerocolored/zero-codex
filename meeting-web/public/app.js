@@ -7,13 +7,14 @@ const token = location.hash.slice(1)
 const key = `meeting:${room}`
 const random = () => [...crypto.getRandomValues(new Uint8Array(32))].map(n => n.toString(16).padStart(2,'0')).join('')
 const hash = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n => n.toString(16).padStart(2,'0')).join('')
-let db, meta, mic, display, pc, events, context, mix, analyser, recorder, recordedStream, paintTimer, uploadTimer, statusTimer
+let db, meta, mic, display, pc, events, context, mix, analyser, recorder, recordedStream, paintTimer, uploadTimer
 let mediaGeneration=0, liveSource, audioOnly=false, avatarSource, greeting, avatarClient, avatarContext, audioPump, speakerGain, disconnectTimer, durationTimer, visionTimer, visionBusy=false, lastVisionAt=0, shareGeneration=0
 let sessionClosed = false, sessionReady = false, greeted = false
 let starting=false, cancelled=false, resumeAudio
 let releaseTab
 let recording = false, ending = false, uploading = false, storageQueue = Promise.resolve(), storageError = false
 let seq = 0, volatile = []
+const uploadedSeq = new Set()
 const canvas = $('scene'), ctx = canvas.getContext('2d'), samples = new Float32Array(256)
 const state = text => { $('status').textContent = text; $('entryStatus').textContent = text; $('permissionHint').hidden=$('permissionHelp').hidden=text!=='マイクの許可を待っています' }
 const offerRetry = () => { $('join').textContent='接続を再試行'; $('join').hidden=false; $('join').disabled=false }
@@ -31,15 +32,16 @@ async function api(action, options={}) {
 }
 const post = (action,body) => api(action,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
 function contain(video,x,y,w,h){
-  if(video.readyState<2||!video.videoWidth)return
+  if(!video.srcObject?.getVideoTracks().some(t=>t.readyState==='live')||video.readyState<2||!video.videoWidth)return
   const scale=Math.min(w/video.videoWidth,h/video.videoHeight)
   ctx.drawImage(video,x+(w-video.videoWidth*scale)/2,y+(h-video.videoHeight*scale)/2,video.videoWidth*scale,video.videoHeight*scale)
 }
 function paint(){
   ctx.fillStyle='#ffffff';ctx.fillRect(0,0,1280,720)
   const sharing=display?.getVideoTracks().some(t=>t.readyState==='live')
-  if(sharing){contain($('screen'),0,0,1118,720);contain($('avatar'),1130,8,142,180)}
-  else contain($('avatar'),0,0,1280,700)
+  const showingAvatar=avatarClient&&!audioOnly
+  if(sharing){contain($('screen'),0,0,1118,720);if(showingAvatar)contain($('avatar'),1130,8,142,180)}
+  else if(showingAvatar)contain($('avatar'),0,0,1280,700)
 }
 paintTimer=setInterval(paint,1000/30);paint()
 async function describeScreen(){
@@ -61,40 +63,43 @@ async function flush() {
   uploading=true
   try {
     await storageQueue
-    for(const chunk of await chunks()) {
-      if(chunk.uploaded)continue
+    // Memory-held chunks use the same verified upload even if browser storage is full.
+    const pending=[...await chunks(),...volatile]
+    for(const chunk of pending) {
+      if(chunk.uploaded||uploadedSeq.has(chunk.seq))continue
       const bytes=await chunk.blob.arrayBuffer(), digest=await hash(bytes)
       const ack=await api(`chunks/${meta.segment}/${chunk.seq}`,{method:'PUT',headers:{'content-type':'application/octet-stream','x-content-sha256':digest},body:bytes})
       if(ack.hash!==digest)throw new Error('録画の保存確認に失敗しました')
-      chunk.uploaded=true;await transaction('chunks','readwrite',s=>s.put(chunk,`${room}:${chunk.seq}`))
+      chunk.uploaded=true;uploadedSeq.add(chunk.seq)
+      if(!volatile.includes(chunk))try{await transaction('chunks','readwrite',s=>s.put(chunk,`${room}:${chunk.seq}`))}catch{/* Re-upload is idempotent after a reload. */}
     }
-    $('saveState').textContent=meta.stopped?'録画をサーバーに保存中':'';$('retry').hidden=true
+    $('saveState').textContent='';$('retry').hidden=true
   }catch(error){state(error.message);$('retry').hidden=false;$('saveState').textContent='未送信の録画はこのブラウザに保持しています'}
   finally{uploading=false}
 }
 function releaseMedia(){
   mediaGeneration++;const oldAvatar=avatarClient;avatarClient=null;void oldAvatar?.stop().catch(()=>{});
   clearInterval(uploadTimer);clearTimeout(disconnectTimer);clearTimeout(durationTimer);clearInterval(visionTimer);shareGeneration++;audioPump?.disconnect();avatarContext?.close().catch(()=>{});pc?.close();mic?.getTracks().forEach(t=>t.stop());display?.getTracks().forEach(t=>t.stop());recordedStream?.getTracks().forEach(t=>t.stop());context?.close().catch(()=>{});$('remoteAudio').srcObject=null;liveSource=null;avatarSource=null;avatarContext=null;audioPump=null;recording=false
+  $('avatar').srcObject=null;$('screen').srcObject=null;paint()
   $('speaker').disabled=$('mute').disabled=$('share').disabled=$('end').disabled=true
 }
 async function finish() {
   if(ending)return;ending=true;$('end').disabled=true
-  if(!recording&&!meta?.stopped){cancelled=true;releaseMedia();resumeAudio?.();$('join').hidden=true;state('会議を終了しました');if(meta?.segment)void post('hangup',{segment:meta.segment}).catch(()=>{});ending=false;return}
+  if(!recording&&!meta?.stopped){cancelled=true;releaseMedia();resumeAudio?.();$('join').hidden=true;state('');$('entry').hidden=true;if(meta?.segment)void post('hangup',{segment:meta.segment}).catch(()=>{});ending=false;return}
   try{
     if(sessionReady&&!sessionClosed&&events?.readyState==='open'){
-      state('会話を終了しています');events.send(JSON.stringify({type:'session.close'}))
+      state('');events.send(JSON.stringify({type:'session.close'}))
       await new Promise(resolve=>{const timeout=setTimeout(done,15000);function done(){clearTimeout(timeout);events.removeEventListener('message',listen);resolve()}function listen(event){try{if(JSON.parse(event.data).type==='session.closed')done()}catch{}}events.addEventListener('message',listen)})
     }
     if(recorder?.state==='recording') await new Promise(resolve=>{recorder.addEventListener('stop',resolve,{once:true});recorder.stop()})
     releaseMedia();await storageQueue
-    meta.stopped=true;meta.count=seq;await saveMeta();$('download').hidden=false
-    state('録画を保存しています。このページを閉じずにお待ちください');await flush()
-    const saved=await chunks()
-    if(storageError||saved.length!==meta.count||saved.some(c=>!c.uploaded))throw new Error('未保存の録画があります。保存を再試行するか、録画をダウンロードしてください')
-    await post('finish',{segment:meta.segment,count:meta.count});meta.finished=true;await saveMeta()
-    state('会議を終了しました');$('retry').hidden=true
-    $('saveState').textContent='ローカル端末への回収を待っています'
-    statusTimer=setInterval(async()=>{try{const result=await api('status');if(result.state==='local_verified'){$('saveState').textContent='プロジェクトの端末に録画を保存しました';clearInterval(statusTimer)}}catch{}},5000)
+    meta.stopped=true;meta.count=seq;try{await saveMeta()}catch{/* Keep metadata in memory while recovering a full browser store. */}
+    state('');await flush()
+    const saved=[...await chunks(),...volatile]
+    if(recoverRecordingCount(saved)!==seq||saved.some(c=>!c.uploaded&&!uploadedSeq.has(c.seq)))throw new Error('未保存の録画があります。保存を再試行してください')
+    await post('finish',{segment:meta.segment,count:seq});meta.finished=true;try{await saveMeta()}catch{/* Server has confirmed every chunk. */}volatile=[];storageError=false
+    state('');$('entry').hidden=true;$('retry').hidden=true
+    $('saveState').textContent=''
   }catch(error){state(error.message);$('retry').hidden=false}
   finally{ending=false}
 }
@@ -102,15 +107,15 @@ $('retry').onclick=()=>meta.stopped?finish():flush()
 $('end').onclick=finish
 $('speaker').onclick=()=>{const muted=$('speaker').getAttribute('aria-pressed')!=='true';$('speaker').setAttribute('aria-pressed',String(muted));$('speaker').setAttribute('aria-label',muted?'スピーカーのミュートを解除':'ミュート');speakerGain.gain.value=muted?0:1}
 $('mute').onclick=()=>{const muted=mic.getAudioTracks()[0].enabled;mic.getAudioTracks().forEach(t=>t.enabled=!muted);$('mute').setAttribute('aria-pressed',String(muted));$('mute').setAttribute('aria-label',muted?'マイクをオン':'マイクオフ')}
-$('share').onclick=async()=>{
-  if(display?.getVideoTracks().some(t=>t.readyState==='live')){display.getTracks().forEach(t=>t.stop());display=null;shareGeneration++;$('share').setAttribute('aria-pressed','false');$('shareLabel').textContent='画面共有';return}
-  try{display=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});$('screen').srcObject=display;await $('screen').play();$('shareLabel').textContent='共有を停止';$('share').setAttribute('aria-pressed','true');shareGeneration++;void describeScreen();display.getVideoTracks()[0].onended=()=>{shareGeneration++;$('share').setAttribute('aria-pressed','false');$('shareLabel').textContent='画面共有';if(events?.readyState==='open')events.send(JSON.stringify({type:'session.thinking.append',delegation_id:null,content:'画面共有は終了しました。以前の画面を現在の画面として扱わないでください。'}))}}
-  catch{state('画面共有は開始されませんでした。会話は続けられます')}
+function stopSharing(){
+  const old=display;display=null;old?.getTracks().forEach(t=>t.stop());$('screen').srcObject=null;shareGeneration++
+  $('share').setAttribute('aria-pressed','false');$('shareLabel').textContent='画面共有'
+  if(events?.readyState==='open')events.send(JSON.stringify({type:'session.thinking.append',delegation_id:null,content:'画面共有は終了しました。以前の画面を現在の画面として扱わないでください。'}))
 }
-$('download').onclick=async()=>{
-  const stored=await chunks(), bySeq=new Map(stored.map(c=>[c.seq,c.blob]));for(const c of volatile)bySeq.set(c.seq,c.blob)
-  const blob=new Blob([...bySeq.entries()].sort((a,b)=>a[0]-b[0]).map(c=>c[1]),{type:meta.mime})
-  const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${room}-${meta.segment}.${meta.mime.includes('mp4')?'mp4':'webm'}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000)
+$('share').onclick=async()=>{
+  if(display?.getVideoTracks().some(t=>t.readyState==='live')){stopSharing();return}
+  try{display=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});$('screen').srcObject=display;await $('screen').play();$('shareLabel').textContent='共有を停止';$('share').setAttribute('aria-pressed','true');shareGeneration++;void describeScreen();display.getVideoTracks()[0].onended=stopSharing}
+  catch{state('画面共有は開始されませんでした。会話は続けられます')}
 }
 async function iceComplete(connection){
   if(connection.iceGatheringState==='complete')return
@@ -163,7 +168,7 @@ async function startMeeting(){
       if(!event.data.size)return
       // Split large browser blobs without changing their byte order or container.
       for(let offset=0;offset<event.data.size;offset+=4*1024*1024){const chunk={room,seq:seq++,blob:event.data.slice(offset,offset+4*1024*1024),uploaded:false};volatile.push(chunk)
-        storageQueue=storageQueue.then(async()=>{meta.count=await persistRecordingChunk(db,key,meta,chunk);volatile=volatile.filter(c=>c!==chunk)}).catch(()=>{storageError=true;state('ブラウザへの録画保存に失敗しました。会議を終了して録画をダウンロードしてください');$('download').hidden=false;void finish()})}
+        storageQueue=storageQueue.then(async()=>{meta.count=await persistRecordingChunk(db,key,meta,chunk);volatile=volatile.filter(c=>c!==chunk)}).catch(()=>{storageError=true;state('録画を保存できません。ページを閉じずに保存を再試行してください');void finish()})}
     }
     recorder.onerror=()=>{state('録画が停止しました。取得済みの録画を保存します');void finish()}
     // Recording begins before the session can produce its first audio.
@@ -197,7 +202,7 @@ async function init(){
   db=await new Promise((resolve,reject)=>{const request=indexedDB.open('zero-hearing',1);request.onupgradeneeded=()=>{request.result.createObjectStore('meta');request.result.createObjectStore('chunks')};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)})
   meta=await transaction('meta','readonly',s=>s.get(key))||{client:random()};await saveMeta()
   if(meta.segment&&!meta.finished){const status=await api('status');if(status.retryable&&(await chunks()).length===0){meta.stopped=false;meta.count=0;await saveMeta();void startMeeting();return}}
-  if(meta.segment){$('entry').hidden=true;$('download').hidden=false;try{seq=recoverRecordingCount(await chunks());meta.count=seq;await saveMeta()}catch(error){state(error.message);return}if(meta.finished){state('会議は終了しています');}else{meta.stopped=true;$('retry').hidden=false;state(seq?'前回の録画が残っています。保存を再試行してください':'接続を終了して保存を確定してください')}}
+  if(meta.segment){$('entry').hidden=true;try{seq=recoverRecordingCount(await chunks());meta.count=seq;await saveMeta()}catch(error){state(error.message);return}if(meta.finished){state('');}else{meta.stopped=true;$('retry').hidden=false;state(seq?'前回の録画が残っています。保存を再試行してください':'接続を終了して保存を確定してください')}}
   else void startMeeting()
 }
 init().catch(error=>{state(error.message||'録画の保存領域を開けません。ブラウザのストレージを許可してください');$('join').disabled=true})

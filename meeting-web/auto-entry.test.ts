@@ -7,18 +7,18 @@ const source=readFileSync(new URL('./public/app.js',import.meta.url),'utf8').rep
 const tick=()=>new Promise(resolve=>setTimeout(resolve,0))
 function setup({denied=false,blocked=false,savedMeta=null,savedChunks=[]}: {denied?:boolean;blocked?:boolean;savedMeta?:any;savedChunks?:any[]}={}){
   const elements=new Map<string,any>(),calls:string[]=[],listeners=new Map<string,Function>()
-  let grant:(value:any)=>void=()=>{},stopped=0,requests=0
+  let grant:(value:any)=>void=()=>{},stopped=0,requests=0,draws=0
   const track={stop(){stopped++}},stream={getTracks:()=>[track]}
-  const element=(id:string)=>{if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',getContext:()=>({fillRect(){}}),captureStream(){},getAttribute(){},setAttribute(){}});return elements.get(id)}
+  const element=(id:string)=>{if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',getContext:()=>({fillRect(){},drawImage(){draws++}}),captureStream(){},getAttribute(){},setAttribute(){}});return elements.get(id)}
   class Audio extends EventTarget{state='suspended';resume(){return new Promise(()=>{})}close(){this.state='closed';return Promise.resolve()}}
   const db={transaction(){const tx:any={objectStore:(name:string)=>({get:()=>{const request={result:savedMeta};queueMicrotask(()=>tx.oncomplete?.());return request},put:()=>{queueMicrotask(()=>tx.oncomplete?.());return {}},getAll:()=>{const request={result:savedChunks};queueMicrotask(()=>tx.oncomplete?.());return request}})};return tx}}
-  const sandbox:any={acquireRecordingTab:async()=>()=>{},recoverRecordingCount:(rows:any[])=>rows.length,indexedDB:{open(){const request:any={result:db};queueMicrotask(()=>request.onsuccess?.());return request}},document:{getElementById:element},location:{pathname:'/room/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',hash:'#'+'a'.repeat(64)},crypto,DOMException,AbortSignal,Float32Array,Uint8Array,AudioContext:Audio,MediaRecorder:{isTypeSupported:()=>true},window:{MediaRecorder:true,addEventListener:(name:string,fn:Function)=>listeners.set(name,fn)},navigator:{mediaDevices:{getUserMedia(){requests++;return denied?Promise.reject(new DOMException('Denied','NotAllowedError')):new Promise(resolve=>{grant=resolve})}}},setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,fetch:async(url:string)=>{calls.push(url.split('/').at(-1)!);return {ok:!blocked,json:async()=>blocked?{error:'この会議は終了または期限切れです'}:{project:'fixture',retryable:true}}}}
-  runInNewContext(source+`;meta={client:'b'.repeat(64)};this.start=startMeeting;this.finish=finish;this.init=init;`,sandbox)
-  return {init:sandbox.init,start:sandbox.start,finish:sandbox.finish,element,calls,grant:()=>grant(stream),stopped:()=>stopped,requests:()=>requests,listeners}
+  const sandbox:any={queueMicrotask,acquireRecordingTab:async()=>()=>{},recoverRecordingCount:(rows:any[])=>rows.length,indexedDB:{open(){const request:any={result:db};queueMicrotask(()=>request.onsuccess?.());return request}},document:{getElementById:element},location:{pathname:'/room/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',hash:'#'+'a'.repeat(64)},crypto,DOMException,AbortSignal,Float32Array,Uint8Array,AudioContext:Audio,MediaRecorder:{isTypeSupported:()=>true},window:{MediaRecorder:true,addEventListener:(name:string,fn:Function)=>listeners.set(name,fn)},navigator:{mediaDevices:{getUserMedia(){requests++;return denied?Promise.reject(new DOMException('Denied','NotAllowedError')):new Promise(resolve=>{grant=resolve})}}},setInterval:()=>1,clearInterval(){},setTimeout,clearTimeout,fetch:async(url:string,options:any)=>{calls.push(url.split('/').at(-1)!);return {ok:!blocked,json:async()=>blocked?{error:'この会議は終了または期限切れです'}:{project:'fixture',retryable:true,hash:options?.headers?.['x-content-sha256']}}}}
+  runInNewContext(source+`;meta={client:'b'.repeat(64)};this.start=startMeeting;this.finish=finish;this.init=init;this.draw=contain;this.stopSharing=stopSharing;this.recover=async(rows,persisted=[])=>{db={transaction(store,mode){if(mode==="readwrite")throw new Error("QuotaExceededError");const tx={objectStore:()=>({getAll:()=>{const req={result:persisted};queueMicrotask(()=>tx.oncomplete());return req}})};return tx}};meta={client:"test",segment:"test",stopped:true};seq=rows.length+persisted.length;volatile=rows;await finish()};`,sandbox)
+  return {draws:()=>draws,recover:sandbox.recover,init:sandbox.init,start:sandbox.start,finish:sandbox.finish,element,calls,grant:()=>grant(stream),stopped:()=>stopped,requests:()=>requests,listeners,draw:sandbox.draw,stopSharing:sandbox.stopSharing}
 }
 test('startup automatically requests microphone, single flight, late grant after End stops tracks',async()=>{
  const f=setup();const pending=f.start();await tick();expect(f.requests()).toBe(1);await f.start();expect(f.requests()).toBe(1)
- await f.finish();f.grant();await pending;expect(f.stopped()).toBe(1);expect(f.calls).toEqual(['join']);expect(f.element('entryStatus').textContent).toBe('会議を終了しました')
+ await f.finish();f.grant();await pending;expect(f.stopped()).toBe(1);expect(f.calls).toEqual(['join']);expect(f.element('entryStatus').textContent).toBe('');expect(f.element('entry').hidden).toBe(true)
 })
 test('invalid/ended invitation fails before microphone or paid session',async()=>{
  const f=setup({blocked:true});await f.start();expect(f.requests()).toBe(0);expect(f.calls).toEqual(['join'])
@@ -38,4 +38,29 @@ test('page initialization starts microphone without an entry click',async()=>{
 })
 test('initialization preserves local chunks even when the server says retryable',async()=>{
  const f=setup({savedMeta:{client:'b'.repeat(64),segment:'segment'},savedChunks:[{room:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',seq:0,blob:new Blob(['recording'])}]});await f.init();expect(f.requests()).toBe(0);expect(f.element('retry').hidden).toBe(false);expect(f.element('status').textContent).toContain('前回の録画')
+})
+
+test('stopped video with retained dimensions is never painted',()=>{
+ const f=setup();const stale={readyState:4,videoWidth:768,videoHeight:768,srcObject:null}
+ // Ended media must not draw even if the browser retains decoded dimensions.
+ expect(()=>f.draw(stale,0,0,1280,720)).not.toThrow()
+ expect(()=>f.draw({...stale,srcObject:{getVideoTracks:()=>[{readyState:'ended'}]}},0,0,1280,720)).not.toThrow()
+ expect(f.draws()).toBe(0)
+ f.draw({...stale,srcObject:{getVideoTracks:()=>[{readyState:'live'}]}},0,0,1280,720);expect(f.draws()).toBe(1)
+})
+
+test('full browser storage still uploads memory chunks and finalizes without local writes',async()=>{
+ const f=setup();await f.recover([0,1].map(seq=>({room:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',seq,blob:new Blob(['chunk'+seq]),uploaded:false})))
+ expect(f.calls).toEqual(['0','1','finish']);expect(f.element('retry').hidden).toBe(true);expect(f.element('status').textContent).toBe('')
+})
+
+test('older memory chunk does not reduce the stopped segment total',async()=>{
+ const f=setup();const chunk=(seq:number)=>({room:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',seq,blob:new Blob(['chunk'+seq]),uploaded:false})
+ await f.recover([chunk(0)],[chunk(1)])
+ expect(f.calls).toEqual(['1','0','finish']);expect(f.element('retry').hidden).toBe(true)
+})
+
+test('failed memory upload retains retry and never finalizes the segment',async()=>{
+ const f=setup({blocked:true});await f.recover([{room:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',seq:0,blob:new Blob(['chunk']),uploaded:false}])
+ expect(f.calls).toEqual(['0']);expect(f.element('retry').hidden).toBe(false);expect(f.element('status').textContent).toContain('保存を再試行')
 })

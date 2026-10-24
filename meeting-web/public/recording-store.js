@@ -13,7 +13,7 @@ export function persistRecordingChunk(db, key, meta, chunk) {
 /** Repair historical stale metadata from actual bytes; never certify a gap. */
 export function recoverRecordingCount(chunks) {
   const ordered=[...chunks].sort((a,b)=>a.seq-b.seq)
-  if(ordered.some((chunk,index)=>chunk.seq!==index))throw new Error('録画に欠落があります。保存済みの録画をダウンロードしてください')
+  if(ordered.some((chunk,index)=>chunk.seq!==index))throw new Error('録画に欠落があります。残っている録画を保持するためページを閉じないでください')
   return ordered.length
 }
 

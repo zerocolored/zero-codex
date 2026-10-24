@@ -49,6 +49,8 @@ test('SDP exchange uses pinned GPT Live contract and context; repeated call cann
     expect(response.status).toBe(200);expect(await response.json()).toEqual({sdp:'fixture answer'})
     expect(f.calls[0].url).toBe('https://api.openai.com/v1/live/sessions')
     expect(f.calls[0].body.session.model).toBe('gpt-live-1')
+    expect(f.calls[0].body.session.instructions).toContain('指す場所を聞き返して説明を遮らず')
+    expect(f.calls[0].body.session.instructions).toContain('見たと断言したりしない')
     expect(JSON.stringify(f.calls[0].body.session.input)).toContain('project summary');expect(JSON.stringify(f.calls[0].body.session.input)).toContain('thread history')
     expect((await f.send(base+'/session','POST',body,invite)).status).toBe(409);expect(f.calls).toHaveLength(1)
     expect((await f.send(base+'/session','POST',{...body,instructions:'override'},invite)).status).toBe(400)
