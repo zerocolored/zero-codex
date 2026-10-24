@@ -209,7 +209,7 @@ describe('durable Slack thread history', () => {
     expect(snapshot.transcript).toContain('失敗原因を調べる')
     expect(snapshot.transcript).toContain('調査中です')
     expect(snapshot.transcript).toContain('prior job did not complete')
-    expect(snapshot.transcript).not.toContain('U0HISTORY01')
+    expect(snapshot.transcript).toContain('U0HISTORY01')
     expect(snapshot.transcript).toContain('xoxb-')
     expect(snapshot.transcript).toContain('/Users/example')
 
@@ -341,7 +341,7 @@ describe('durable Slack thread history', () => {
     }))
     const same = store.claimNext('thread-history-worker')!
     expect(store.threadHistorySnapshot(same.id).transcript).toContain('共有すべき結果')
-    expect(store.threadHistorySnapshot(same.id).transcript).not.toContain('U0HISTORY01')
+    expect(store.threadHistorySnapshot(same.id).transcript).toContain('U0HISTORY01')
     store.close()
   })
 
@@ -377,6 +377,7 @@ describe('durable Slack thread history', () => {
     expect(snapshot.attempt).toBe(2)
     expect(snapshot.transcript).toContain('最初の試行でここまで確認しました')
     expect(snapshot.transcript).toContain('前の調査結果は残っていますか？')
+    expect(snapshot.transcript).toContain('[Past same-thread question]\nSlack source: {"senderId":"U0ANOTHER01","messageId":"retry-question","senderKind":"human"}')
     expect(snapshot.transcript).toContain('調査結果は保持して再開します。')
     expect(snapshot.transcript).toContain('delivery not confirmed')
     expect(store.threadHistorySnapshot(second.id, second.attempts).digest).toBe(snapshot.digest)

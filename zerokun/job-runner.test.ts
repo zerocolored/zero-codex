@@ -466,7 +466,8 @@ test('再開には同じスレッドの実配送記録を渡し生成済み回�
     // 既存スレッドでは差し替わらないので、毎回組み立て直すこの prompt に必ず入れる。
     expect(prompt).toContain('お願い: <誰> が <何> してください')
     expect(prompt).toContain('Do not open with what you')
-    expect(prompt).toContain('If you genuinely need nothing from the reader')
+    expect(prompt).toContain('If no permitted user action is needed')
+    expect(prompt).toContain('Never turn a native denial into a manual-execution request')
     // 自分のサンドボックスが *KEY* を落とすことを知らないと「管理者が
     // SUPABASE_SERVICE_ROLE_KEY を設定してください」という叶わない依頼で止まる
     // (2026-09-28 実測)。除外規則と代替経路を毎回の prompt に入れる。

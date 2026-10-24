@@ -3,6 +3,7 @@ import { createHash } from 'crypto'
 import { lstatSync } from 'fs'
 import { resolveZeroJobDatabasePath } from './state-dir.ts'
 import { requireManagedStateRoot } from './managed-path.ts'
+import { slackMessageOrigin, slackMessageBody } from './task-authorization.ts'
 
 const MAX_INPUT_ENTRIES = 512
 export const MAX_CANONICAL_INPUT_CHARS = 256 * 1024
@@ -108,10 +109,11 @@ export function createAdvisorInputSnapshot(
   }
   const transcript = entries.map(entry => [
     `--- input revision ${entry.revision} (${entry.kind}) ---`,
+    slackMessageOrigin(entry.userId, entry.messageId),
     `Slack message: ${entry.messageId}`,
     `Sender: ${entry.userId}`,
     `Write authorized: ${entry.writeEnabled ? 'yes' : 'no'}`,
-    entry.task,
+    slackMessageBody(entry.task),
     ...(entry.attachments.length > 0 ? [
       'Attachments (read-only local paths):',
       ...entry.attachments.map(path => `- ${path}`),

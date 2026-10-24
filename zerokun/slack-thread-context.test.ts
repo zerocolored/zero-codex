@@ -37,7 +37,7 @@ describe('buildInitialSlackThreadContext', () => {
     expect(result.text.indexOf('先頭です')).toBeLessThan(result.text.indexOf('補足です'))
     expect(result.text.indexOf('補足です')).toBeLessThan(result.text.indexOf('確認して'))
     expect(result.text).not.toContain(BOT)
-    expect(result.text).not.toContain('U0ALICE')
+    expect(result.text).toContain('\"senderId\":\"U0ALICE\"')
     expect(result.text).toContain('@参加者1')
     expect(result.text).not.toContain('\nbot\n')
     expect(result.text).toContain('添付: #1, #2')

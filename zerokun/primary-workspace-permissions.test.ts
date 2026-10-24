@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, linkSyn
 import { homedir, tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { buildCodexChildEnvironment, buildCodexDeveloperInstructions, buildCodexPermissionOverrides, buildCodexWorkerPrompt, buildCodexLiveControlPrompt } from './codex-executor.ts'
+import { slackMessageBody } from './task-authorization.ts'
 import { NATIVE_UPLOAD_CONFIRMATION_PROTOCOL } from './native-confirmation.ts'
 import type { JobControlRecord } from './job-runner.ts'
 import { prepareManagedStateRoot, ensureManagedDirectory } from './managed-path.ts'
@@ -36,7 +37,7 @@ test('resumed and steered tasks cannot treat an old handwritten upload question 
       inputDigest: 'c'.repeat(64), userId: 'U0123456789',
     } as JobControlRecord, 'complete', host, job)
     for (const text of [initial, followup]) {
-      expect(text.lastIndexOf(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)).toBeGreaterThan(text.indexOf(task))
+      expect(text.lastIndexOf(NATIVE_UPLOAD_CONFIRMATION_PROTOCOL)).toBeGreaterThan(Math.max(text.indexOf(task), text.indexOf(slackMessageBody(task))))
       expect(text).toContain('not answers to a host upload dialog')
       expect(text).toContain('Respect user cancellations and actual native policy denials')
     }
