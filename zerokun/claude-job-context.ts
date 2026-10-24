@@ -18,6 +18,7 @@ import { GO_CHROME_ENABLED_TOOLS, GO_CHROME_DISABLED_TOOLS } from './chrome-tool
 import { taskGoalObjective, type NativeGoal } from './codex-goal.ts'
 import type { PrimaryToolsContext } from './primary-tools-broker.ts'
 import { pinClaudeJobModel, readClaudeJobModel } from './claude-model-binding.ts'
+import { prepareMeetingContext } from './meeting-broker.ts'
 
 type McpSpec = { command: string; args: string[]; env?: Record<string, string> }
 
@@ -51,6 +52,7 @@ export function claudePrimaryInstructions(job: JobRecord, input: {
     'For required GUI hearing, pass uiProposal to the initial advisor_round. Fable may produce the isolated sample and sanitized After. If unavailable, create the isolated proposal yourself, label its source and obtain required explicit direction approval before editing the product.',
     'Use zerokun_github for authenticated issue reads, fetch, branch publication and pull requests when needed. A public 404 or absent shell login does not prove the host capability is unavailable.',
     'Use zerokun_usage.task_usage_read for this task\'s numeric usage, including prior tasks in this conversation. Missing/partial records are not zero.',
+    'Use zerokun_meetings.meeting_status before asking an operator to inspect meeting configuration or invitation registration. Use meeting_recording_read for verified, currently readable recording paths; never disclose meeting credentials.',
     ...(job.writeEnabled ? [
       'For an authorized Unity project task, use zerokun_runtime.unity_editor action=open to start the project and action=status to verify its MCP response. The ordinary execute sandbox cannot launch a native GUI Editor or reach all license/Package Manager IPC; that local denial is not a failed Unity license. This host capability is the supported route, not permission to bypass the shell sandbox. Like a normal Unity launch, it runs this project’s Editor scripts and package code with host permissions; use it only within the user-authorized project task. Do not ask the user to launch Unity manually before trying it. Poll status without repeatedly launching. The Editor persists after the job; never close unrelated Editors. A software-terms agreement or actual login still requires the user. Project .mcp.json is not automatically loaded by this core; this tool checks the installed Unity MCP against the pinned project. Use the installed Unity CLI through execute for subsequent authorized project operations.',
       'For local browser evidence use zerokun_browser.verify_local_page. Use zerokun_cloud_logging for scoped project logs and registered historical evidence. An empty registry is not proof no evidence exists elsewhere.',
@@ -116,7 +118,9 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string, dele
       'complete', processNonce, resolveClaudeExecutableLookup(), 'claude-code']),
     zerokun_github: spec('github-credential-broker.ts', [contextPath, stateDir]),
     zerokun_usage: spec('task-usage-broker.ts', [stateDir, job.id]),
+    zerokun_meetings: spec('meeting-broker.ts', [stateDir, job.id]),
   }
+  prepareMeetingContext(stateDir, job)
   const usageDir = ensureManagedDirectory(stateDir, join(stateDir, 'task-usage-context'))
   atomicWritePrivateFile(join(usageDir, `${job.id}.json`), JSON.stringify({ version: 1, jobId: job.id, repoPath: job.historyRepoPath ?? jobRepo }))
   const chrome = !delegation && job.writeEnabled ? installedGoChromeEntrypoint(import.meta.dir, jobRepo) : undefined
@@ -149,6 +153,7 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string, dele
   const readonlyMcpPath = join(runtimeDir, 'readonly-mcp.json')
   atomicWritePrivateFile(readonlyMcpPath, JSON.stringify({ mcpServers: {
     zerokun_runtime: spec('primary-tools-broker.ts', [readonlyToolsPath]), zerokun_usage: servers.zerokun_usage,
+    zerokun_meetings: servers.zerokun_meetings,
   } }))
   atomicWritePrivateFile(settingsPath, JSON.stringify({ disableAllHooks: true, autoMemoryEnabled: false, enabledPlugins: {} }))
   const globalPath = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'AGENTS.md')
@@ -171,7 +176,7 @@ export function prepareClaudeJobContext(job: JobRecord, stateInput: string, dele
     '--restricted', '--tools', '', '--no-chrome', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', readonly ? readonlyMcpPath : mcpPath,
     '--settings', settingsPath, '--append-system-prompt-file', systemPromptPath, '--system-prompt-snapshot', 'off',
     '--model', pinnedModel ?? 'opus', '--permission-mode', 'dontAsk', '--allowedTools',
-    ...(readonly ? ['zerokun_runtime', 'zerokun_usage'] : Object.keys(servers).filter(name => name !== 'go-chrome-mcp')).map(name => `mcp__${name}__*`),
+    ...(readonly ? ['zerokun_runtime', 'zerokun_usage', 'zerokun_meetings'] : Object.keys(servers).filter(name => name !== 'go-chrome-mcp')).map(name => `mcp__${name}__*`),
     ...(!readonly && chrome ? GO_CHROME_ENABLED_TOOLS.map(name => `mcp__go-chrome-mcp__${name}`) : []),
     ...(chrome ? ['--disallowedTools', ...GO_CHROME_DISABLED_TOOLS.map(name => `mcp__go-chrome-mcp__${name}`)] : []),
     ...(resume ? ['--resume', sessionId] : ['--session-id', sessionId]),

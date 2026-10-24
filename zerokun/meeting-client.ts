@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
-import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, writeSync, fsyncSync, renameSync, unlinkSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, readdirSync, writeSync, fsyncSync, renameSync, unlinkSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { z } from 'zod'
-import { atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
+import { assertDescriptorStillNamesPath, atomicWritePrivateFile, readOptionalBoundedAtomicOwnedFile, readOptionalBoundedOwnerOnlyRegularFile } from './safe-file.ts'
 import { ensureManagedDirectory, requireManagedDirectory } from './managed-path.ts'
 import { runIsolatedCodexJson } from './slack-thread-intent.ts'
 import { sanitizeThreadHistoryText } from './thread-history.ts'
@@ -11,22 +11,126 @@ export const meetingConfigSchema = z.object({ origin: z.string().url().refine(va
   const url = new URL(value); return url.protocol === 'https:' && url.origin === value
 }), adminToken: z.string().min(32).max(300) }).strict()
 export const meetingUnavailable = '会議サービスへの接続設定がまだ完了していません。会議機能の設定完了後に、もう一度お声がけください。'
+export class MeetingError extends Error {
+  constructor(readonly code: 'invalid_config' | 'unauthorized' | 'forbidden' | 'not_found' | 'service_error' | 'unreachable' | 'invalid_manifest' | 'incomplete' | 'local_recording_unavailable') {
+    super(`Meeting operation: ${code}`)
+  }
+}
 export function readMeetingConfig(state: string) {
-  const text = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'meeting.json'), 4096)
-  return text ? meetingConfigSchema.parse(JSON.parse(text)) : null
+  try {
+    const text = readOptionalBoundedOwnerOnlyRegularFile(join(state, 'meeting.json'), 4096)
+    return text ? meetingConfigSchema.parse(JSON.parse(text)) : null
+  } catch { throw new MeetingError('invalid_config') }
 }
 const sha = (data: string | Uint8Array) => createHash('sha256').update(data).digest('hex')
 type Config = z.infer<typeof meetingConfigSchema>
-const recordSchema = z.object({ id: z.string().uuid(), url: z.string(), expires: z.number(), repo: z.string(), thread: z.string(), chat: z.string(), requestId: z.string(), synced: z.boolean() })
-const manifestSchema = z.object({ id: z.string().uuid(), project: z.string(), ended: z.number().nullable(), segments: z.array(z.object({
+export const meetingRecordSchema = z.object({ id: z.string().uuid(), url: z.string(), expires: z.number(), repo: z.string(), thread: z.string(), chat: z.string(), requestId: z.string(), synced: z.boolean() })
+const recordSchema = meetingRecordSchema
+export const meetingManifestSchema = z.object({ id: z.string().uuid(), project: z.string(), ended: z.number().nullable(), segments: z.array(z.object({
   id: z.string().uuid(), mime: z.string(), count: z.number().int().nonnegative().nullable(), state: z.string(),
   chunks: z.array(z.object({ seq: z.number().int().nonnegative(), hash: z.string().regex(/^[a-f0-9]{64}$/), size: z.number().int().min(1).max(8*1024*1024) })).max(20001),
 })).max(20) })
+const manifestSchema = meetingManifestSchema
 async function request(config: Config, path: string, init: RequestInit = {}, fetcher: typeof fetch = fetch) {
-  const response = await fetcher(`${config.origin}${path}`, { ...init, redirect: 'error', signal: AbortSignal.timeout(45000),
-    headers: { ...init.headers, authorization: `Bearer ${config.adminToken}` } })
-  if (!response.ok) { await response.body?.cancel(); throw Error(`Meeting service returned HTTP ${response.status}`) }
+  let response: Response
+  try {
+    response = await fetcher(`${config.origin}${path}`, { ...init, redirect: 'error', signal: AbortSignal.timeout(45000),
+      headers: { ...init.headers, authorization: `Bearer ${config.adminToken}` } })
+  } catch { throw new MeetingError('unreachable') }
+  if (!response.ok) {
+    await response.body?.cancel()
+    throw new MeetingError(response.status === 401 ? 'unauthorized' : response.status === 403 ? 'forbidden'
+      : response.status === 404 ? 'not_found' : 'service_error')
+  }
   return response
+}
+
+export async function fetchMeetingManifest(config: Config, id: string, fetcher: typeof fetch = fetch) {
+  if (!z.string().uuid().safeParse(id).success) throw new MeetingError('invalid_manifest')
+  const response = await request(config, `/api/rooms/${id}/manifest`, {}, fetcher)
+  const reader = response.body?.getReader()
+  if (!reader) throw new MeetingError('invalid_manifest')
+  try {
+    let size = 0
+    const parts: Uint8Array[] = []
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.length
+      if (size > 4 * 1024 * 1024) throw new MeetingError('invalid_manifest')
+      parts.push(value)
+    }
+    const manifest = manifestSchema.parse(JSON.parse(Buffer.concat(parts).toString('utf8')))
+    if (manifest.id !== id || new Set(manifest.segments.map(s => s.id)).size !== manifest.segments.length
+      || manifest.segments.reduce((n, s) => n + s.chunks.reduce((m, c) => m + c.size, 0), 0) > 2 * 1024 ** 3) {
+      throw new MeetingError('invalid_manifest')
+    }
+    return manifest
+  } catch { throw new MeetingError('invalid_manifest') }
+  finally { await reader.cancel() }
+}
+
+export type MeetingManifest = z.infer<typeof manifestSchema>
+export type MeetingRecord = z.infer<typeof recordSchema>
+export type MeetingScope = { repoPath: string; historyRepoPath?: string; chatId: string; threadTs: string }
+export function meetingMatchesScope(record: MeetingRecord, scope: MeetingScope): boolean {
+  return record.repo === (scope.historyRepoPath ?? scope.repoPath) && record.chat === scope.chatId && record.thread === scope.threadTs
+}
+export function meetingRecords(state: string): Array<{ path: string; record: MeetingRecord }> {
+  let directory: string
+  try { directory = requireManagedDirectory(state, join(state, 'meetings')) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
+  const records: Array<{ path: string; record: MeetingRecord }> = []
+  for (const name of readdirSync(directory).filter(n => /^[a-f0-9]{64}\.json$/.test(n))) {
+    const path = join(directory, name)
+    try { records.push({ path, record: recordSchema.parse(JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(path, 10000)!)) }) }
+    catch { /* A malformed registration must not prevent other meetings from being collected. */ }
+  }
+  return records
+}
+export function meetingMediaName(segment: MeetingManifest['segments'][number]): string {
+  return `${segment.id}.${segment.mime.startsWith('video/mp4') ? 'mp4' : 'webm'}`
+}
+export function requireCompleteMeeting(manifest: MeetingManifest): void {
+  if (manifest.ended === null || manifest.segments.some(s => s.count === null || s.chunks.length !== s.count
+    || s.chunks.some((c, i) => c.seq !== i))) throw new MeetingError('incomplete')
+}
+/** Validate each chunk of an assembled file, without loading a whole video into memory. */
+export function visitMeetingMedia(path: string, segment: MeetingManifest['segments'][number], visit?: (bytes: Buffer) => void): void {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const metadata = fstatSync(fd)
+    const size = segment.chunks.reduce((n, c) => n + c.size, 0)
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.uid !== process.getuid?.()
+      || (metadata.mode & 0o077) !== 0 || size > 2 * 1024 ** 3 || metadata.size !== size) throw new MeetingError('local_recording_unavailable')
+    for (const chunk of segment.chunks) {
+      const bytes = Buffer.alloc(chunk.size)
+      let offset = 0
+      while (offset < bytes.length) {
+        const count = readSync(fd, bytes, offset, bytes.length - offset, null)
+        if (!count) throw new MeetingError('local_recording_unavailable')
+        offset += count
+      }
+      if (sha(bytes) !== chunk.hash) throw new MeetingError('local_recording_unavailable')
+      visit?.(bytes)
+    }
+    assertDescriptorStillNamesPath(fd, path)
+  } finally { closeSync(fd) }
+}
+
+/** Local verification is independent of the server's acknowledgement. */
+export function verifiedLocalMeeting(state: string, record: MeetingRecord): { directory: string; manifest: MeetingManifest } | null {
+  try {
+    const directory = requireManagedDirectory(state, join(state, 'meeting-recordings', record.id))
+    const raw = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(join(directory, 'manifest.json'), 4 * 1024 * 1024)!)
+    const manifest = manifestSchema.parse(raw)
+    const receipt = JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(join(directory, 'receipt.json'), 4096)!)
+    if (manifest.id !== record.id || receipt.id !== record.id || raw.repo !== record.repo || raw.chat !== record.chat || raw.thread !== record.thread) return null
+    requireCompleteMeeting(manifest)
+    if (new Set(manifest.segments.map(s => s.id)).size !== manifest.segments.length) return null
+    for (const segment of manifest.segments) if (segment.count) visitMeetingMedia(join(directory, meetingMediaName(segment)), segment)
+    return { directory, manifest }
+  } catch { return null }
 }
 function projectReadme(repo: string): string {
   for (const name of ['README.md', 'README', 'readme.md']) {
@@ -98,19 +202,30 @@ export async function createMeetingInvitation(input: {
 }
 /** Download chunk-by-chunk; only fsynced, digest-verified output earns a local receipt. */
 export async function syncMeetingRecordings(state: string, fetcher: typeof fetch = fetch): Promise<void> {
-  const config=readMeetingConfig(state);if(!config)return
-  const directory=ensureManagedDirectory(state,join(state,'meetings'))
+  const heartbeat: { lastTickAt: number; completedAt?: number; config: 'absent' | 'ready' | 'invalid'; rooms: Record<string, { attemptedAt: number; error: string | null }> } = {
+    lastTickAt: Date.now(), config: 'absent', rooms: {},
+  }
+  const persist = () => atomicWritePrivateFile(join(state, 'meeting-sync-status.json'), JSON.stringify(heartbeat))
+  let config: Config | null
+  try { config = readMeetingConfig(state) }
+  catch { heartbeat.config = 'invalid'; persist(); throw new MeetingError('invalid_config') }
+  if (!config) { heartbeat.completedAt = Date.now(); persist(); return }
+  heartbeat.config = 'ready'; persist()
   let failures=0
-  for(const name of readdirSync(directory).filter(n=>/^[a-f0-9]{64}\.json$/.test(n))) {
-    try {
-    const path=join(directory,name),record=recordSchema.parse(JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(path,10000)!))
+  for(const { path, record } of meetingRecords(state)) {
     if(record.synced)continue
-    const manifest=manifestSchema.parse(await (await request(config,`/api/rooms/${record.id}/manifest`,{},fetcher)).json())
-    if(manifest.id!==record.id)throw Error('Meeting manifest identity mismatch')
+    const progress = heartbeat.rooms[record.id] = { attemptedAt: Date.now(), error: null as string | null }
+    try {
+    const manifest=await fetchMeetingManifest(config,record.id,fetcher)
     const destination=ensureManagedDirectory(state,join(state,'meeting-recordings',record.id))
     // Keep partial manifests even if a browser was closed before finalization.
     atomicWritePrivateFile(join(destination,'manifest.json'),JSON.stringify({...manifest,repo:record.repo,thread:record.thread,chat:record.chat},null,2))
     for(const segment of manifest.segments) {
+      if (manifest.ended !== null && segment.count !== null && segment.chunks.length === segment.count
+        && segment.chunks.every((c, i) => c.seq === i) && segment.count > 0) {
+        try { visitMeetingMedia(join(destination, meetingMediaName(segment)), segment); continue }
+        catch { /* Missing/corrupt assembled data can be rebuilt from verified chunks. */ }
+      }
       const partsDir=ensureManagedDirectory(state,join(destination,segment.id))
       for(const chunk of segment.chunks){
         const chunkPath=join(partsDir,`${chunk.seq}.chunk`),old=readOptionalBoundedAtomicOwnedFile(chunkPath,8*1024*1024)
@@ -122,8 +237,8 @@ export async function syncMeetingRecordings(state: string, fetcher: typeof fetch
         if(bytes.length!==chunk.size||sha(bytes)!==chunk.hash)throw Error('Meeting chunk checksum mismatch')
         atomicWritePrivateFile(chunkPath,bytes)
       }
-      if(!manifest.ended)continue
-      if(segment.count===null||segment.chunks.length!==segment.count||segment.chunks.some((c,i)=>c.seq!==i))throw Error('Meeting recording is incomplete')
+      if(manifest.ended === null)continue
+      if(segment.count===null||segment.chunks.length!==segment.count||segment.chunks.some((c,i)=>c.seq!==i))throw new MeetingError('incomplete')
       if(segment.count===0)continue // A failed connection has a manifest, never an empty playable recording.
       const extension=segment.mime.startsWith('video/mp4')?'mp4':'webm',target=join(destination,`${segment.id}.${extension}`)
       const temporary=`${target}.part-${crypto.randomUUID()}`,fd=openSync(temporary,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600)
@@ -138,12 +253,14 @@ export async function syncMeetingRecordings(state: string, fetcher: typeof fetch
       }finally{closeSync(fd);if(!completed)unlinkSync(temporary)}
       renameSync(temporary,target)
     }
-    if(!manifest.ended)continue
+    if(manifest.ended === null)continue
     atomicWritePrivateFile(join(destination,'receipt.json'),JSON.stringify({id:record.id,verifiedAt:Date.now()}))
-    await request(config,`/api/rooms/${record.id}/received`,{method:'POST'},fetcher)
+    await (await request(config,`/api/rooms/${record.id}/received`,{method:'POST'},fetcher)).body?.cancel()
     record.synced=true;atomicWritePrivateFile(path,JSON.stringify(record))
-    } catch { failures++ }
+    } catch (error) { failures++; progress.error = error instanceof MeetingError ? error.code : 'local_io_or_integrity' }
+    finally { persist() }
   }
+  heartbeat.completedAt = Date.now(); persist()
   if(failures)throw Error(`Meeting synchronization pending for ${failures} recording(s)`)
 }
 
@@ -168,8 +285,10 @@ export function meetingRecordingDirectories(state: string, scope: { repoPath: st
   for(const name of names.filter(n=>/^[a-f0-9]{64}\.json$/.test(n))){
     try {
     const record=recordSchema.parse(JSON.parse(readOptionalBoundedOwnerOnlyRegularFile(join(directory,name),10000)!))
-    if(record.synced&&record.repo===(scope.historyRepoPath??scope.repoPath)&&record.chat===scope.chatId&&record.thread===scope.threadTs)
-      paths.push(requireManagedDirectory(state,join(state,'meeting-recordings',record.id)))
+    if(meetingMatchesScope(record,scope)) {
+      const local = verifiedLocalMeeting(state, record)
+      if (local) paths.push(local.directory)
+    }
     } catch { /* One unavailable recording must not prevent unrelated ordinary work. */ }
   }
   return paths

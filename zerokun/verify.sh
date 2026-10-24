@@ -429,6 +429,7 @@ for entry in \
   zerokun/primary-tools-broker.ts \
   zerokun/core-command.ts \
   zerokun/task-usage-broker.ts \
+  zerokun/meeting-broker.ts \
   zerokun/chrome-session-broker.ts \
   zerokun/codex-reproduction-broker.ts \
   zerokun/project-layout.ts \
