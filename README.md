@@ -472,6 +472,15 @@ zerochan-access write deny U0123456789
 
 ## 起動と運用
 
+### タスク開始時のGit同期
+
+通常タスクは読み取り専用・再開を含め、Codex / Claude Codeの実行前にremoteの作業branchと統合branchをfetchし、SHA・ahead/behind・未コミット状態を主担当へ渡します。
+ホストは依頼を解釈する前にcheckoutを書き換えません。主担当が実装前にcleanな作業branchを明示的なpull --ff-onlyで更新します。fetchだけでは作業ファイルの最新化完了にはなりません。
+新規作業はrepositoryの統合branchの取得済みSHAから専用branch/worktreeで開始し、継続は既存の作業branchを維持します。developへの強制切替や継続branchへの無条件の統合先mergeは行いません。
+未コミット変更、履歴分岐、競合、upstreamの欠落、通信失敗は主担当へ引き継ぎ、未確認の実装は進めず、原因調査や認可済みの競合解消を行います。自動stash・reset・force-pushはしません。
+独立セキュリティ監査は既存の検査対象を維持します。remoteのないrepositoryと非Git projectには同期元がありません。push直前の同期も引き続き必要です。
+
+
 ```bash
 # setup後、対象projectへ移動して起動（Herdr外なら専用workspaceを自動作成）
 cd /absolute/path/to/project

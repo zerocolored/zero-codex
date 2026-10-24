@@ -1,5 +1,14 @@
 # zero-codex working instructions
 
+## タスク開始前の最新コード確認・取り込み（必須）
+
+- 読み取り専用を含む開始・再開時に、remote、branch、upstream、worktree、未コミット変更を確認し、作業branchと統合branchをfetchしてSHAとahead/behindを比較する。
+- ホストはfetch・比較の結果を主担当へ渡す。書込み可能な利用者の調査依頼もあるため、権限だけでcheckoutを変更しない。
+- 主担当は実装前に、cleanかつfast-forward可能な作業branchを、remoteとbranchを明示した`git pull --ff-only`で更新する。fetchだけで作業ファイルが最新になったとは扱わない。
+- 新規作業はfetch済みの統合先（このrepositoryはmain）から専用branch/worktreeで始める。継続は既存の作業branch/worktreeを引き継ぎ、無関係な統合branch更新を自動で強制しない。managed workspaceでは指定された物理rootを維持する。
+- 未コミット変更、履歴分岐、upstream未設定・削除、競合、通信失敗は保持して報告し、調査や認可済みの競合解消は継続できる。古いcheckoutで未確認の実装を始めない。自動stash、reset、force-push、推測した別branchのpullは禁止する。
+- 読み取り専用ではcheckoutを変更せず、取得済みrevisionを調べて対象SHAと制約を報告する。remoteなし・非Gitを最新版取得済みと報告しない。
+
 ## push前の最新コード取り込み（必須）
 
 - pushする前に、remote、対象branchとupstream、worktree、未コミット変更を確認し、

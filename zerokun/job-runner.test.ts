@@ -1,3 +1,4 @@
+import { TaskStartSyncInterruptedError } from './task-start-sync.ts'
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { TestProcessScope } from './test-process-scope.ts'
@@ -16787,3 +16788,24 @@ describe('durable UI/UX approval wait', () => {
     store.close()
   })
 })
+
+for (const userCancelled of [false, true]) {
+  test(`Git observation interruption before primary preserves write job: cancel=${userCancelled}`, async () => {
+    const store = makeStore()
+    try {
+      const job = store.enqueue(input({writeEnabled: true})).job
+      const next = userCancelled ? store.enqueue(input({messageId: 'next-sync-job', threadTs: 'next-thread'})).job : null
+      const stats = await runQueuedJobs({store, maxJobsPerSession: 5, pollMs: 1, stopWhenIdle: true,
+        executor: async running => {
+          if (running.id !== job.id) return {sessionId: 'next-session', result: 'ok'}
+          if (userCancelled) store.stageLiveControl(store.interruptControlTarget(job.chatId, job.threadTs)!, {chatId: job.chatId, threadTs: job.threadTs, messageId: 'cancel-sync', userId: job.userId, task: '中止', kind: 'interrupt'})
+          throw new TaskStartSyncInterruptedError()
+        },
+      })
+      expect(store.get(job.id)?.status).toBe(userCancelled ? 'failed' : 'queued')
+      if (userCancelled) expect(store.get(job.id)?.terminalOutcome).toBe('cancelled')
+      expect(stats.failed).toBe(userCancelled ? 1 : 0)
+      if (next) expect(store.get(next.id)?.status).toBe('completed')
+    } finally { store.close() }
+  })
+}

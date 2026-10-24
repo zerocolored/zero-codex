@@ -352,3 +352,11 @@ describe('Zero-kun Codex wiring', () => {
   })
 
 })
+
+
+test('task-start host observation stays fetch-only and passes evidence to the primary', () => {
+  const runner = readFileSync(join(import.meta.dir, 'job-runner.ts'), 'utf8')
+  expect(runner).toContain('executionJob.taskStartSync = await synchronizeTaskProject(')
+  expect(runner).toContain('{...executionJob, writeEnabled: false}, executionController.signal')
+  expect(runner).toContain('() => store.get(job.id)?.cancelRequestedAt != null')
+})
