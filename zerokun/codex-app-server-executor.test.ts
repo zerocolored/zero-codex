@@ -3098,6 +3098,35 @@ describe('production App Server executor', () => {
     value.store.close()
   }, 30_000)
 
+  test('corrected external model request reaches the primary unchanged after a cached rejection',async()=>{
+    const task='違う違う。ヒグスフィールドの中で GPT イメージ 2.5 とか呼び出せないの？確認して'
+    const external='GPT-4o mini とか使えるよね。Fixstars でそっちでやってみてよ。'
+    const value=fixture('normal',true,task), rpcLog=join(value.root,'corrected-model.jsonl'), promptLog=join(value.root,'corrected-prompt.jsonl')
+    const models=[{id:'gpt-6-astra',medium:true},{id:'gpt-6-sol',medium:true}]
+    try {
+      await expect(value.store.taskModels().resolve(value.job.id,[{revision:-1,task:external}],models,undefined,
+        async()=>({decision:'unsupported',model:null,evidence:external,continuation:true}))).rejects.toThrow('unsupported')
+      await expect(value.store.taskModels().resolve(value.job.id,[{revision:1,task}],models,undefined,
+        async()=>({decision:'none',model:null,evidence:'',continuation:true}))).rejects.toThrow('unsupported')
+      let calls=0
+      const result=await executeCodexJob(value.job,{
+        codexBinForTesting:value.executable,logDir:value.logDir,stateDir:value.state,
+        skipEffectiveConfigCheck:true,liveControls:value.hooks,
+        selectModel:async(requests,catalog,signal)=>value.store.taskModels().resolve(value.job.id,requests,catalog,signal,async(text,_,previous)=>{
+          calls++;expect(text).toBe(task);expect(previous).toEqual({task:external,model:null,pending:'unsupported'})
+          return {decision:'retain',model:null,evidence:task,continuation:true}
+        }),
+        extraEnvironment:{ZERO_FIXTURE_MODE:'normal',ZERO_RPC_LOG:rpcLog,ZERO_LOG_HANDSHAKES:'1',ZERO_PROMPT_LOG:promptLog},
+      })
+      expect(result.result).toBe('通常完了');expect(calls).toBe(1)
+      const rpc=readFileSync(rpcLog,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+      expect(rpc.filter(row=>row.method==='turn/start')).toHaveLength(1)
+      expect(rpc.find(row=>row.method==='thread/start').model).toBe('gpt-6-astra')
+      expect(rpc.find(row=>row.method==='turn/start').model).toBe('gpt-6-astra')
+      expect(JSON.parse(readFileSync(promptLog,'utf8').trim()).text).toContain(task)
+    } finally {value.store.close()}
+  },30000)
+
   test.each([false,true])('model check runtime recovery executes the unchanged input once (write=%s)',async write=>{
     const value=fixture('normal',write,'この処理を直して');const rpcLog=join(value.root,'model-retry.jsonl');let calls=0;
     try {
