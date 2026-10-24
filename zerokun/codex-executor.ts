@@ -1,4 +1,5 @@
 import { TASK_AUTHORIZATION_CONTEXT, slackMessageOrigin, slackMessageBody } from './task-authorization.ts'
+import { prepareMeetingContext } from './meeting-broker.ts'
 import { buildStorageInstructions, storageFailureFromDiagnostics } from './storage-failure.ts'
 import { classifyCodexFailure, codexRateLimitResumeAt, THROTTLE_NOTICE_INTERVAL_MS, type CodexRateLimitInfo, type CodexRateLimitReason } from './codex-rate-limit.ts'
 export { codexRateLimitResumeAt, type CodexRateLimitInfo } from './codex-rate-limit.ts'
@@ -4215,6 +4216,8 @@ export function buildCodexDeveloperInstructions(
       'This does not dismiss a refusal reporting an actual user or tool denial. A read-only helper',
       'or missing transport does not itself prohibit otherwise authorized primary operations.',
       'For your own task token usage or API-equivalent cost questions, call zerokun_usage.task_usage_read first.',
+      'For meeting configuration, invitation registration or automatic recording collection, call zerokun_meetings.meeting_status before asking an operator to inspect private state.',
+      'Use zerokun_meetings.meeting_recording_read to obtain verified recording paths readable in this job. It also works for recordings collected after job start or awaiting server acknowledgement. Never read or disclose meeting credentials.',
       'It reads numeric host records for this conversation, including past jobs; no user-uploaded usage export is needed for retained records.',
       'List tasks, then select the intended task numbers and exclude later cost questions. Respect partial/unavailable, unknown model and cache accounting notes.',
       'Do not confuse an empty project audit registry with missing token logs. Never inspect private host logs directly or claim a full total from partial providers.',
@@ -4241,6 +4244,7 @@ export function buildCodexDeveloperInstructions(
       'The primary shell retains the normal host HOME and configuration search paths so installed CLIs can use existing logins.',
       'Job scratch and temporary directories remain separate. The authorized primary uses normal Codex filesystem reads and native permission review, without Zero-specific OS read-deny rules.',
       'Never read, copy, disclose, or modify Zero private state, bot credentials, other jobs, or host agent settings. Native filesystem access is not authorization to use that data.',
+      'The verified recording and manifest paths returned by zerokun_meetings are explicitly authorized read-only task inputs, not host configuration. Read those exact returned files when relevant.',
       'Use authenticated CLI, Browser, Chrome or available host tools as appropriate to the authorized task; Zero does not select an exclusive route.',
       'A CLI missing-authentication error is evidence about that invocation only; do not assume the user has not logged in or require another login before checking its configuration context.',
       'Native configuration refresh or login needed for the task uses the normal Codex permission flow; do not invent an additional Zero approval requirement.',
@@ -5855,6 +5859,7 @@ export function buildCodexPermissionOverrides(
     appSwapMcp?: { command: string; args: string[] }
     cloudLoggingMcp?: { command: string; args: string[] }
     usageMcp?: { command: string; args: string[] }
+    meetingMcp?: { command: string; args: string[] }
     seatbeltFingerprintAllowPath?: string
     executionWriteEnabled?: boolean
     localVerificationEnabled?: boolean
@@ -6247,6 +6252,10 @@ export function buildCodexPermissionOverrides(
   if (options.usageMcp) {
     const usage = options.usageMcp
     mcpEntries.push(`zerokun_usage={command=${tomlString(usage.command)},args=[${usage.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["task_usage_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90}`)
+  }
+  if (options.meetingMcp) {
+    const meeting = options.meetingMcp
+    mcpEntries.push(`zerokun_meetings={command=${tomlString(meeting.command)},args=[${meeting.args.map(tomlString).join(',')}],enabled=true,required=false,enabled_tools=["meeting_status","meeting_recording_read"],default_tools_approval_mode="approve",startup_timeout_sec=30,tool_timeout_sec=90}`)
   }
   const mcpServers = `{${mcpEntries.join(',')}}`
   return [
@@ -7159,6 +7168,8 @@ export async function executeCodexJob(
   const cloudLoggingBrokerPath = requireSafeBroker('cloud-logging-broker.ts')
   const appSwapBrokerPath = requireSafeBroker('app-swap-broker.ts')
   const usageBrokerPath = requireSafeBroker('task-usage-broker.ts')
+  const meetingBrokerPath = requireSafeBroker('meeting-broker.ts')
+  prepareMeetingContext(managedStateDir, job)
   const usageContextDir = ensureManagedDirectory(managedStateDir, join(managedStateDir, 'task-usage-context'))
   atomicWritePrivateFile(join(usageContextDir, `${job.id}.json`), JSON.stringify({
     version: 1, jobId: job.id, repoPath: job.historyRepoPath ?? job.repoPath,
@@ -7418,6 +7429,10 @@ export async function executeCodexJob(
         command: realpathSync(process.execPath),
         args: ['--config=/dev/null', '--no-env-file', usageBrokerPath, managedStateDir, job.id],
       } : undefined
+      const meetingMcp = stage === 'complete' && !continuationDecision ? {
+        command: realpathSync(process.execPath),
+        args: ['--config=/dev/null', '--no-env-file', meetingBrokerPath, managedStateDir, job.id],
+      } : undefined
       const permissionProfile = `zerokun_job_${randomUUID().replaceAll('-', '')}`
       const cloudLoggingMcp = job.writeEnabled && stage === 'complete' && !continuationDecision
         ? {
@@ -7466,6 +7481,7 @@ export async function executeCodexJob(
         cloudLoggingMcp,
         appSwapMcp,
         usageMcp,
+        meetingMcp,
         seatbeltFingerprintAllowPath: seatbeltFingerprint.allow.path,
         executionWriteEnabled,
         localVerificationEnabled: browserMcp !== undefined,

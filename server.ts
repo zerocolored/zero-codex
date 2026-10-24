@@ -16,6 +16,7 @@ import { App } from '@slack/bolt'
 import { createSlackThreadFailureReactionApplier, createSlackThreadFailureReactionDrainer } from './zerokun/slack-thread-failure-reaction.ts'
 import { startConfiguredFleet } from './zerokun/fleet-runtime.ts'
 import { createHash, randomBytes } from 'crypto'
+import { startMeetingSync } from './zerokun/meeting-client.ts'
 import {
   closeSync, constants, existsSync, fsyncSync, openSync, writeFileSync,
   mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync,
@@ -2913,6 +2914,7 @@ try {
   })
   slackSocket.arm()
   setInterval(checkApprovals, 5_000).unref()
+  startMeetingSync(STATE_DIR, () => process.stderr.write('meeting recording sync pending retry\n'))
   const connectedProjectDir = realpathSync(process.cwd())
   rememberStartedProject(STATE_DIR, connectedProjectDir, identity.appId)
   writeLastConnectedProject(STATE_DIR, connectedProjectDir)
