@@ -228,8 +228,10 @@ codex <trust-args> -C <repo> \
   確認してから結果を返します。
 - supervisorは通常の親子/PGID追跡に加え、state内のjob固有Seatbelt allow/deny tagをkernelへ照会します。
   commandが`setsid`、stdio close、PID 1へのreparentを行っても、matching generationを全て停止して固定点を
-  作り、再開後のTERMには通常cleanupの壁時計上限を設けません。完全一致の`中止`、host abort、内部fault、
-  crash recovery時だけbounded KILLへ進み、3回連続で空になるまでv4 cleanup receiptを発行しません。
+  作ります。回答確定とadvisor回収が済み、直接のCodex processが終了した後は、60秒の終了猶予を
+  過ぎても残る所有子processをgeneration再照合のうえ回収します。実行中の主担当やadvisorにはこの期限を
+  適用しません。回答未確定の通常cleanupは待機を維持し、完全一致の`中止`、host abort、内部fault、
+  crash recoveryでもbounded KILLへ進みます。3回連続で空になるまでv4 cleanup receiptを発行しません。
   relayの明示cancelが必要だった場合も成功へ昇格しません。tag identityはregistrationに
   永続化されるため、runner crash後の起動時recoveryでも同じ検査を行います。
 - 実効config preflight、localhost browser broker、GitHub credential brokerも同じjob tagを継承します。

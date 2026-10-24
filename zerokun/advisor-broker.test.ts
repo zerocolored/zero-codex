@@ -19,7 +19,7 @@ import { dirname, join } from 'path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { readProcessIdentity } from './process-tree.ts'
-import { signalProcessIfLive } from './process-generation.ts'
+import { observeProcessGeneration, signalProcessIfLive, type ProcessIdentity } from './process-generation.ts'
 import {
   advanceAdvisorReceipt,
   allAdvisorAttemptsAdopted,
@@ -83,16 +83,69 @@ import {
 } from './advisor-round-recovery.ts'
 
 const temporaryDirs: string[] = []
+const fixtureCleanups = new Set<() => Promise<void>>()
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all([...fixtureCleanups].map(cleanup => cleanup()))
   for (const dir of temporaryDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
+
+// Capture generations while the fixture is alive, before an assertion or Bun
+// test timeout can unwind. Never resolve a recycled PID again during cleanup.
+function guardFixtureProcesses(pidFile: string): () => Promise<void> {
+  const owned = new Map<number, ProcessIdentity>()
+  const capture = () => {
+    if (!existsSync(pidFile)) return
+    for (const raw of readFileSync(pidFile, 'utf8').trim().split(/\s+/)) {
+      const pid = Number(raw)
+      if (!Number.isSafeInteger(pid) || pid <= 1 || owned.has(pid)) continue
+      const identity = readProcessIdentity(pid)
+      if (identity) owned.set(pid, identity)
+    }
+  }
+  const timer = setInterval(capture, 10)
+  let cleanup: Promise<void> | undefined
+  const close = () => cleanup ??= (async () => {
+    clearInterval(timer)
+    capture()
+    for (const identity of owned.values()) signalProcessIfLive(identity, 'SIGKILL')
+    const deadline = Date.now() + 2_000
+    while ([...owned.values()].some(identity => observeProcessGeneration(identity).status === 'alive')
+      && Date.now() < deadline) await Bun.sleep(20)
+    fixtureCleanups.delete(close)
+    for (const identity of owned.values()) expect(observeProcessGeneration(identity).status).toBe('dead')
+  })()
+  fixtureCleanups.add(close)
+  return close
+}
 
 function fixtureDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'zerochan-advisor-broker-'))
   temporaryDirs.push(dir)
   return dir
 }
+
+test.skipIf(process.platform === 'win32')('fixture assertion failure still reaps its pinned TERM-ignoring process', async () => {
+  const dir = fixtureDir()
+  const pidFile = join(dir, 'guard.pid')
+  const cleanup = guardFixtureProcesses(pidFile)
+  const child = Bun.spawn(['/usr/bin/python3', '-c',
+    'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); signal.alarm(30); time.sleep(25)'], {
+    stdin: 'ignore', stdout: 'ignore', stderr: 'ignore',
+  })
+  const identity = readProcessIdentity(child.pid)!
+  writeFileSync(pidFile, String(child.pid))
+  try {
+    await expect((async () => {
+      try {
+        await Bun.sleep(50)
+        throw new Error('fixture assertion failed')
+      } finally { await cleanup() }
+    })()).rejects.toThrow('fixture assertion failed')
+    await child.exited
+    expect(observeProcessGeneration(identity).status).toBe('dead')
+  } finally { await cleanup() }
+}, 5_000)
 
 function git(args: string[], cwd: string): string {
   const result = Bun.spawnSync(['/usr/bin/git', ...args], {
@@ -1325,6 +1378,7 @@ child = os.fork()
 if child == 0:
     os.setsid()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.alarm(30) # Last resort if the test runner itself exits before finally.
     devnull = os.open('/dev/null', os.O_RDWR)
     os.dup2(devnull, 0)
     os.dup2(devnull, 1)
@@ -1337,15 +1391,18 @@ time.sleep(0.3)
 print('review complete')
 `)
       chmodSync(script, 0o700)
-      const result = await runBounded(['/usr/bin/python3', script], {
-        env: { PATH: '/usr/bin:/bin', DESCENDANT_PID_FILE: pidFile },
-        terminationGraceMs: 100,
-      })
-      expect(result.exitCode).toBe(0)
-      expect(result.stdout).toContain('review complete')
-      expect(result.timedOut).toBe(false)
-      expect(result.forcedCleanup).toBe(true)
-      expect(readProcessIdentity(Number(readFileSync(pidFile, 'utf8')))).toBeUndefined()
+      const cleanup = guardFixtureProcesses(pidFile)
+      try {
+        const result = await runBounded(['/usr/bin/python3', script], {
+          env: { PATH: '/usr/bin:/bin', DESCENDANT_PID_FILE: pidFile },
+          terminationGraceMs: 100,
+        })
+        expect(result.exitCode).toBe(0)
+        expect(result.stdout).toContain('review complete')
+        expect(result.timedOut).toBe(false)
+        expect(result.forcedCleanup).toBe(true)
+        expect(readProcessIdentity(Number(readFileSync(pidFile, 'utf8')))).toBeUndefined()
+      } finally { await cleanup() }
     },
     5_000,
   )
@@ -4380,6 +4437,7 @@ int main(void) {
   signal(SIGTERM, handled);
   pid_t child = fork();
   if (child < 0) return 91;
+  alarm(30); /* Also bounds both processes if the test runner disappears. */
   if (child == 0) for (;;) pause();
   const char *pid_path = getenv("PID_FILE");
   FILE *output = pid_path ? fopen(pid_path, "w") : NULL;
@@ -4396,31 +4454,34 @@ int main(void) {
       chmodSync(pinnedProgram, 0o700)
       const runtime = join(import.meta.dir, 'grok-reviewer', 'reviewer-runtime.py')
       const started = Date.now()
-      const result = await runBounded([
-        '/usr/bin/python3', '-I', runtime, 'run', reviewerRoot, runRoot, '--',
-        realpathSync(pinnedProgram),
-      ], {
-        env: {
-          PATH: '/usr/bin:/bin',
-          PID_FILE: pidFile,
-          TERM_FILE: termFile,
-        },
-        timeoutMs: 1_000,
-        terminationGraceMs: 5_000,
-      })
-      expect(result.timedOut, JSON.stringify(result)).toBe(true)
-      expect(grokFailureDiagnostics(result)).toMatchObject({
-        timedOut: true, exitCode: result.exitCode,
-        failure: { advisor: 'grok', cause: 'timeout' },
-      })
-      expect(grokReviewerAuthRequired(result)).toBe(false)
-      expect(Date.now() - started).toBeLessThan(6_500)
-      expect(readFileSync(termFile, 'utf8')).toBe('received\n')
-      const pids = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
-      expect(pids).toHaveLength(2)
-      for (const pid of pids) expect(readProcessIdentity(pid)).toBeUndefined()
-      expect(existsSync(runRoot)).toBe(false)
-      expect(readdirSync(reviewerRoot).filter(name => name.startsWith('run.'))).toEqual([])
+      const cleanup = guardFixtureProcesses(pidFile)
+      try {
+        const result = await runBounded([
+          '/usr/bin/python3', '-I', runtime, 'run', reviewerRoot, runRoot, '--',
+          realpathSync(pinnedProgram),
+        ], {
+          env: {
+            PATH: '/usr/bin:/bin',
+            PID_FILE: pidFile,
+            TERM_FILE: termFile,
+          },
+          timeoutMs: 1_000,
+          terminationGraceMs: 5_000,
+        })
+        expect(result.timedOut, JSON.stringify(result)).toBe(true)
+        expect(grokFailureDiagnostics(result)).toMatchObject({
+          timedOut: true, exitCode: result.exitCode,
+          failure: { advisor: 'grok', cause: 'timeout' },
+        })
+        expect(grokReviewerAuthRequired(result)).toBe(false)
+        expect(Date.now() - started).toBeLessThan(6_500)
+        expect(readFileSync(termFile, 'utf8')).toBe('received\n')
+        const pids = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+        expect(pids).toHaveLength(2)
+        for (const pid of pids) expect(readProcessIdentity(pid)).toBeUndefined()
+        expect(existsSync(runRoot)).toBe(false)
+        expect(readdirSync(reviewerRoot).filter(name => name.startsWith('run.'))).toEqual([])
+      } finally { await cleanup() }
     },
     8_000,
   )

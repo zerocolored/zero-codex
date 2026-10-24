@@ -414,6 +414,94 @@ while (!(await Bun.file(process.env.ESCAPED_READY).exists())) await Bun.sleep(10
 
   test.skipIf(process.platform !== 'darwin'
     || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    'sealed completed turn reaps TERM-ignoring descendants after direct exit without blocking the queue',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-sealed-cleanup-'))
+      temporaryRoots.push(root)
+      const registration = join(root, 'executor.json')
+      const helperPidPath = join(root, 'helper.pid')
+      const fakeCodex = join(root, 'fake-codex')
+      writeFileSync(fakeCodex, [
+        '#!/bin/sh',
+        '( trap "" TERM HUP; while :; do /bin/sleep 1; done ) &',
+        'echo "$!" > "$HELPER_PID"',
+        '/bin/sleep 0.4',
+        'echo blocked-response-preserved',
+        'exit 0',
+      ].join('\n'), { mode: 0o700 })
+      const supervisor = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file',
+        join(import.meta.dir, 'codex-supervisor.ts'), 'sealed-cleanup-job', registration,
+        '--unverified-for-tests', '--', fakeCodex,
+      ], {
+        cwd: root, env: { PATH: '/usr/bin:/bin', HOME: root,
+          HELPER_PID: helperPidPath, ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1',
+          ZEROKUN_SUPERVISOR_TEST_DRAIN_GRACE_MS: '100' },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', detached: true,
+      })
+      const identity = readProcessIdentity(supervisor.pid)!
+      liveSupervisors.push(identity)
+      const stdout = new Response(supervisor.stdout).text()
+      const stderr = new Response(supervisor.stderr).text()
+      await waitFor(() => existsSync(registration)
+        && JSON.parse(readFileSync(registration, 'utf8')).supervisionStage === 'draining')
+      const helper = readProcessIdentity(Number(readFileSync(helperPidPath, 'utf8')))!
+      // Merely exiting the direct process does not authorize force.
+      await Bun.sleep(250)
+      expect(observeProcessGeneration(helper).status).toBe('alive')
+      expect(signalProcessIfLive(identity, 'SIGUSR2')).toBe(true)
+      expect(await Promise.race([supervisor.exited, Bun.sleep(4_000).then(() => -999)])).toBe(0)
+      expect(await stdout).toContain('blocked-response-preserved')
+      expect(await stderr).toContain('Codex descendant cleanup')
+      expect(observeProcessGeneration(helper).status).toBe('dead')
+      expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('cleanup-confirmed')
+    }, 8_000,
+  )
+
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
+    'sealed cleanup grace starts after direct exit, preserving a slow terminal flush',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-slow-flush-'))
+      temporaryRoots.push(root)
+      const registration = join(root, 'executor.json')
+      const ready = join(root, 'ready')
+      const fakeCodex = join(root, 'fake-codex')
+      writeFileSync(fakeCodex, `#!${process.execPath}
+import {writeFileSync} from 'node:fs'
+process.on('SIGTERM', () => {})
+writeFileSync(process.env.READY, 'ready')
+await Bun.sleep(1_000)
+console.log('late-terminal-preserved')
+process.exit(0)
+`, { mode: 0o700 })
+      const supervisor = Bun.spawn([
+        process.execPath, '--config=/dev/null', '--no-env-file',
+        join(import.meta.dir, 'codex-supervisor.ts'), 'slow-flush-job', registration,
+        '--unverified-for-tests', '--', fakeCodex,
+      ], {
+        cwd: root, env: { PATH: '/usr/bin:/bin', HOME: root, READY: ready,
+          ZEROKUN_SUPERVISOR_TEST_UNVERIFIED: '1', ZEROKUN_SUPERVISOR_TEST_DRAIN_GRACE_MS: '100' },
+        stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', detached: true,
+      })
+      const identity = readProcessIdentity(supervisor.pid)!
+      liveSupervisors.push(identity)
+      const stdout = new Response(supervisor.stdout).text()
+      await waitFor(() => existsSync(ready))
+      const recorded = JSON.parse(readFileSync(registration, 'utf8')).directChild
+      const direct = readProcessIdentity(recorded.pid)!
+      expect(direct.started).toBe(recorded.started)
+      expect(signalProcessIfLive(identity, 'SIGUSR2')).toBe(true)
+      await Bun.sleep(300)
+      expect(observeProcessGeneration(direct).status).toBe('alive')
+      expect(await supervisor.exited).toBe(86)
+      expect(await stdout).toContain('late-terminal-preserved')
+      expect(JSON.parse(readFileSync(registration, 'utf8')).phase).toBe('cleanup-confirmed')
+    }, 5_000,
+  )
+
+  test.skipIf(process.platform !== 'darwin'
+    || process.env.ZERO_CODEX_CANDIDATE_SANDBOX === '1')(
     'tracker異常は内部faultとしてTERM無視子をbounded回収する',
     async () => {
       const root = mkdtempSync(join(tmpdir(), 'zerokun-supervisor-tracker-fault-'))
