@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test'
+import { createHash } from 'crypto'
 import { Database } from 'bun:sqlite'
 import { classifyTaskModel, parseModelCatalog, loadTaskModelCatalog, TaskModelSelections, TASK_MODEL_SCHEMA, TaskModelSelectionError, type ModelDecision } from './task-model-selection.ts'
 import { ModelSelectionRuntimeError } from './model-selection-runtime.ts'
@@ -363,3 +364,122 @@ test('permanent runtime failure cannot lose an explicit switch on the next conti
  f.add('two',2,'よい');let checked='';
  expect(await f.selections.resolve('two',[{revision:1,task:'よい'}],models,undefined,async text=>{checked=text;return sol})).toBe('gpt-6-sol');expect(checked).toBe('Solで');f.db.close();
 });
+
+
+describe('external-service misunderstanding recovery',()=>{
+ const external='GPT-4o mini とか使えるよね。Fixstars でそっちでやってみてよ。'
+ const correction='違う違う。ヒグスフィールドの中で GPT イメージ 2.5 とか呼び出せないの？確認して'
+ const retain={...none,decision:'retain',evidence:correction,continuation:true} as ModelDecision
+ const legacy=(f:ReturnType<typeof store>,id:string,task:string,decision:ModelDecision)=>f.db.run(
+  'INSERT INTO task_model_selections VALUES (?,1,?,?,NULL)',
+  [id,createHash('sha256').update(task).digest('hex'),JSON.stringify({...decision,pending:'unsupported'})])
+ test.each(['gpt-6-astra','gpt-6-sol'])('stored incident correction recovers %s and survives restart/replay',async model=>{
+  const f=store();f.add('base',1,'既存の依頼');f.selections.seedHandoff('base','既存の依頼',model)
+  f.add('27',27,external);legacy(f,'27',external,{...none,decision:'unsupported',evidence:external,continuation:true})
+  f.add('28',28,'host hydrated history');f.db.run('INSERT INTO task_model_sources VALUES (?,?)',['28',correction])
+  legacy(f,'28',correction,{...none,continuation:true})
+  let calls=0
+  const run:typeof classifyTaskModel=async(text,catalog,previous)=>{
+   calls++;expect(text).toBe(correction);expect(previous).toEqual({task:external,model:null,pending:'unsupported'});return retain
+  }
+  expect(await new TaskModelSelections(f.db).resolve('28',[{revision:1,task:'host hydrated history'}],models,undefined,run)).toBe(model)
+  expect(await new TaskModelSelections(f.db).resolve('28',[{revision:1,task:'host hydrated history'}],models,undefined,run)).toBe(model)
+  f.add('29',29,'続けて')
+  expect(await f.selections.resolve('29',[{revision:1,task:'続けて'}],models,undefined,run)).toBe(model)
+  expect(calls).toBe(1);expect(f.db.query<any,[]>("SELECT request_text FROM task_model_sources WHERE job_id='28'").get().request_text).toBe(correction)
+  f.db.close()
+ })
+ test('new continuation recovers an old stored correction instead of skipping over it',async()=>{
+  const f=store();f.add('base',1,'Solで');await f.selections.resolve('base',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
+  f.add('27',27,external);legacy(f,'27',external,{...none,decision:'unsupported',continuation:true})
+  f.add('28',28,correction);legacy(f,'28',correction,{...none,continuation:true})
+  f.add('29',29,'続けて');let calls=0
+  expect(await f.selections.resolve('29',[{revision:1,task:'続けて'}],models,undefined,async(text,_,prior)=>{
+   calls++;expect(text).toBe(correction);expect(prior?.task).toBe(external);expect(prior?.pending).toBe('unsupported');return retain
+  })).toBe('gpt-6-sol')
+  expect(calls).toBe(1);expect(f.selections.latest('28')).toBe('gpt-6-sol');f.db.close()
+ })
+ test.each(['unsupported','ambiguous'] as const)('ordinary or unrelated service requests cannot clear genuine %s',async reason=>{
+  const f=store();const choice='主担当を選び直して';f.add('one',1,choice)
+  await expect(f.selections.resolve('one',[{revision:1,task:choice}],models,undefined,async()=>({...none,decision:reason}))).rejects.toThrow(reason)
+  f.add('two',2,'別途、画像サービスの使い方を調べて')
+  await expect(f.selections.resolve('two',[{revision:1,task:'別途、画像サービスの使い方を調べて'}],models,undefined,async()=>({...none,continuation:true}))).rejects.toThrow(reason)
+  f.add('three',3,'続けて');let calls=0
+  await expect(f.selections.resolve('three',[{revision:1,task:'続けて'}],models,undefined,async(text,_,prior)=>{
+   calls++;expect(text).toBe('別途、画像サービスの使い方を調べて');expect(prior?.pending).toBe(reason);return {...none,continuation:true}
+  })).rejects.toThrow(reason)
+  expect(calls).toBe(1);f.db.close()
+ })
+ test('later valid selection prevents resurrection of an older pending correction',async()=>{
+  const f=store();f.add('27',27,external);legacy(f,'27',external,{...none,decision:'unsupported'})
+  f.add('28',28,correction);legacy(f,'28',correction,{...none,continuation:true})
+  f.add('29',29,'Solで');expect(await f.selections.resolve('29',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)).toBe('gpt-6-sol')
+  f.add('30',30,'続けて');expect(await f.selections.resolve('30',[{revision:1,task:'続けて'}],models,undefined,async()=>{throw Error('old correction must not run')})).toBe('gpt-6-sol');f.db.close()
+ })
+ test('same-job correction receives the pending interjection, not the original task',async()=>{
+  const f=store();f.add('one',1,'Solで');await f.selections.resolve('one',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
+  await expect(f.selections.resolve('one',[{revision:2,task:external}],models,undefined,async()=>({...none,decision:'unsupported'}))).rejects.toThrow('unsupported')
+  expect(await f.selections.resolve('one',[{revision:3,task:correction}],models,undefined,async(_,__,prior)=>{
+   expect(prior).toEqual({task:external,model:null,pending:'unsupported'});return retain
+  })).toBe('gpt-6-sol');f.db.close()
+ })
+ test('pending context reaches the actual classifier without claiming an intentional primary switch',async()=>{
+  const context={task:external,model:null,pending:'unsupported' as const}
+  await classifyTaskModel(correction,models,context,undefined,async prompt=>{
+   expect(prompt).toContain(JSON.stringify(context));expect(prompt).toContain('not proof the user wanted a primary switch');return JSON.stringify(retain)
+  })
+ })
+})
+
+
+test.each(['unsupported','ambiguous'] as const)('replaying an older correction cannot cancel a newer genuine %s choice',async reason=>{
+ const f=store();f.add('one',1,'元の依頼')
+ const requests=[{revision:1,task:'サービス内のモデルを試して'},{revision:2,task:'違う、サービス内の話です'},{revision:3,task:'主担当をNewFamilyへ変更'}]
+ await expect(f.selections.resolve('one',requests,models,undefined,async text=>({decision:text===requests[1].task?'none':text===requests[2].task?reason:'unsupported',model:null,evidence:'',continuation:true}))).rejects.toThrow(reason)
+ await expect(f.selections.resolve('one',requests,models,undefined,async text=>{
+  expect(text).toBe(requests[1].task);return {decision:'retain',model:null,evidence:text,continuation:true}
+ })).rejects.toThrow(reason)
+ expect(f.selections.latest('one')).toBeNull();f.db.close()
+})
+
+
+test.each(['unsupported','ambiguous'] as const)('reclassifying a pending none as unrelated cannot silently clear genuine %s',async reason=>{
+ const f=store();f.add('base',1,'Solで');await f.selections.resolve('base',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
+ f.add('one',2,'主担当をNewFamilyへ変更')
+ await expect(f.selections.resolve('one',[{revision:1,task:'主担当をNewFamilyへ変更'}],models,undefined,async()=>({...none,decision:reason}))).rejects.toThrow(reason)
+ f.add('two',3,'別途、画像サービスの使い方を調べて')
+ await expect(f.selections.resolve('two',[{revision:1,task:'別途、画像サービスの使い方を調べて'}],models,undefined,async()=>({...none,continuation:true}))).rejects.toThrow(reason)
+ f.add('three',4,'続けて')
+ await expect(f.selections.resolve('three',[{revision:1,task:'続けて'}],models,undefined,async()=>none)).rejects.toThrow(reason)
+ expect(f.selections.latest('two')).toBeNull();expect(f.selections.latest('three')).toBeNull();f.db.close()
+})
+
+test.each([false,true])('stored correction survives a later infrastructure retry (fresh continuation=%s)',async fresh=>{
+ const f=store();f.add('base',1,'Solで');await f.selections.resolve('base',[{revision:1,task:'Solで'}],models,undefined,async()=>sol)
+ f.add('one',2,'外部サービスでモデルを試して')
+ const inputs=[{revision:1,task:'外部サービスでモデルを試して'},{revision:2,task:'違う、そのサービスの中のモデルの話です'},{revision:3,task:'結果を確認して'}]
+ await expect(f.selections.resolve('one',inputs,models,undefined,async text=>{
+  if(text===inputs[2].task)throw new ModelSelectionRuntimeError('transport')
+  return {...none,decision:text===inputs[0].task?'unsupported':'none',continuation:true}
+ })).rejects.toThrow('transport')
+ const calls:string[]=[]
+ expect(await f.selections.resolve('one',fresh?[...inputs,{revision:4,task:'続けて'}]:inputs,models,undefined,async text=>{
+  calls.push(text);return text===inputs[1].task?{...none,decision:'retain',evidence:text,continuation:true}:{...none,continuation:true}
+ })).toBe('gpt-6-sol')
+ expect(calls).toEqual([inputs[1].task,inputs[2].task]);f.db.close()
+})
+
+test('recovering an old correction cannot skip an unclassified newer primary change',async()=>{
+ const f=store();f.add('one',1,'外部サービスで試して')
+ const inputs=[{revision:1,task:'外部サービスで試して'},{revision:2,task:'違う、そのサービスのモデルです'},{revision:3,task:'今度は主担当をNewFamilyへ変更'}]
+ await expect(f.selections.resolve('one',inputs,models,undefined,async text=>{
+  if(text===inputs[2].task)throw new ModelSelectionRuntimeError('transport')
+  return {...none,decision:text===inputs[0].task?'unsupported':'none',continuation:true}
+ })).rejects.toThrow('transport')
+ let checked=false
+ await expect(f.selections.resolve('one',[...inputs,{revision:4,task:'続けて'}],models,undefined,async text=>{
+  if(text===inputs[1].task)return {...none,decision:'retain',evidence:text,continuation:true}
+  expect(text).toBe(inputs[2].task);checked=true;return {...none,decision:'unsupported',continuation:true}
+ })).rejects.toThrow('unsupported')
+ expect(checked).toBe(true);f.db.close()
+})
