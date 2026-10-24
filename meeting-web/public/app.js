@@ -1,4 +1,5 @@
 import { persistRecordingChunk, recoverRecordingCount, acquireRecordingTab } from './recording-store.js'
+import { SimliClient, LogLevel } from './simli.js'
 const $ = id => document.getElementById(id)
 const room = location.pathname.split('/')[2]
 const token = location.hash.slice(1)
@@ -7,10 +8,11 @@ const key = `meeting:${room}`
 const random = () => [...crypto.getRandomValues(new Uint8Array(32))].map(n => n.toString(16).padStart(2,'0')).join('')
 const hash = async bytes => [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n => n.toString(16).padStart(2,'0')).join('')
 let db, meta, mic, display, pc, events, context, mix, analyser, recorder, recordedStream, paintTimer, uploadTimer, statusTimer
-let sessionClosed = false, sessionReady = false
+let mediaGeneration=0, liveSource, audioOnly=false, avatarSource, greeting, avatarClient, avatarContext, audioPump, speakerGain, disconnectTimer, durationTimer, visionTimer, visionBusy=false, lastVisionAt=0, shareGeneration=0
+let sessionClosed = false, sessionReady = false, greeted = false
 let releaseTab
 let recording = false, ending = false, uploading = false, storageQueue = Promise.resolve(), storageError = false
-let seq = 0, volatile = [], motion = !matchMedia('(prefers-reduced-motion: reduce)').matches, smoothed = 0
+let seq = 0, volatile = []
 const canvas = $('scene'), ctx = canvas.getContext('2d'), samples = new Float32Array(256)
 const state = text => { $('status').textContent = text }
 const transaction = (store, mode, action) => new Promise((resolve,reject) => {
@@ -26,30 +28,31 @@ async function api(action, options={}) {
   return body
 }
 const post = (action,body) => api(action,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
-function paint() {
-  ctx.fillStyle='#101627';ctx.fillRect(0,0,1280,720)
-  let amplitude=0
-  if(analyser){analyser.getFloatTimeDomainData(samples);amplitude=Math.sqrt(samples.reduce((n,v)=>n+v*v,0)/samples.length)}
-  smoothed=smoothed*.82+Math.min(1,amplitude*7)*.18
-  const level=motion?smoothed:0, sharing=display?.getVideoTracks().some(t=>t.readyState==='live')
-  if(sharing && $('screen').readyState>=2){
-    const v=$('screen'),scale=Math.min(1200/v.videoWidth,620/v.videoHeight)
-    ctx.drawImage(v,(1280-v.videoWidth*scale)/2,(680-v.videoHeight*scale)/2,v.videoWidth*scale,v.videoHeight*scale)
-    ctx.fillStyle='#101627dd';ctx.beginPath();ctx.roundRect(1040,465,205,205,24);ctx.fill()
-  }
-  ctx.save();ctx.translate(sharing?1140:640,sharing?550:335);const scale=sharing?.30:1;ctx.scale(scale,scale)
-  for(let i=3;i>=0;i--){const r=160+i*48+level*(75+i*20);const gradient=ctx.createRadialGradient(0,5,40,0,5,r)
-    gradient.addColorStop(0,`rgba(131,159,255,${.06+level*.07})`);gradient.addColorStop(1,'rgba(131,159,255,0)');ctx.fillStyle=gradient;ctx.beginPath();ctx.arc(0,5,r,0,Math.PI*2);ctx.fill()}
-  ctx.shadowColor='#9baeff';ctx.shadowBlur=36+level*30;ctx.filter=`blur(${10+level*5}px)`
-  const glow=ctx.createLinearGradient(-80,-130,80,150);glow.addColorStop(0,'#d5dfff');glow.addColorStop(.5,'#a4b8f5');glow.addColorStop(1,'#435c9b');ctx.fillStyle=glow
-  ctx.beginPath();ctx.ellipse(0,-76,51+level*3,61+level*2,0,0,Math.PI*2);ctx.fill()
-  ctx.beginPath();ctx.moveTo(-104,132);ctx.bezierCurveTo(-105,15,-48,4,0,4);ctx.bezierCurveTo(48,4,105,15,104,132);ctx.quadraticCurveTo(0,171,-104,132);ctx.fill();ctx.restore()
-  ctx.fillStyle='#c3cee8';ctx.font='19px sans-serif';ctx.fillText(meta?.project || 'ヒアリング',30,40)
-  if(recording){ctx.fillStyle='#f48f9e';ctx.beginPath();ctx.arc(33,680,5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#d4def3';ctx.font='15px sans-serif';ctx.fillText(`REC  ${new Date(Date.now()-(meta.startedAt||Date.now())).toISOString().slice(11,19)}`,48,686)}
+function contain(video,x,y,w,h){
+  if(video.readyState<2||!video.videoWidth)return
+  const scale=Math.min(w/video.videoWidth,h/video.videoHeight)
+  ctx.drawImage(video,x+(w-video.videoWidth*scale)/2,y+(h-video.videoHeight*scale)/2,video.videoWidth*scale,video.videoHeight*scale)
 }
-$('motion').onclick=()=>{motion=!motion;$('motion').textContent=motion?'動きを止める':'動きを再開';paint()}
-$('motion').textContent=motion?'動きを止める':'動きを再開'
+function paint(){
+  ctx.fillStyle='#ffffff';ctx.fillRect(0,0,1280,720)
+  const sharing=display?.getVideoTracks().some(t=>t.readyState==='live')
+  if(sharing){contain($('screen'),0,0,1118,720);contain($('avatar'),1130,8,142,180)}
+  else contain($('avatar'),0,0,1280,700)
+}
 paintTimer=setInterval(paint,1000/30);paint()
+async function describeScreen(){
+  if(Date.now()-lastVisionAt<15000||visionBusy||!sessionReady||events?.readyState!=='open'||!display?.getVideoTracks().some(t=>t.readyState==='live'))return
+  const generation=shareGeneration, frame=document.createElement('canvas'), v=$('screen')
+  if(v.readyState<2)return
+  frame.width=Math.min(1280,v.videoWidth);frame.height=Math.round(v.videoHeight*frame.width/v.videoWidth)
+  frame.getContext('2d').drawImage(v,0,0,frame.width,frame.height)
+  visionBusy=true;lastVisionAt=Date.now()
+  try{const result=await post('screen',{segment:meta.segment,image:frame.toDataURL('image/jpeg',.7)})
+    if(generation===shareGeneration&&$('status').textContent==='共有画面の読み取りを再試行します。音声は続けられます')state('')
+    if(generation===shareGeneration&&events?.readyState==='open')events.send(JSON.stringify({type:'session.thinking.append',event_id:crypto.randomUUID(),delegation_id:null,content:result.description}))
+  }catch{if(generation===shareGeneration)state('共有画面の読み取りを再試行します。音声は続けられます')}
+  finally{visionBusy=false}
+}
 async function flush() {
   if(!db)return
   while(uploading)await new Promise(resolve=>setTimeout(resolve,50))
@@ -63,13 +66,14 @@ async function flush() {
       if(ack.hash!==digest)throw new Error('録画の保存確認に失敗しました')
       chunk.uploaded=true;await transaction('chunks','readwrite',s=>s.put(chunk,`${room}:${chunk.seq}`))
     }
-    $('saveState').textContent='録画をサーバーに保存中';$('retry').hidden=true
+    $('saveState').textContent=meta.stopped?'録画をサーバーに保存中':'';$('retry').hidden=true
   }catch(error){state(error.message);$('retry').hidden=false;$('saveState').textContent='未送信の録画はこのブラウザに保持しています'}
   finally{uploading=false}
 }
 function releaseMedia(){
-  clearInterval(uploadTimer);pc?.close();mic?.getTracks().forEach(t=>t.stop());display?.getTracks().forEach(t=>t.stop());recordedStream?.getTracks().forEach(t=>t.stop());context?.close().catch(()=>{});$('remoteAudio').srcObject=null;recording=false
-  $('mute').disabled=$('share').disabled=$('end').disabled=true
+  mediaGeneration++;const oldAvatar=avatarClient;avatarClient=null;void oldAvatar?.stop().catch(()=>{});
+  clearInterval(uploadTimer);clearTimeout(disconnectTimer);clearTimeout(durationTimer);clearInterval(visionTimer);shareGeneration++;audioPump?.disconnect();avatarContext?.close().catch(()=>{});pc?.close();mic?.getTracks().forEach(t=>t.stop());display?.getTracks().forEach(t=>t.stop());recordedStream?.getTracks().forEach(t=>t.stop());context?.close().catch(()=>{});$('remoteAudio').srcObject=null;liveSource=null;avatarSource=null;avatarContext=null;audioPump=null;recording=false
+  $('speaker').disabled=$('mute').disabled=$('share').disabled=$('end').disabled=true
 }
 async function finish() {
   if(ending)return;ending=true;$('end').disabled=true
@@ -85,7 +89,7 @@ async function finish() {
     const saved=await chunks()
     if(storageError||saved.length!==meta.count||saved.some(c=>!c.uploaded))throw new Error('未保存の録画があります。保存を再試行するか、録画をダウンロードしてください')
     await post('finish',{segment:meta.segment,count:meta.count});meta.finished=true;await saveMeta()
-    state('会議を終了しました');$('recordState').textContent='録画保存済み';$('recordState').classList.remove('recording');$('retry').hidden=true
+    state('会議を終了しました');$('retry').hidden=true
     $('saveState').textContent='ローカル端末への回収を待っています'
     statusTimer=setInterval(async()=>{try{const result=await api('status');if(result.state==='local_verified'){$('saveState').textContent='プロジェクトの端末に録画を保存しました';clearInterval(statusTimer)}}catch{}},5000)
   }catch(error){state(error.message);$('retry').hidden=false}
@@ -93,10 +97,11 @@ async function finish() {
 }
 $('retry').onclick=()=>meta.stopped?finish():flush()
 $('end').onclick=finish
-$('mute').onclick=()=>{const muted=mic.getAudioTracks()[0].enabled;mic.getAudioTracks().forEach(t=>t.enabled=!muted);$('mute').setAttribute('aria-pressed',String(muted));$('mute').textContent=muted?'ミュート解除':'ミュート'}
+$('speaker').onclick=()=>{const muted=$('speaker').getAttribute('aria-pressed')!=='true';$('speaker').setAttribute('aria-pressed',String(muted));$('speaker').setAttribute('aria-label',muted?'スピーカーのミュートを解除':'ミュート');speakerGain.gain.value=muted?0:1}
+$('mute').onclick=()=>{const muted=mic.getAudioTracks()[0].enabled;mic.getAudioTracks().forEach(t=>t.enabled=!muted);$('mute').setAttribute('aria-pressed',String(muted));$('mute').setAttribute('aria-label',muted?'マイクをオン':'マイクオフ')}
 $('share').onclick=async()=>{
-  if(display?.getVideoTracks().some(t=>t.readyState==='live')){display.getTracks().forEach(t=>t.stop());display=null;$('share').textContent='画面共有';return}
-  try{display=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});$('screen').srcObject=display;await $('screen').play();$('share').textContent='共有を停止';display.getVideoTracks()[0].onended=()=>{$('share').textContent='画面共有'}}
+  if(display?.getVideoTracks().some(t=>t.readyState==='live')){display.getTracks().forEach(t=>t.stop());display=null;shareGeneration++;$('share').setAttribute('aria-pressed','false');$('shareLabel').textContent='画面共有';return}
+  try{display=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});$('screen').srcObject=display;await $('screen').play();$('shareLabel').textContent='共有を停止';$('share').setAttribute('aria-pressed','true');shareGeneration++;void describeScreen();display.getVideoTracks()[0].onended=()=>{shareGeneration++;$('share').setAttribute('aria-pressed','false');$('shareLabel').textContent='画面共有';if(events?.readyState==='open')events.send(JSON.stringify({type:'session.thinking.append',delegation_id:null,content:'画面共有は終了しました。以前の画面を現在の画面として扱わないでください。'}))}}
   catch{state('画面共有は開始されませんでした。会話は続けられます')}
 }
 $('download').onclick=async()=>{
@@ -110,18 +115,32 @@ async function iceComplete(connection){
 }
 $('join').onclick=async()=>{
   $('join').disabled=true
+  const generation=++mediaGeneration;sessionClosed=false;sessionReady=false;greeted=false;audioOnly=false
   try{
     if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder||!canvas.captureStream)throw new Error('録画対応のChromeまたはEdgeで開いてください')
-    const mime=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4'].find(t=>MediaRecorder.isTypeSupported(t))
+    const mime=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'].find(t=>MediaRecorder.isTypeSupported(t))
     if(!mime)throw new Error('このブラウザは録画形式に対応していません')
     mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false})
     context=new AudioContext();await context.resume();mix=context.createMediaStreamDestination();analyser=context.createAnalyser();analyser.fftSize=256
     context.createMediaStreamSource(mic).connect(mix)
-    const joined=await post('join',{});meta.project=joined.project;meta.segment=meta.segment||crypto.randomUUID();meta.mime=mime;meta.startedAt=Date.now();meta.stopped=false;meta.count=0;seq=0;await saveMeta();$('project').textContent=joined.project
+    const joined=await post('join',{});meta.project=joined.project;meta.segment=meta.segment||crypto.randomUUID();meta.mime=mime;meta.startedAt=Date.now();meta.stopped=false;meta.count=0;seq=0;await saveMeta()
     await post('prepare',{segment:meta.segment,mime})
+    speakerGain=context.createGain();speakerGain.connect(context.destination)
+    const avatarLost=()=>{if(generation!==mediaGeneration||audioOnly)return;audioOnly=true;avatarSource?.disconnect();audioPump?.disconnect();avatarContext?.close().catch(()=>{});if(liveSource){liveSource.connect(mix);liveSource.connect(speakerGain)}state('映像に接続できません。音声のみで続けます')}
+    try{
+      state('映像に接続しています');const avatarSession=await post('avatar',{segment:meta.segment})
+      const client=new SimliClient(avatarSession.session_token,$('avatar'),$('avatarAudio'),avatarSession.iceServers,LogLevel.ERROR,'p2p');avatarClient=client
+      client.on('error',avatarLost);client.on('stop',avatarLost)
+      $('avatarAudio').muted=true
+      const attachAvatarAudio=()=>{const stream=$('avatarAudio').srcObject;if(audioOnly||generation!==mediaGeneration)return;if(!(stream instanceof MediaStream)||!stream.getAudioTracks().length)return;avatarSource?.disconnect();avatarSource=context.createMediaStreamSource(stream);avatarSource.connect(mix);avatarSource.connect(speakerGain)}
+      $('avatarAudio').onloadedmetadata=attachAvatarAudio
+      let timer;try{await Promise.race([client.start(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Avatar timeout')),25000)})])}finally{clearTimeout(timer)}
+      attachAvatarAudio()
+      if(!audioOnly){avatarContext=new AudioContext({sampleRate:16000});await avatarContext.resume();await avatarContext.audioWorklet.addModule('/pcm-worklet.js');audioPump=new AudioWorkletNode(avatarContext,'pcm16');audioPump.port.onmessage=e=>{if(!audioOnly)client.sendAudioData(new Uint8Array(e.data))};audioPump.connect(avatarContext.destination)}
+    }catch{avatarLost();const failed=avatarClient;avatarClient=null;void failed?.stop().catch(()=>{})}
     pc=new RTCPeerConnection();mic.getTracks().forEach(t=>pc.addTrack(t,mic));events=pc.createDataChannel('oai-events')
-    events.onmessage=event=>{try{const data=JSON.parse(event.data);if(data.type==='session.started'){sessionReady=true;state('お話しください')}if(data.type==='session.closed'){sessionClosed=true;if(!ending)void finish()}if(data.type==='error'){state('音声サービスからエラーが返されました。録画を保存します');if(!ending)void finish()}}catch{}}
-    pc.ontrack=event=>{const stream=event.streams[0]||new MediaStream([event.track]);$('remoteAudio').srcObject=stream;$('remoteAudio').play().catch(()=>{state('音声の再生を許可してください');$('remoteAudio').controls=true});const source=context.createMediaStreamSource(stream);source.connect(mix);source.connect(analyser)}
+    events.onmessage=event=>{try{const data=JSON.parse(event.data);if(data.type==='session.started'){sessionReady=true;state(audioOnly?'映像に接続できません。音声のみで続けます':'');if(!greeted){greeted=true;events.send(JSON.stringify({type:'session.commentary.append',event_id:'greeting_'+meta.segment,delegation_id:null,content:greeting}))}}if(data.type==='session.closed'){sessionClosed=true;if(!ending)void finish()}if(data.type==='error'){state('音声サービスで一部の処理に失敗しました。会話を続けられます')}}catch{}}
+    pc.ontrack=event=>{const stream=new MediaStream([event.track]);$('remoteAudio').srcObject=stream;$('remoteAudio').muted=true;void $('remoteAudio').play();liveSource=context.createMediaStreamSource(stream);if(!audioOnly)avatarContext.createMediaStreamSource(stream).connect(audioPump);if(audioOnly){liveSource.connect(mix);liveSource.connect(speakerGain)}}
     recordedStream=new MediaStream([...canvas.captureStream(30).getVideoTracks(),...mix.stream.getAudioTracks()])
     recorder=new MediaRecorder(recordedStream,{mimeType:mime,videoBitsPerSecond:1400000,audioBitsPerSecond:96000})
     recorder.ondataavailable=event=>{
@@ -132,16 +151,21 @@ $('join').onclick=async()=>{
     }
     recorder.onerror=()=>{state('録画が停止しました。取得済みの録画を保存します');void finish()}
     // Recording begins before the session can produce its first audio.
-    recorder.start(3000);recording=true;uploadTimer=setInterval(flush,4000)
+
     const offer=await pc.createOffer();await pc.setLocalDescription(offer);await iceComplete(pc)
-    state('音声に接続しています');const answer=await post('session',{segment:meta.segment,mime,sdp:pc.localDescription.sdp});await pc.setRemoteDescription({type:'answer',sdp:answer.sdp})
-    pc.onconnectionstatechange=()=>{if(pc.connectionState==='connected')state('お話しください');if(['failed','disconnected'].includes(pc.connectionState)&&!ending){state('音声接続が切れました。録画を保存します');void finish()}}
-    $('entry').hidden=true;$('mute').disabled=$('end').disabled=false;$('share').disabled=!navigator.mediaDevices.getDisplayMedia;$('recordState').textContent='● 録画中';$('recordState').classList.add('recording');if(!sessionReady)state('音声に接続しています')
-    setTimeout(()=>{if(recording)void finish()},2*60*60*1000)
-  }catch(error){state(error.message);if(recorder?.state==='recording'){await finish()}else{releaseMedia();$('join').disabled=false}}
+    const hour=new Date().getHours(),greetingText=hour<11?'おはようございます':hour<18?'こんにちは':'こんばんは';greeting='今すぐ日本語で「'+greetingText+'、ゼロちゃんです。タスクの内容について聞かせていただけますか？」と挨拶して、返事を待ってください。';state('音声に接続しています');const answer=await post('session',{segment:meta.segment,mime,sdp:pc.localDescription.sdp,hour});recorder.start(3000);recording=true;uploadTimer=setInterval(flush,4000);await pc.setRemoteDescription({type:'answer',sdp:answer.sdp})
+    pc.onconnectionstatechange=()=>{
+      if(pc.connectionState==='connected'){clearTimeout(disconnectTimer);if(sessionReady)state(audioOnly?'映像に接続できません。音声のみで続けます':'')}
+      if(pc.connectionState==='disconnected'&&!ending){state('再接続を待っています');clearTimeout(disconnectTimer);disconnectTimer=setTimeout(()=>{if(pc.connectionState==='disconnected')void finish()},15000)}
+      if(pc.connectionState==='failed'&&!ending){state('音声接続が切れました。録画を保存します');void finish()}
+    }
+    $('entry').hidden=true;$('speaker').disabled=$('mute').disabled=$('end').disabled=false;$('share').disabled=!navigator.mediaDevices.getDisplayMedia;if(!sessionReady)state('音声に接続しています')
+    visionTimer=setInterval(describeScreen,15000)
+    durationTimer=setTimeout(()=>{if(recording)void finish()},2*60*60*1000)
+  }catch(error){state(error.message);if(recorder?.state==='recording'){await finish()}else{releaseMedia();if(!meta.segment){$('join').disabled=false;return}try{const status=await api('status');if(status.retryable)$('join').disabled=false;else if(meta.segment){meta.stopped=true;await saveMeta();$('entry').hidden=true;$('retry').hidden=false;state('接続を終了して保存を確定してください')}}catch{$('join').disabled=false}}}
 }
 window.addEventListener('beforeunload',event=>{if(recording||(!meta?.finished&&meta?.segment)){event.preventDefault();event.returnValue=''}})
-window.addEventListener('pagehide',()=>{releaseMedia();releaseTab?.()})
+window.addEventListener('pagehide',()=>{if(meta?.segment&&!meta.finished)void fetch(`/api/rooms/${room}/hangup`,{method:'POST',keepalive:true,headers:{authorization:`Bearer ${token}`,'x-meeting-client':meta.client,'content-type':'application/json'},body:JSON.stringify({segment:meta.segment})}).catch(()=>{});releaseMedia();releaseTab?.()})
 window.addEventListener('pageshow',event=>{if(event.persisted)location.reload()})
 async function init(){
   if(!/^[a-f0-9-]{36}$/.test(room||'')||!/^[a-f0-9]{64}$/.test(token)){state('Slackで受け取った招待リンクから開いてください');$('join').disabled=true;return}
@@ -149,7 +173,8 @@ async function init(){
   if(!releaseTab){state('別のタブで会議を開いています。そちらを閉じてから再読み込みしてください');$('join').disabled=true;return}
   db=await new Promise((resolve,reject)=>{const request=indexedDB.open('zero-hearing',1);request.onupgradeneeded=()=>{request.result.createObjectStore('meta');request.result.createObjectStore('chunks')};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)})
   meta=await transaction('meta','readonly',s=>s.get(key))||{client:random()};await saveMeta()
-  if(meta.segment){$('entry').hidden=true;$('download').hidden=false;$('project').textContent=meta.project||'ヒアリング';try{seq=recoverRecordingCount(await chunks());meta.count=seq;await saveMeta()}catch(error){state(error.message);return}if(meta.finished){state('会議は終了しています');$('recordState').textContent='録画保存済み'}else{meta.stopped=true;$('retry').hidden=false;state('前回の録画が残っています。保存を再試行してください')}}
+  if(meta.segment&&!meta.finished){const status=await api('status');if(status.retryable){meta.stopped=false;meta.count=0;await saveMeta();$('join').disabled=false;return}}
+  if(meta.segment){$('entry').hidden=true;$('download').hidden=false;try{seq=recoverRecordingCount(await chunks());meta.count=seq;await saveMeta()}catch(error){state(error.message);return}if(meta.finished){state('会議は終了しています');}else{meta.stopped=true;$('retry').hidden=false;state(seq?'前回の録画が残っています。保存を再試行してください':'接続を終了して保存を確定してください')}}
   else $('join').disabled=false
 }
 init().catch(error=>{state(error.message||'録画の保存領域を開けません。ブラウザのストレージを許可してください');$('join').disabled=true})

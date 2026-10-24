@@ -124,6 +124,7 @@ export async function syncMeetingRecordings(state: string, fetcher: typeof fetch
       }
       if(!manifest.ended)continue
       if(segment.count===null||segment.chunks.length!==segment.count||segment.chunks.some((c,i)=>c.seq!==i))throw Error('Meeting recording is incomplete')
+      if(segment.count===0)continue // A failed connection has a manifest, never an empty playable recording.
       const extension=segment.mime.startsWith('video/mp4')?'mp4':'webm',target=join(destination,`${segment.id}.${extension}`)
       const temporary=`${target}.part-${crypto.randomUUID()}`,fd=openSync(temporary,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600)
       let completed=false

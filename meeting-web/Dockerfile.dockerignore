@@ -6,3 +6,5 @@
 !meeting-web/server.ts
 !meeting-web/public
 !meeting-web/public/**
+!meeting-web/avatar.ts
+!meeting-web/build.ts
